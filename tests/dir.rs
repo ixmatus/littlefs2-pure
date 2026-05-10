@@ -1,7 +1,7 @@
 //! Integration tests for `Fs::read_pair` and the directory entry iterator.
 
 use littlefs2_pure::tag::TagType;
-use littlefs2_pure::{entries, BlockAddress, BlockPair, EntryKind, Fs};
+use littlefs2_pure::{entries, lookup, BlockAddress, BlockPair, EntryKind, Fs};
 
 mod common;
 use common::{build_directory_block, DirEntrySpec, MemStorage};
@@ -116,6 +116,137 @@ fn dir_iter_empty_pair_yields_nothing() {
         .read_pair(BlockPair::new(BlockAddress::new(2), BlockAddress::new(3)), &mut a, &mut b)
         .unwrap();
     assert_eq!(entries(&pair).count(), 0);
+}
+
+#[test]
+fn lookup_finds_inline_file() {
+    let inline_body = b"hello world".to_vec();
+    let dir_block = build_directory_block(
+        1,
+        &[DirEntrySpec {
+            id: 0,
+            name: b"greet.txt",
+            name_type: TagType::RegularFile,
+            struct_type: TagType::InlineStruct,
+            struct_body: &inline_body,
+        }],
+        MemStorage::BLOCK_SIZE,
+    );
+
+    let mut storage = MemStorage::new();
+    storage.write_block(2, &dir_block);
+    let sb = littlefs2_pure::Superblock {
+        version: littlefs2_pure::DISK_VERSION,
+        block_size: MemStorage::BLOCK_SIZE as u32,
+        block_count: MemStorage::BLOCK_COUNT,
+        name_max: 0,
+        file_max: 0,
+        attr_max: 0,
+    };
+    storage.write_block(0, &common::build_superblock_block(&sb, MemStorage::BLOCK_SIZE));
+
+    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let pair = fs
+        .read_pair(BlockPair::new(BlockAddress::new(2), BlockAddress::new(3)), &mut a, &mut b)
+        .unwrap();
+
+    let resolved = lookup(&pair, b"greet.txt").unwrap();
+    assert_eq!(resolved.entry.id, 0);
+    assert_eq!(resolved.entry.kind, EntryKind::RegularFile);
+    assert_eq!(resolved.struct_type, TagType::InlineStruct);
+    // For an inline file, the struct body *is* the file content.
+    assert_eq!(resolved.struct_body, b"hello world");
+}
+
+#[test]
+fn lookup_finds_directory() {
+    let dir_struct = vec![10u8, 0, 0, 0, 11, 0, 0, 0];
+    let dir_block = build_directory_block(
+        1,
+        &[DirEntrySpec {
+            id: 3,
+            name: b"subdir",
+            name_type: TagType::Directory,
+            struct_type: TagType::DirStruct,
+            struct_body: &dir_struct,
+        }],
+        MemStorage::BLOCK_SIZE,
+    );
+
+    let mut storage = MemStorage::new();
+    storage.write_block(2, &dir_block);
+    let sb = littlefs2_pure::Superblock {
+        version: littlefs2_pure::DISK_VERSION,
+        block_size: MemStorage::BLOCK_SIZE as u32,
+        block_count: MemStorage::BLOCK_COUNT,
+        name_max: 0,
+        file_max: 0,
+        attr_max: 0,
+    };
+    storage.write_block(0, &common::build_superblock_block(&sb, MemStorage::BLOCK_SIZE));
+
+    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let pair = fs
+        .read_pair(BlockPair::new(BlockAddress::new(2), BlockAddress::new(3)), &mut a, &mut b)
+        .unwrap();
+
+    let resolved = lookup(&pair, b"subdir").unwrap();
+    assert_eq!(resolved.entry.id, 3);
+    assert_eq!(resolved.entry.kind, EntryKind::Directory);
+    assert_eq!(resolved.struct_type, TagType::DirStruct);
+    // Decode the pair address from the DirStruct body.
+    let a_addr = u32::from_le_bytes(resolved.struct_body[0..4].try_into().unwrap());
+    let b_addr = u32::from_le_bytes(resolved.struct_body[4..8].try_into().unwrap());
+    assert_eq!((a_addr, b_addr), (10, 11));
+}
+
+#[test]
+fn lookup_missing_name_returns_none() {
+    let inline = b"x".to_vec();
+    let block = build_directory_block(
+        1,
+        &[DirEntrySpec {
+            id: 0,
+            name: b"present.txt",
+            name_type: TagType::RegularFile,
+            struct_type: TagType::InlineStruct,
+            struct_body: &inline,
+        }],
+        MemStorage::BLOCK_SIZE,
+    );
+
+    let mut storage = MemStorage::new();
+    storage.write_block(2, &block);
+    let sb = littlefs2_pure::Superblock {
+        version: littlefs2_pure::DISK_VERSION,
+        block_size: MemStorage::BLOCK_SIZE as u32,
+        block_count: MemStorage::BLOCK_COUNT,
+        name_max: 0,
+        file_max: 0,
+        attr_max: 0,
+    };
+    storage.write_block(0, &common::build_superblock_block(&sb, MemStorage::BLOCK_SIZE));
+
+    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let pair = fs
+        .read_pair(BlockPair::new(BlockAddress::new(2), BlockAddress::new(3)), &mut a, &mut b)
+        .unwrap();
+    assert!(lookup(&pair, b"absent.txt").is_none());
 }
 
 #[test]

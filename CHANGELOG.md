@@ -6,6 +6,15 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **`dir::lookup` and `dir::Resolved` (Phase 1f sliver).** Single pair
+  lookup by name. Walks the tag stream twice: first to find a NAME tag
+  whose body matches the requested name, then to pair it with a STRUCT
+  tag (InlineStruct, CtzStruct, or DirStruct) at the same id. The
+  returned `Resolved { entry, struct_type, struct_body }` carries
+  enough to read an inline file directly (`struct_body` is the file
+  content) or to follow into a subdirectory (`struct_body` is the
+  next pair's two LE u32 block addresses). CTZ-based file content
+  reading is Phase 1g.
 - **`Fs::read_pair` and the `dir` module (Phase 1e).** `Fs::read_pair`
   fetches an arbitrary metadata pair from storage through two caller
   supplied buffers and runs `MetadataPair::parse` on the result. The

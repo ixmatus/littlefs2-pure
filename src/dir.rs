@@ -88,3 +88,86 @@ impl<'a> Iterator for Entries<'a> {
 pub fn entries<'a>(pair: &MetadataPair<'a>) -> Entries<'a> {
     Entries { inner: pair.reader.iter_tags() }
 }
+
+/// A resolved entry: the directory entry plus its STRUCT body.
+///
+/// Returned by [`lookup`]. The `struct_body` slice's interpretation
+/// depends on `entry.kind`:
+///
+/// - [`EntryKind::RegularFile`] with an [`crate::TagType::InlineStruct`]
+///   STRUCT tag: `struct_body` *is* the file content (inline small file).
+/// - [`EntryKind::RegularFile`] with an [`crate::TagType::CtzStruct`]
+///   STRUCT tag: `struct_body` is 8 bytes encoding the CTZ skip list head
+///   block (LE `u32`) followed by the file size (LE `u32`). Phase 1g
+///   adds the helper to follow the skip list.
+/// - [`EntryKind::Directory`] with a [`crate::TagType::DirStruct`] STRUCT
+///   tag: `struct_body` is 8 bytes, two LE `u32`s addressing the
+///   subdirectory's metadata pair.
+///
+/// The `struct_type` field disambiguates without re-parsing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resolved<'a> {
+    /// The directory entry.
+    pub entry: DirEntry<'a>,
+    /// The type of the STRUCT tag that paired with the NAME.
+    pub struct_type: crate::tag::TagType,
+    /// The STRUCT tag's body bytes.
+    pub struct_body: &'a [u8],
+}
+
+/// Look up a directory entry by name within a single metadata pair.
+///
+/// Walks the tag stream looking for:
+///
+/// 1. A NAME tag (RegularFile or Directory) whose body equals `name`.
+/// 2. A STRUCT tag at the same id (a [`crate::TagType::InlineStruct`],
+///    [`crate::TagType::CtzStruct`], or [`crate::TagType::DirStruct`]).
+///
+/// Returns `None` if no NAME matches, or if the matching NAME's id has
+/// no STRUCT tag in the same pair. The "no STRUCT" case can happen in
+/// partially-written commits and is treated by this read path as
+/// "entry incomplete, do not yield".
+///
+/// # Scope
+///
+/// Single pair only. Does not chase HardTail tags into adjacent pairs.
+/// Does not apply splice / Delete renumbering. See module docs for the
+/// Phase 1e scope.
+#[must_use]
+pub fn lookup<'a>(pair: &MetadataPair<'a>, name: &[u8]) -> Option<Resolved<'a>> {
+    // First pass: find the NAME tag with the matching body, record its
+    // id and kind.
+    let mut found: Option<(u16, EntryKind, &'a [u8])> = None;
+    for entry in pair.reader.iter_tags() {
+        match entry.tag.tag_type() {
+            TagType::RegularFile if entry.body == name => {
+                found = Some((entry.tag.id(), EntryKind::RegularFile, entry.body));
+            }
+            TagType::Directory if entry.body == name => {
+                found = Some((entry.tag.id(), EntryKind::Directory, entry.body));
+            }
+            _ => {}
+        }
+    }
+    let (id, kind, name_slice) = found?;
+
+    // Second pass: find a STRUCT tag at the same id. Latest wins
+    // (mirroring the "later commits supersede earlier" rule).
+    let mut struct_body: Option<(crate::tag::TagType, &'a [u8])> = None;
+    for entry in pair.reader.iter_tags() {
+        if entry.tag.id() != id {
+            continue;
+        }
+        if let ty @ (TagType::InlineStruct | TagType::CtzStruct | TagType::DirStruct) =
+            entry.tag.tag_type()
+        {
+            struct_body = Some((ty, entry.body));
+        }
+    }
+    let (struct_type, body) = struct_body?;
+    Some(Resolved {
+        entry: DirEntry { id, name: name_slice, kind },
+        struct_type,
+        struct_body: body,
+    })
+}

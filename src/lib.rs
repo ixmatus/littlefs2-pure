@@ -54,7 +54,7 @@ pub mod tag;
 // authored. See `docs/PLAN.md`.
 
 pub use crate::block::{BlockAddress, BlockPair};
-pub use crate::dir::{entries, DirEntry, EntryKind};
+pub use crate::dir::{entries, lookup, DirEntry, EntryKind, Resolved};
 pub use crate::error::{Error, Result};
 pub use crate::fs::Fs;
 pub use crate::meta::{MetadataPair, MetadataReader, TagEntry};
