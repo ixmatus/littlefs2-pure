@@ -39,6 +39,7 @@ extern crate std;
 
 pub mod block;
 pub mod crc;
+pub mod ctz;
 pub mod dir;
 pub mod error;
 pub mod fs;
@@ -54,6 +55,7 @@ pub mod tag;
 // authored. See `docs/PLAN.md`.
 
 pub use crate::block::{BlockAddress, BlockPair};
+pub use crate::ctz::CtzStruct;
 pub use crate::dir::{entries, lookup, DirEntry, EntryKind, Resolved};
 pub use crate::error::{Error, Result};
 pub use crate::fs::Fs;

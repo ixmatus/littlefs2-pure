@@ -6,6 +6,24 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **CTZ skip list geometry math (Phase 1g foundations).** New module
+  `ctz` carries the algorithms that map a logical file offset to a
+  (block_index, absolute_offset_within_block) tuple. Matches
+  `lfs_ctz_index` (`lfs.c:2843`) byte-for-byte after the property
+  test caught a docs-vs-implementation mismatch about whether the
+  returned offset includes the skip pointer header (it does — that's
+  what makes it directly usable for a `storage.read` call).
+  - `CtzStruct::from_bytes / to_bytes`: 8 byte body codec
+    (head_block + size, both LE u32).
+  - `skip_pointers_in_block(index)`: `ctz(index) + 1` for `index > 0`,
+    else 0.
+  - `content_bytes_in_block(index, block_size)`: payload bytes after
+    the skip pointer header.
+  - `block_count(size, block_size)`: total blocks in a chain.
+  - `block_index_at_offset(offset, block_size)`: the central
+    `(block, abs_off)` translator.
+  - Property test `block_index_matches_brute_force` cross-checks
+    against a per-block walk over 200K offsets and 6 block sizes.
 - **`dir::lookup` and `dir::Resolved` (Phase 1f sliver).** Single pair
   lookup by name. Walks the tag stream twice: first to find a NAME tag
   whose body matches the requested name, then to pair it with a STRUCT
