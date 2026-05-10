@@ -6,6 +6,16 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **`Fs::read_pair` and the `dir` module (Phase 1e).** `Fs::read_pair`
+  fetches an arbitrary metadata pair from storage through two caller
+  supplied buffers and runs `MetadataPair::parse` on the result. The
+  `dir` module exposes `DirEntry`, `EntryKind`, and `entries(pair) ->
+  Entries`, an iterator yielding one entry per NAME tag (RegularFile or
+  Directory) in commit order. Phase 1e scope is intentionally narrow:
+  splice handling (Delete renumbering), HardTail chasing, and full path
+  resolution are deferred and called out in the module docs.
+- **Three new integration tests** (`tests/dir.rs`) covering the three
+  entry kinds, an empty pair, and a pair containing only a non NAME tag.
 - **`Fs::mount` (storage-backed glue).** Composes `MetadataPair::parse` and
   `Superblock::from_pair` against a `Storage` backed device. Caller passes
   in two scratch buffers (each exactly `S::BLOCK_SIZE` bytes); after mount

@@ -123,4 +123,28 @@ impl<S: Storage> Fs<S> {
     pub fn into_storage(self) -> S {
         self.storage
     }
+
+    /// Read a metadata pair from the storage device into the provided
+    /// buffers and parse it.
+    ///
+    /// `addr` is the pair's two block addresses. `buf_a` receives the
+    /// bytes of `addr.a`; `buf_b` receives the bytes of `addr.b`. Both
+    /// buffers must be exactly [`S::BLOCK_SIZE`](Storage::BLOCK_SIZE)
+    /// bytes; their previous contents are overwritten.
+    ///
+    /// The returned [`MetadataPair`] borrows from `buf_a` and `buf_b`, so
+    /// the buffers must outlive the borrow.
+    pub fn read_pair<'b>(
+        &mut self,
+        addr: BlockPair,
+        buf_a: &'b mut [u8],
+        buf_b: &'b mut [u8],
+    ) -> Result<MetadataPair<'b>, Error> {
+        if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
+            return Err(Error::GeometryMismatch);
+        }
+        self.storage.read(addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        MetadataPair::parse(addr.a, buf_a, addr.b, buf_b)
+    }
 }

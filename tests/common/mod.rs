@@ -199,6 +199,36 @@ impl Storage for MemStorage {
     }
 }
 
+/// One entry passed to [`build_directory_block`].
+pub struct DirEntrySpec<'a> {
+    pub id: u16,
+    pub name: &'a [u8],
+    pub name_type: TagType,
+    pub struct_type: TagType,
+    pub struct_body: &'a [u8],
+}
+
+/// Build a metadata block containing a directory listing.
+///
+/// For each entry the builder emits a NAME tag (with `name_type`
+/// controlling RegularFile vs Directory) followed immediately by a
+/// STRUCT tag with the given `struct_type` carrying `struct_body`.
+pub fn build_directory_block(
+    revision: u32,
+    entries: &[DirEntrySpec<'_>],
+    block_size: usize,
+) -> alloc::vec::Vec<u8> {
+    let mut builder = BlockBuilder::new(block_size, revision).unwrap();
+    for e in entries {
+        let name_tag = Tag::new(true, e.name_type, e.id, e.name.len() as u16);
+        builder.tag(name_tag, e.name).unwrap();
+        let struct_tag = Tag::new(true, e.struct_type, e.id, e.struct_body.len() as u16);
+        builder.tag(struct_tag, e.struct_body).unwrap();
+    }
+    builder.commit(0).unwrap();
+    builder.finish()
+}
+
 /// Construct a single commit metadata block containing a superblock
 /// (NAME magic + INLINESTRUCT geometry), matching what
 /// [`Superblock::from_pair`] expects for mount.

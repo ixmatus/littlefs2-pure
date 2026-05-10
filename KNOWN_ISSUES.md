@@ -8,7 +8,10 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 - [x] Metadata *pair* reader: pick the active block of a pair by revision counter (wrap aware signed comparison), fall back to the alternate if the active fails. (`src/meta.rs::MetadataPair`, Phase 1b)
 - [x] Superblock parser: detect the LittleFS magic, parse version, geometry, name_max, file_max, attr_max. (`src/superblock.rs`, Phase 1c)
 - [x] Storage-backed mount (`Fs::mount`). Reads blocks 0 and 1 via the `Storage` trait, runs `MetadataPair::parse`, then `Superblock::from_pair`. (`src/fs.rs`, Phase 1d)
-- [ ] Directory traversal: open root, list children, resolve absolute paths.
+- [x] Single-pair directory entry iteration. (`src/dir.rs`, Phase 1e)
+- [ ] Splice handling: Delete tags renumber entries with higher ids; the current iterator yields deleted entries. (Phase 1e.2)
+- [ ] HardTail chasing: directories split across multiple metadata pairs. (Phase 1e.3)
+- [ ] Full path resolution: walk from root by name, descending into subdirectories. (Phase 1e.4)
 - [ ] File read: inline structs (small files stored inside metadata) and CTZ skip list (block chained files).
 - [ ] User attribute read.
 - [ ] Mount level error reporting: distinguish "not a LittleFS v2 image" from "geometry mismatch" from "corrupt metadata".
