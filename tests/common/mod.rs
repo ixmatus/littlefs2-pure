@@ -8,9 +8,10 @@
 
 #![allow(dead_code)]
 
-use littlefs2_pure::crc;
+use littlefs2_pure::ctz::{block_count, content_bytes_in_block, skip_pointers_in_block, CtzStruct};
 use littlefs2_pure::storage::Storage;
 use littlefs2_pure::tag::{Tag, TagType, ID_NONE};
+use littlefs2_pure::{crc, BlockAddress};
 
 /// Test only metadata block builder.
 ///
@@ -227,6 +228,56 @@ pub fn build_directory_block(
     }
     builder.commit(0).unwrap();
     builder.finish()
+}
+
+/// Build a CTZ skip list chain in `storage` and return its
+/// [`CtzStruct`] header.
+///
+/// The chain occupies physical blocks `base_block`, `base_block + 1`,
+/// ..., one per CTZ-index. Each block at CTZ index `i` carries
+/// `ctz(i) + 1` little-endian `u32` skip pointers at its head followed
+/// by content bytes. The pointers in block `i` address blocks
+/// `i - 2^k` for `k = 0..=ctz(i)`; concretely, the physical address of
+/// CTZ-index `j` is `base_block + j`.
+///
+/// `data` is split across blocks according to each block's content
+/// capacity (`block_size - 4 * skip_pointers_in_block(i)`). The last
+/// block's content may be partial.
+///
+/// Returns the [`CtzStruct`] whose `head_block` is the physical block
+/// of the last CTZ-index and `size` equals `data.len()`.
+pub fn build_ctz_chain(storage: &mut MemStorage, base_block: u32, data: &[u8]) -> CtzStruct {
+    let bs = MemStorage::BLOCK_SIZE as u32;
+    if data.is_empty() {
+        return CtzStruct { head_block: BlockAddress::new(base_block), size: 0 };
+    }
+    let total = block_count(data.len() as u32, bs);
+    let mut data_off = 0usize;
+    for i in 0..total {
+        let pointer_count = skip_pointers_in_block(i) as usize;
+        let content_cap = content_bytes_in_block(i, bs) as usize;
+        let phys = base_block + i;
+
+        let mut block_buf = alloc::vec![0xFFu8; bs as usize];
+        // Write skip pointers: block i has ctz(i)+1 pointers addressing
+        // blocks i - 2^k for k = 0..=ctz(i). Each pointer is the
+        // PHYSICAL address (base + index).
+        for k in 0..pointer_count {
+            let target_idx = i - (1u32 << k);
+            let target_phys = base_block + target_idx;
+            let off = 4 * k;
+            block_buf[off..off + 4].copy_from_slice(&target_phys.to_le_bytes());
+        }
+        // Append content.
+        let header = 4 * pointer_count;
+        let content_len = content_cap.min(data.len() - data_off);
+        block_buf[header..header + content_len]
+            .copy_from_slice(&data[data_off..data_off + content_len]);
+        data_off += content_len;
+
+        storage.write_block(phys, &block_buf);
+    }
+    CtzStruct { head_block: BlockAddress::new(base_block + total - 1), size: data.len() as u32 }
 }
 
 /// Construct a single commit metadata block containing a superblock

@@ -124,6 +124,18 @@ impl<S: Storage> Fs<S> {
         self.storage
     }
 
+    /// Read a CTZ backed file's content via [`ctz::read_ctz`].
+    ///
+    /// Convenience wrapper that forwards the storage handle.
+    pub fn read_ctz(
+        &mut self,
+        ctz: &crate::ctz::CtzStruct,
+        out: &mut [u8],
+        scratch: &mut [u8],
+    ) -> Result<usize, Error> {
+        crate::ctz::read_ctz(&mut self.storage, ctz, out, scratch)
+    }
+
     /// Read a metadata pair from the storage device into the provided
     /// buffers and parse it.
     ///

@@ -15,7 +15,7 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 - [ ] Full path resolution: walk from root by name, descending into subdirectories. (Phase 1e.4)
 - [x] File read for inline structs: the InlineStruct body *is* the file content; `dir::lookup` returns it directly. (Phase 1f sliver)
 - [x] CTZ struct codec and geometry math: 8 byte body decode/encode, skip pointer count per block, content bytes per block, file offset -> (block, abs_offset) translation. (`src/ctz.rs`, Phase 1g foundations)
-- [ ] CTZ storage-backed read: walk the chain backward from head, fetch each block's content portion, reassemble. Builds on `block_index_at_offset`. (Phase 1g full)
+- [x] CTZ storage-backed read: walk the chain backward from head, fetch each block's content portion, reassemble. (`src/ctz.rs::read_ctz`, Phase 1g full)
 - [ ] User attribute read.
 - [ ] Mount level error reporting: distinguish "not a LittleFS v2 image" from "geometry mismatch" from "corrupt metadata".
 

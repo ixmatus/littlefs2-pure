@@ -30,9 +30,7 @@ fn brute_force(offset: u32, block_size: u32) -> (u32, u32) {
         consumed = consumed.saturating_add(cap);
         idx += 1;
         // Sanity bound to avoid runaway loops on insane inputs.
-        if idx > 1_000_000 {
-            panic!("brute_force exceeded 1M iterations");
-        }
+        assert!(idx <= 1_000_000, "brute_force exceeded 1M iterations");
     }
 }
 
