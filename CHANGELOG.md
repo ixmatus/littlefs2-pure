@@ -6,6 +6,21 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **Metadata pair reader (`meta::MetadataReader`).** Walks a metadata block,
+  verifies every CCRC, exposes tags from successfully committed regions via
+  the `iter_tags` iterator. Bit accuracy verified against the C reference's
+  `lfs_dir_fetchmatch` (lfs.c:1095): big endian tag word, little endian
+  revision counter and CRC body, XOR encoded against the previous tag,
+  CRC reset and `(chunk & 1) << 31` parity flip on each verified commit.
+- **Tag helpers.** `dsize`, `body_len`, `is_ccrc`, `ccrc_chunk` for the
+  reader and the synthetic builder.
+- **Synthetic metadata block builder** (`tests/common::BlockBuilder`) for
+  property testing. Independent reimplementation of the commit byte layout;
+  the reader + builder agreement is a cross check, not a self consistency
+  invariant.
+- **Property tests for the metadata reader** (`tests/property_meta.rs`):
+  single commit roundtrip, multi commit roundtrip with parity alternation,
+  single byte corruption invalidates the committed region.
 - Workspace and package scaffold.
 - `Storage` trait: read, program, erase, sync, with associated geometry consts.
 - `BlockAddress`, `BlockPair` newtypes.

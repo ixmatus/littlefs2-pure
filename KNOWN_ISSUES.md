@@ -4,7 +4,8 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 
 ## Read path (Phase 1)
 
-- [ ] Metadata pair reader: find the active block by revision counter, walk commits, verify CRC, surface tag stream.
+- [x] Metadata block reader: walk commits, verify CRC, surface tag stream. (`src/meta.rs`, Phase 1a)
+- [ ] Metadata *pair* reader: pick the active block of a pair by revision counter (wrap aware signed comparison), fall back to the alternate if the active fails. (Phase 1b)
 - [ ] Superblock parser: detect the LittleFS magic, parse version, geometry, name_max, file_max, attr_max.
 - [ ] Directory traversal: open root, list children, resolve absolute paths.
 - [ ] File read: inline structs (small files stored inside metadata) and CTZ skip list (block chained files).
