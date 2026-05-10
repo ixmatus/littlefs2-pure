@@ -38,7 +38,10 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 - [x] `remove_from_root`: delete a file by name from the root, splice-correct. (Phase 2b.4)
 - [x] `list_root`: enumerate root entries, splice-correct, skipping the superblock. (Phase 2b.4)
 - [x] `exists`: typed wrapper over `resolve`. (Phase 2b.4)
-- [ ] `mkdir`, `rmdir`, `rename`. (Phase 2e, 2g)
+- [x] `mkdir`: create a directory at an arbitrary path. (`src/fs.rs::mkdir`, Phase 2e)
+- [x] `write_to_path` / `remove_at_path` / `list_dir`: path-based file ops on arbitrary directories. (Phase 2e)
+- [ ] `rmdir`: remove an empty directory. Currently `remove_at_path` works on directories but doesn't validate emptiness or free the directory's pair. (Phase 2g)
+- [ ] `rename`: move an entry between directories. (Phase 2g)
 - [ ] User attribute write.
 - [ ] Atomic move state recovery.
 

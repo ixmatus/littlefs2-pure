@@ -13,9 +13,13 @@ This file points downstream consumers (SMIL firmware, etc.) at the relevant entr
 | Read inline file content | Use `resolved.struct_body` directly when `struct_type == InlineStruct` | Zero-copy slice into your buffer |
 | Read CTZ file content | `Fs::read_ctz(&ctz_struct, &mut out, &mut scratch)` | After parsing `CtzStruct::from_bytes(resolved.struct_body)` |
 | Write or update a small inline file | `Fs::write_inline_to_root(name, content, ...)` | Upsert semantics; appends if room, else compacts to the alternate |
-| Write any-size file (auto-dispatch) | `Fs::write_to_root(name, content, ...)` | Picks inline (≤128 bytes) or CTZ; create-only on the CTZ side |
+| Write any-size file at root (auto-dispatch) | `Fs::write_to_root(name, content, ...)` | Picks inline (≤128 bytes) or CTZ; create-only on the CTZ side |
+| Write any-size file at arbitrary path | `Fs::write_to_path(path, content, ...)` | Parent directory must exist |
 | Write a large file as CTZ | `Fs::write_ctz_to_root(name, content, ...)` | Allocates blocks and writes the skip-list chain |
-| Remove a file | `Fs::remove_from_root(name, ...)` | Splice-correct; deleted entries no longer resolve |
+| Create a directory | `Fs::mkdir(path, ...)` | Allocates a fresh metadata pair, writes empty initial commit |
+| Remove a file at root | `Fs::remove_from_root(name, ...)` | Splice-correct; deleted entries no longer resolve |
+| Remove a file at path | `Fs::remove_at_path(path, ...)` | Resolves parent, then removes |
+| List a directory | `Fs::list_dir(path, callback, ...)` | Splice-correct, skips superblock; single-pair only (no HardTail chasing yet) |
 | List root directory | `Fs::list_root(callback, ...)` | Skips the superblock; renumbers across splice |
 | NOR-aligned program wrapper | `NorAlignedStorage::new(your_storage)` | Caches programs to `PROG_SIZE` windows |
 
@@ -23,11 +27,11 @@ This file points downstream consumers (SMIL firmware, etc.) at the relevant entr
 
 | Capability | Tracking |
 |---|---|
-| `mkdir` | Phase 2e (allocator is in place; just needs the API + tests) |
-| File writes at nested paths | Phase 2e (requires path resolution + parent-pair append) |
 | Stateful File handle (open / read / write / seek / set_len / sync) | Phase 2f (designs around a `File<'fs, S>` cursor) |
+| `rmdir` (with emptiness check + pair free) | Phase 2g |
 | `rename` | Phase 2g |
 | CTZ-on-CTZ updates (overwrite a large file with new large content) | Phase 2f follow-up |
+| Multi-pair directory listing (HardTail chasing in `list_dir`) | Phase 2g |
 | Power-loss fuzz / Kani harnesses | Phase 3 |
 
 For the SMIL audit logger specifically: `create_dir`, `File::write` with append/truncate, `File::seek`, and `set_len` all map to Phases 2c–2f. The current write surface is sufficient for upsert-style configuration files (small keys + small values), not for log-style streaming writes.

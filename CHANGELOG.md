@@ -6,6 +6,24 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **`Fs::mkdir`, path-based writes/removes, and `list_dir` (Phase 2e).**
+  - `mkdir(path)`: resolves the parent, allocates a fresh metadata
+    pair for the new directory, erases + initializes it with one
+    empty CCRC commit, then appends a `CreateDir` commit to the
+    parent pair pointing at the new dir's blocks.
+  - `write_to_path(path, content)`: auto-dispatches inline vs CTZ at
+    the parent of the leaf component. The parent directory must
+    exist.
+  - `remove_at_path(path)`: removes the file at the leaf of `path`.
+  - `list_dir(path, callback)`: enumerates entries in a directory at
+    `path` (root included). Applies splice renumbering; does not yet
+    chase HardTails (Phase 2g).
+  - Internal: refactored `write_inline_to_root`,
+    `write_ctz_to_root`, and `remove_from_root` to call private
+    `*_to_pair` methods, so both root-only and path-based variants
+    share the same write logic. Added `resolve_parent` helper.
+  - Added `WriteOp::CreateDir { id, name, dir_pair }` and threaded
+    through `emit_op` and `build_compact_commit`.
 - **CTZ file writes (Phase 2d) via `Fs::write_to_root` and
   `Fs::write_ctz_to_root`.** `write_to_root` auto-dispatches inline vs
   CTZ based on content size (`INLINE_MAX = 128` bytes). The CTZ path
