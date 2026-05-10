@@ -57,6 +57,114 @@ pub struct Fs<S: Storage> {
 }
 
 impl<S: Storage> Fs<S> {
+    /// Write a small inline file at the filesystem root.
+    ///
+    /// Appends a new commit to the root metadata pair's active block
+    /// containing a `Create` splice + `RegularFile` NAME tag +
+    /// `InlineStruct` tag with `content` as the body. The new entry
+    /// gets the next free id (current live entry count).
+    ///
+    /// **Scope.** This is the Phase 2b sliver: it only writes at the
+    /// root, only supports inline content (must fit inside the
+    /// remaining bytes of the active block), and does not handle
+    /// compaction. Files whose name + content overflow the block return
+    /// [`Error::OutOfRange`]; compaction (Phase 2e) and CTZ extension
+    /// (Phase 2d) lift those constraints.
+    ///
+    /// `buf_a` and `buf_b` are scratch buffers, each exactly
+    /// [`S::BLOCK_SIZE`](Storage::BLOCK_SIZE) bytes.
+    ///
+    /// On NOR flash with non-trivial program semantics, this function
+    /// programs only the new bytes (from `committed_end` to the new
+    /// commit's end), assuming the trailing region is in erased state
+    /// (`0xFF`). This is the case for any pair that has not been
+    /// overwritten since its last erase.
+    pub fn write_inline_to_root(
+        &mut self,
+        name: &[u8],
+        content: &[u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
+            return Err(Error::GeometryMismatch);
+        }
+        if name.is_empty() || name.len() > 0x3FF || content.len() > 0x3FF {
+            return Err(Error::InvalidPath);
+        }
+
+        // Read the root pair, parse it, and decide which buffer holds
+        // the active block.
+        self.storage.read(0, 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(1, 0, buf_b).map_err(|_| Error::Io)?;
+        let active_addr;
+        let committed_end;
+        let next_ptag;
+        let mut count = 0usize;
+        {
+            let pair =
+                MetadataPair::parse(BlockAddress::new(0), &*buf_a, BlockAddress::new(1), &*buf_b)?;
+            active_addr = pair.active_block;
+            committed_end = pair.reader.committed_end();
+            next_ptag = pair.reader.next_ptag();
+            crate::dir::live_entries(&pair, |_| {
+                count += 1;
+                Ok::<(), Error>(())
+            })?;
+            // Reject duplicate names eagerly. (Not strictly necessary —
+            // LittleFS allows it on disk — but matches user
+            // expectations.)
+            if crate::dir::lookup(&pair, name).is_some() {
+                return Err(Error::AlreadyExists);
+            }
+        }
+
+        let new_id = u16::try_from(count).map_err(|_| Error::OutOfRange)?;
+        if new_id == crate::tag::ID_NONE {
+            return Err(Error::OutOfRange);
+        }
+
+        // Select the active buffer and append the new commit.
+        let active_buf: &mut [u8] = if active_addr == BlockAddress::new(0) { buf_a } else { buf_b };
+        let new_end = {
+            let mut commit =
+                crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
+            commit.tag(crate::tag::Tag::new(true, crate::tag::TagType::Create, new_id, 0), &[])?;
+            commit.tag(
+                crate::tag::Tag::new(
+                    true,
+                    crate::tag::TagType::RegularFile,
+                    new_id,
+                    name.len() as u16,
+                ),
+                name,
+            )?;
+            commit.tag(
+                crate::tag::Tag::new(
+                    true,
+                    crate::tag::TagType::InlineStruct,
+                    new_id,
+                    content.len() as u16,
+                ),
+                content,
+            )?;
+            commit.finish(0)?;
+            commit.bytes_written()
+        };
+
+        // Program only the new bytes. The trailing region of the
+        // active block was already 0xFF (erased) prior to this call.
+        self.storage
+            .program(
+                active_addr.as_u32(),
+                committed_end as u32,
+                &active_buf[committed_end..new_end],
+            )
+            .map_err(|_| Error::Io)?;
+        self.storage.sync().map_err(|_| Error::Io)?;
+        Ok(())
+    }
+
     /// Format the storage device with a fresh, empty LittleFS v2
     /// filesystem.
     ///

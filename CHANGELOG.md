@@ -6,6 +6,17 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **`Fs::write_inline_to_root` (Phase 2b).** Append a small file to
+  the root directory. Reads the active block, runs `live_entries` to
+  determine the next free id, builds a new commit (Create + NAME +
+  InlineStruct) on top of the existing committed region using
+  `Commit::new_appending`, and programs only the new bytes to flash.
+  Rejects duplicates (`Error::AlreadyExists`); returns
+  `Error::OutOfRange` if the commit would overflow the block (Phase
+  2e compaction lifts this).
+- **`meta::Commit::new_appending`.** Continue a metadata block at a
+  given offset with a pre-existing XOR base, supporting the append-
+  to-existing-pair pattern.
 - **`meta::Commit` slice-based commit builder (Phase 2a foundation).**
   No-alloc, no-std builder for metadata commits. Takes a caller-supplied
   byte slice; writes the revision header at offset 0; appends tags via

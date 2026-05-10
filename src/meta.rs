@@ -319,6 +319,23 @@ impl<'a> Commit<'a> {
         Ok(Self { buf, offset: 4, ptag: 0xFFFF_FFFF, crc })
     }
 
+    /// Continue an existing metadata block by appending a new commit at
+    /// `offset` with the given pre-existing XOR base `ptag`.
+    ///
+    /// Typically `offset` is [`MetadataReader::committed_end`] and
+    /// `ptag` is [`MetadataReader::next_ptag`] for the pair being
+    /// extended. The CRC accumulator starts fresh at [`crc::INIT`]
+    /// because every commit's CRC is independent.
+    ///
+    /// Bytes before `offset` are left untouched. Bytes from `offset`
+    /// onward are overwritten by `tag` and `finish` calls.
+    pub fn new_appending(buf: &'a mut [u8], offset: usize, ptag: u32) -> Result<Self, Error> {
+        if buf.len() < offset + 8 {
+            return Err(Error::OutOfRange);
+        }
+        Ok(Self { buf, offset, ptag, crc: crc::INIT })
+    }
+
     /// Append a non-CCRC tag and its body to the in-progress commit.
     ///
     /// `body.len()` must equal `tag.body_len()`. Returns
