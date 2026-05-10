@@ -173,8 +173,15 @@ enum WriteOp<'a> {
     CreateCtz { id: u16, name: &'a [u8], head_block: u32, total_size: u32 },
     /// Update the existing entry at `id` by appending a new
     /// InlineStruct with `content`. The NAME and entry kind are
-    /// preserved by the existing tags in the commit log.
+    /// preserved by the existing tags in the commit log. If the prior
+    /// STRUCT was a CtzStruct, the previous chain becomes orphan and
+    /// is reclaimed by the next allocator scan.
     Update { id: u16, content: &'a [u8] },
+    /// Update the existing entry at `id` to point at a new CTZ chain
+    /// at `head_block` with size `total_size`. The NAME and entry kind
+    /// are preserved by the existing tags. The previous STRUCT (inline
+    /// or CTZ) is replaced; any old CTZ chain becomes orphan.
+    UpdateCtz { id: u16, head_block: u32, total_size: u32 },
     /// Remove the entry at `id`. Append path emits a `Delete` tag;
     /// compact path skips the slot and renumbers subsequent ids down.
     Remove { id: u16 },
@@ -202,6 +209,12 @@ fn emit_op(commit: &mut crate::meta::Commit<'_>, op: &WriteOp<'_>) -> Result<(),
         }
         WriteOp::Update { id, content } => {
             commit.tag(Tag::new(true, TagType::InlineStruct, id, content.len() as u16), content)?;
+        }
+        WriteOp::UpdateCtz { id, head_block, total_size } => {
+            let mut body = [0u8; 8];
+            body[0..4].copy_from_slice(&head_block.to_le_bytes());
+            body[4..8].copy_from_slice(&total_size.to_le_bytes());
+            commit.tag(Tag::new(true, TagType::CtzStruct, id, 8), &body)?;
         }
         WriteOp::Remove { id } => {
             // Delete tag's length field is the special sentinel 0x3FF
@@ -442,15 +455,24 @@ impl<S: Storage> Fs<S> {
         if name.is_empty() || name.len() > 0x3FF {
             return Err(Error::InvalidPath);
         }
-        // Reject CTZ updates for now; only create.
-        {
+        // Pre-check: detect whether the entry exists, and reject if it
+        // exists as a Directory (overwriting a directory with a file
+        // is destructive and not supported here; use rmdir + write
+        // separately).
+        let existing_id: Option<u16> = {
             self.storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
             self.storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
             let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
-            if crate::dir::lookup(&pair, name).is_some() {
-                return Err(Error::AlreadyExists);
+            match crate::dir::lookup(&pair, name) {
+                Some(r) => {
+                    if r.entry.kind != crate::dir::EntryKind::RegularFile {
+                        return Err(Error::AlreadyExists);
+                    }
+                    Some(r.entry.id)
+                }
+                None => None,
             }
-        }
+        };
 
         let bs = S::BLOCK_SIZE as u32;
         let total_blocks_u32 = block_count(content.len() as u32, bs);
@@ -529,15 +551,26 @@ impl<S: Storage> Fs<S> {
             count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
         }
 
-        let new_id = u16::try_from(count).map_err(|_| Error::OutOfRange)?;
-        if new_id == crate::tag::ID_NONE {
-            return Err(Error::OutOfRange);
-        }
         let head_block = chain[total_blocks - 1].as_u32();
-        let op =
-            WriteOp::CreateCtz { id: new_id, name, head_block, total_size: content.len() as u32 };
-        // dsize: Create (4) + NAME (4+name.len) + CtzStruct (4+8) + CCRC (8).
-        let op_dsize = 4 + (4 + name.len()) + (4 + 8) + 8;
+        let total_size = content.len() as u32;
+        let op = if let Some(id) = existing_id {
+            // Replacing an existing file: emit an UpdateCtz that
+            // overrides the entry's struct body. The previous chain
+            // becomes unreachable and gets reclaimed by the next
+            // allocator scan.
+            WriteOp::UpdateCtz { id, head_block, total_size }
+        } else {
+            let new_id = u16::try_from(count).map_err(|_| Error::OutOfRange)?;
+            if new_id == crate::tag::ID_NONE {
+                return Err(Error::OutOfRange);
+            }
+            WriteOp::CreateCtz { id: new_id, name, head_block, total_size }
+        };
+        let op_dsize = match op {
+            WriteOp::UpdateCtz { .. } => (4 + 8) + 8,
+            // Create: Create (4) + NAME (4+name.len) + CtzStruct (4+8) + CCRC (8).
+            _ => 4 + (4 + name.len()) + (4 + 8) + 8,
+        };
 
         if committed_end + op_dsize <= S::BLOCK_SIZE {
             let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
@@ -570,6 +603,93 @@ impl<S: Storage> Fs<S> {
         }
         self.storage.sync().map_err(|_| Error::Io)?;
         Ok(())
+    }
+
+    /// Append bytes to the file at `path`. Creates the file if it does
+    /// not exist; otherwise reads the existing content, concatenates
+    /// `additional`, and rewrites via [`Self::write_to_path`].
+    ///
+    /// **Storage model.** This is an *atomic full-rewrite* append. The
+    /// existing content is read into the caller-supplied
+    /// `content_scratch` buffer, the new bytes are appended in memory,
+    /// and the combined content is written as a single new entry. For
+    /// CTZ-backed files, the old chain becomes unreachable and the
+    /// allocator reclaims its blocks on the next scan.
+    ///
+    /// This pattern is O(file_size) per append, so it suits use cases
+    /// with infrequent appends or small files. Append-heavy workloads
+    /// (log streaming) should use the future stateful `File` API,
+    /// which extends CTZ chains incrementally (Phase 2f.2).
+    ///
+    /// `content_scratch` must be at least
+    /// `existing_size + additional.len()` bytes. Caller is expected to
+    /// budget enough space for the maximum expected file size.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::OutOfRange`] if `content_scratch` is too small for
+    ///   the combined content.
+    /// - [`Error::AlreadyExists`] if the path exists but is a
+    ///   directory (cannot append to a directory).
+    /// - Storage and corruption errors propagate from underlying
+    ///   reads/writes.
+    pub fn append_to_path(
+        &mut self,
+        path: crate::path::Path<'_>,
+        additional: &[u8],
+        content_scratch: &mut [u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        // Resolve and copy the existing content into content_scratch.
+        let (existing_size, ctz_to_load): (usize, Option<crate::ctz::CtzStruct>) =
+            match self.resolve(path, buf_a, buf_b) {
+                Ok(r) => {
+                    if r.entry.kind != crate::dir::EntryKind::RegularFile {
+                        return Err(Error::AlreadyExists);
+                    }
+                    match r.struct_type {
+                        crate::tag::TagType::InlineStruct => {
+                            let n = r.struct_body.len();
+                            if n + additional.len() > content_scratch.len() {
+                                return Err(Error::OutOfRange);
+                            }
+                            content_scratch[..n].copy_from_slice(r.struct_body);
+                            (n, None)
+                        }
+                        crate::tag::TagType::CtzStruct => {
+                            let ctz = crate::ctz::CtzStruct::from_bytes(r.struct_body)?;
+                            let n = ctz.size as usize;
+                            if n + additional.len() > content_scratch.len() {
+                                return Err(Error::OutOfRange);
+                            }
+                            (n, Some(ctz))
+                        }
+                        _ => return Err(Error::Corrupt),
+                    }
+                }
+                Err(Error::NotFound) => {
+                    if additional.len() > content_scratch.len() {
+                        return Err(Error::OutOfRange);
+                    }
+                    (0, None)
+                }
+                Err(e) => return Err(e),
+            };
+
+        // For CTZ files, pull the chain content into the scratch.
+        if let Some(ctz) = ctz_to_load {
+            self.read_ctz(&ctz, &mut content_scratch[..existing_size], buf_a)?;
+        }
+
+        // Stamp the new bytes after the existing content.
+        content_scratch[existing_size..existing_size + additional.len()]
+            .copy_from_slice(additional);
+        let total = existing_size + additional.len();
+
+        // Hand off to write_to_path, which auto-dispatches inline vs
+        // CTZ and handles update semantics for existing entries.
+        self.write_to_path(path, &content_scratch[..total], buf_a, buf_b)
     }
 
     /// Resolve a path's parent directory. Returns `(parent_pair,
@@ -1062,6 +1182,7 @@ impl<S: Storage> Fs<S> {
         // Commit size for each WriteOp shape, plus the trailing CCRC (8).
         let op_dsize = match op {
             WriteOp::Update { content, .. } => (4 + content.len()) + 8,
+            WriteOp::UpdateCtz { .. } => (4 + 8) + 8,
             WriteOp::Create { name, content, .. } => 4 + (4 + name.len()) + (4 + content.len()) + 8,
             // CreateCtz and CreateDir both have an 8-byte struct body
             // (head_block + size for CTZ; pair_a + pair_b for Dir).

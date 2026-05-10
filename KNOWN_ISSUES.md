@@ -31,8 +31,11 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 - [ ] File write at arbitrary paths (not just root): requires path resolution to a directory + append. (Phase 2b.4)
 - [x] Block allocator: scan-based, BFS walk from root, tracks used blocks via bitmap. (`src/alloc.rs`, Phase 2c)
 - [x] File write with CTZ extension when content exceeds inline threshold: `Fs::write_to_root` / `Fs::write_ctz_to_root` allocate blocks and lay out the skip-list chain. (Phase 2d)
-- [ ] CTZ-on-CTZ updates (writing to an existing name where the new content is > `INLINE_MAX`): currently returns `OutOfRange`. Needs old-chain free + new-chain alloc. (Phase 2f follow-up)
-- [ ] CTZ-on-inline updates (writing > INLINE_MAX to an existing inline name): same as above. (Phase 2f follow-up)
+- [x] CTZ-on-CTZ updates: `write_to_root` and `write_to_path` rewrite the chain; the old chain becomes unreachable and is reclaimed by the next allocator scan. (Phase 2f.1)
+- [x] CTZ-on-inline / inline-on-CTZ transitions: handled transparently via `Update` / `UpdateCtz` overrides. (Phase 2f.1)
+- [x] `append_to_path`: atomic full-rewrite append. (Phase 2f.1)
+- [ ] **Streaming append for large CTZ files**: the current `append_to_path` is O(file_size). A true incremental chain extension (one read of the last block + one allocation per call) is a follow-up. (Phase 2f.2)
+- [ ] **Stateful `File<'fs, S>` handle** with `open / read / write / seek / sync / set_len`. Useful for batched writes (avoid re-reading on each entry). (Phase 2f.2)
 - [x] `Fs::format` producing a superblock the C reference can mount. (Phase 2a; bit accuracy verified against `meta::MetadataReader` round-trip; C-reference cross-check pending the conformance harness.)
 - [ ] Sync semantics (`Fs::sync`, drop on close).
 - [x] `remove_from_root`: delete a file by name from the root, splice-correct. (Phase 2b.4)

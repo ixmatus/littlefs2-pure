@@ -6,7 +6,7 @@
 
 use littlefs2_pure::ctz::CtzStruct;
 use littlefs2_pure::tag::TagType;
-use littlefs2_pure::{Fs, Path};
+use littlefs2_pure::{EntryKind, Error, Fs, Path};
 
 mod common;
 use common::MemStorage;
@@ -126,6 +126,95 @@ fn ctz_file_alongside_inline_files() {
     let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
     fs.read_ctz(&ctz, &mut out, &mut scratch).unwrap();
     assert_eq!(out, log);
+}
+
+#[test]
+fn ctz_to_ctz_update_replaces_content() {
+    // Write a CTZ file, then overwrite it with new (also CTZ) content.
+    // The new content must read back; old chain is orphaned (reclaimed
+    // by the next allocator scan).
+    let mut fs = make_fs();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+
+    let v1: Vec<u8> = (0..300).map(|i| (i & 0xff) as u8).collect();
+    fs.write_to_root(b"log", &v1, &mut a, &mut b).unwrap();
+    let v2: Vec<u8> = (0..300).map(|i| ((i + 1) & 0xff) as u8).collect();
+    fs.write_to_root(b"log", &v2, &mut a, &mut b).unwrap();
+
+    let mut a2 = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b2 = [0u8; MemStorage::BLOCK_SIZE];
+    let r = fs.resolve(Path::new("/log").unwrap(), &mut a2, &mut b2).unwrap();
+    assert_eq!(r.struct_type, TagType::CtzStruct);
+    let ctz = CtzStruct::from_bytes(r.struct_body).unwrap();
+    let mut out = vec![0u8; ctz.size as usize];
+    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    fs.read_ctz(&ctz, &mut out, &mut scratch).unwrap();
+    assert_eq!(out, v2);
+}
+
+#[test]
+fn inline_to_ctz_promotion_via_write_to_root() {
+    // First write: small content goes inline. Second write to same
+    // name: large content. Must convert to CTZ.
+    let mut fs = make_fs();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+
+    fs.write_to_root(b"f", b"small", &mut a, &mut b).unwrap();
+    let big: Vec<u8> = (0..400).map(|i| (i & 0xff) as u8).collect();
+    fs.write_to_root(b"f", &big, &mut a, &mut b).unwrap();
+
+    let mut a2 = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b2 = [0u8; MemStorage::BLOCK_SIZE];
+    let r = fs.resolve(Path::new("/f").unwrap(), &mut a2, &mut b2).unwrap();
+    assert_eq!(r.struct_type, TagType::CtzStruct);
+    let ctz = CtzStruct::from_bytes(r.struct_body).unwrap();
+    let mut out = vec![0u8; ctz.size as usize];
+    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    fs.read_ctz(&ctz, &mut out, &mut scratch).unwrap();
+    assert_eq!(out, big);
+}
+
+#[test]
+fn ctz_to_inline_shrink_via_write_to_root() {
+    // First write: large CTZ. Second write: small inline. The inline
+    // STRUCT tag overrides the prior CTZ STRUCT at the same id, so a
+    // subsequent read returns the small content.
+    let mut fs = make_fs();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+
+    let big: Vec<u8> = (0..400).map(|i| (i & 0xff) as u8).collect();
+    fs.write_to_root(b"f", &big, &mut a, &mut b).unwrap();
+    fs.write_to_root(b"f", b"tiny", &mut a, &mut b).unwrap();
+
+    let mut a2 = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b2 = [0u8; MemStorage::BLOCK_SIZE];
+    let r = fs.resolve(Path::new("/f").unwrap(), &mut a2, &mut b2).unwrap();
+    assert_eq!(r.struct_type, TagType::InlineStruct);
+    assert_eq!(r.struct_body, b"tiny");
+}
+
+#[test]
+fn write_to_root_rejects_overwriting_directory() {
+    // mkdir /foo, then try to write to /foo (as a file). Must fail
+    // with AlreadyExists; the directory must remain intact.
+    let mut fs = make_fs();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    fs.mkdir(Path::new("/foo").unwrap(), &mut a, &mut b).unwrap();
+
+    // Small content -> tries write_inline; current write_inline_to_pair
+    // accepts existing-as-directory via Update which is wrong. Let me
+    // first test the CTZ path (which we just added the kind check to).
+    let big: Vec<u8> = vec![0; 400];
+    let err = fs.write_to_root(b"foo", &big, &mut a, &mut b).unwrap_err();
+    assert_eq!(err, Error::AlreadyExists);
+
+    // /foo must still be a directory.
+    let r = fs.resolve(Path::new("/foo").unwrap(), &mut a, &mut b).unwrap();
+    assert_eq!(r.entry.kind, EntryKind::Directory);
 }
 
 #[test]

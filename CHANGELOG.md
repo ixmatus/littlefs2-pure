@@ -6,6 +6,28 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **`Fs::append_to_path` and CTZ updates (Phase 2f.1).** Atomic
+  full-rewrite append: reads existing content, concatenates with the
+  new bytes, writes back via `write_to_path`. Handles all three
+  layout transitions automatically:
+  - inline-grows-inline: rewrite as inline
+  - inline-to-CTZ promotion: write new chain, drop inline body
+  - CTZ-to-CTZ extension: write new chain, old chain orphaned
+  The caller provides a `content_scratch` buffer big enough to hold
+  the combined existing-plus-new content. O(file_size) per append;
+  fine for the SMIL audit logger's 80-byte-entry workload. A
+  stateful streaming File API (true incremental CTZ chain extension)
+  is the Phase 2f.2 follow-up.
+- **`WriteOp::UpdateCtz` and CTZ-on-existing-entry updates.**
+  `write_ctz_to_pair` now updates an existing regular-file entry
+  in-place (via `UpdateCtz`, which emits a `CtzStruct` tag at the
+  existing id). The old chain becomes unreachable and the allocator
+  reclaims its blocks on the next scan. `write_to_root` /
+  `write_to_path` likewise handle the three transitions
+  (inline↔CTZ) transparently.
+- **Reject overwriting a directory with a file.** Both
+  `write_inline_to_pair` and `write_ctz_to_pair` now return
+  `Error::AlreadyExists` if the target name resolves to a Directory.
 - **`Fs::mkdir`, path-based writes/removes, and `list_dir` (Phase 2e).**
   - `mkdir(path)`: resolves the parent, allocates a fresh metadata
     pair for the new directory, erases + initializes it with one

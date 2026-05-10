@@ -18,6 +18,7 @@ This file points downstream consumers (SMIL firmware, etc.) at the relevant entr
 | Write a large file as CTZ | `Fs::write_ctz_to_root(name, content, ...)` | Allocates blocks and writes the skip-list chain |
 | Create a directory | `Fs::mkdir(path, ...)` | Allocates a fresh metadata pair, writes empty initial commit |
 | Remove a file at root | `Fs::remove_from_root(name, ...)` | Splice-correct; deleted entries no longer resolve |
+| Append to a file (atomic full-rewrite) | `Fs::append_to_path(path, additional, content_scratch, ...)` | Creates if missing; handles inline↔CTZ transitions |
 | Remove a file at path | `Fs::remove_at_path(path, ...)` | Resolves parent, then removes |
 | List a directory | `Fs::list_dir(path, callback, ...)` | Splice-correct, skips superblock; single-pair only (no HardTail chasing yet) |
 | List root directory | `Fs::list_root(callback, ...)` | Skips the superblock; renumbers across splice |
@@ -27,10 +28,10 @@ This file points downstream consumers (SMIL firmware, etc.) at the relevant entr
 
 | Capability | Tracking |
 |---|---|
-| Stateful File handle (open / read / write / seek / set_len / sync) | Phase 2f (designs around a `File<'fs, S>` cursor) |
+| Stateful `File<'fs, S>` handle with `open / read / write / seek / set_len / sync` | Phase 2f.2 (the existing `append_to_path` covers append-only workloads atomically) |
+| Streaming append for huge files (no full read-rewrite) | Phase 2f.2 (true incremental CTZ chain extension) |
 | `rmdir` (with emptiness check + pair free) | Phase 2g |
 | `rename` | Phase 2g |
-| CTZ-on-CTZ updates (overwrite a large file with new large content) | Phase 2f follow-up |
 | Multi-pair directory listing (HardTail chasing in `list_dir`) | Phase 2g |
 | Power-loss fuzz / Kani harnesses | Phase 3 |
 
