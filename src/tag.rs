@@ -349,6 +349,45 @@ impl Tag {
     pub const fn xor(self, other: Tag) -> Tag {
         Self(self.0 ^ other.0)
     }
+
+    /// Body length in bytes. Zero for tags whose length field is the special
+    /// sentinel (`0x3FF`, the "delete" or "no body" marker); otherwise the
+    /// length field value.
+    #[inline]
+    #[must_use]
+    pub const fn body_len(self) -> usize {
+        if self.is_special_length() {
+            0
+        } else {
+            self.length() as usize
+        }
+    }
+
+    /// On disk size in bytes: the 4 byte tag word plus the body length.
+    /// Matches the C reference's `lfs2_tag_dsize`.
+    #[inline]
+    #[must_use]
+    pub const fn dsize(self) -> usize {
+        4 + self.body_len()
+    }
+
+    /// `true` if this is a commit CRC tag (type `0x500..=0x503`).
+    #[inline]
+    #[must_use]
+    pub const fn is_ccrc(self) -> bool {
+        matches!(self.tag_type(), TagType::CommitCrc(_))
+    }
+
+    /// If this is a [`TagType::CommitCrc`], returns its chunk byte (low 2
+    /// bits carry the erase state hint).
+    #[inline]
+    #[must_use]
+    pub const fn ccrc_chunk(self) -> Option<u8> {
+        match self.tag_type() {
+            TagType::CommitCrc(c) => Some(c),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Debug for Tag {

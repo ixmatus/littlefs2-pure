@@ -40,6 +40,7 @@ extern crate std;
 pub mod block;
 pub mod crc;
 pub mod error;
+pub mod meta;
 pub mod path;
 pub mod storage;
 pub mod tag;
