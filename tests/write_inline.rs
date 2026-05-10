@@ -63,7 +63,10 @@ fn write_multiple_files_each_at_next_id() {
 }
 
 #[test]
-fn write_duplicate_name_rejected() {
+fn write_duplicate_name_updates_content() {
+    // write_inline_to_root has upsert semantics: writing to an existing
+    // name replaces the content. Verifies the second write succeeds and
+    // a read returns the second content.
     let mut storage = MemStorage::new();
     let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
     Fs::format(&mut storage, &mut scratch).unwrap();
@@ -73,9 +76,55 @@ fn write_duplicate_name_rejected() {
 
     let mut a = [0u8; MemStorage::BLOCK_SIZE];
     let mut b = [0u8; MemStorage::BLOCK_SIZE];
-    fs.write_inline_to_root(b"dup.txt", b"first", &mut a, &mut b).unwrap();
-    let err = fs.write_inline_to_root(b"dup.txt", b"second", &mut a, &mut b).unwrap_err();
-    assert_eq!(err, Error::AlreadyExists);
+    fs.write_inline_to_root(b"cfg", b"v1", &mut a, &mut b).unwrap();
+    fs.write_inline_to_root(b"cfg", b"v2-updated", &mut a, &mut b).unwrap();
+
+    let mut a2 = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b2 = [0u8; MemStorage::BLOCK_SIZE];
+    let r = fs.resolve(Path::new("/cfg").unwrap(), &mut a2, &mut b2).unwrap();
+    assert_eq!(r.struct_body, b"v2-updated");
+}
+
+#[test]
+fn many_updates_to_same_name_survive_remount() {
+    // Hammer the same name with many updates. Each update appends a
+    // new InlineStruct (small commit); eventually the block fills and
+    // compaction GCs to the alternate. After every update, the latest
+    // content must be readable. Then a fresh mount must agree.
+    let mut storage = MemStorage::new();
+    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    Fs::format(&mut storage, &mut scratch).unwrap();
+
+    let final_content;
+    {
+        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+
+        let mut a = [0u8; MemStorage::BLOCK_SIZE];
+        let mut b = [0u8; MemStorage::BLOCK_SIZE];
+        for i in 0..40u32 {
+            let v = format!("rev{i:03}");
+            fs.write_inline_to_root(b"state", v.as_bytes(), &mut a, &mut b).unwrap();
+        }
+        final_content = b"rev039".to_vec();
+
+        // Confirm latest content visible to the live Fs.
+        let mut a2 = [0u8; MemStorage::BLOCK_SIZE];
+        let mut b2 = [0u8; MemStorage::BLOCK_SIZE];
+        let r = fs.resolve(Path::new("/state").unwrap(), &mut a2, &mut b2).unwrap();
+        assert_eq!(r.struct_body, &final_content[..]);
+        storage = fs.into_storage();
+    }
+
+    // Fresh mount sees the final content too (durability check).
+    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let r = fs.resolve(Path::new("/state").unwrap(), &mut a, &mut b).unwrap();
+    assert_eq!(r.struct_body, &final_content[..]);
 }
 
 #[test]

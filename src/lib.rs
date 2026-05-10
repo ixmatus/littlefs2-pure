@@ -44,6 +44,7 @@ pub mod dir;
 pub mod error;
 pub mod fs;
 pub mod meta;
+pub mod nor;
 pub mod path;
 pub mod storage;
 pub mod superblock;
@@ -60,6 +61,7 @@ pub use crate::dir::{entries, live_entries, lookup, DirEntry, EntryKind, Resolve
 pub use crate::error::{Error, Result};
 pub use crate::fs::{Fs, ResolvedPath};
 pub use crate::meta::{MetadataPair, MetadataReader, TagEntry};
+pub use crate::nor::NorAlignedStorage;
 pub use crate::path::Path;
 pub use crate::storage::Storage;
 pub use crate::superblock::Superblock;

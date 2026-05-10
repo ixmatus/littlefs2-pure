@@ -25,8 +25,10 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 - [ ] Commit construction with FCRC redundancy. The current builder emits CCRC only; FCRC for next-prog erase detection is not yet integrated. (Phase 2 follow-up)
 - [ ] Block allocator with the lookahead buffer.
 - [ ] Compaction on full metadata pair.
-- [x] File write (inline, root-only): `Fs::write_inline_to_root` appends a Create + NAME + InlineStruct commit. (Phase 2b)
-- [ ] File write at arbitrary paths (not just root): requires path resolution to a directory + append. (Phase 2b.2)
+- [x] File write (inline, root-only) with upsert semantics: `Fs::write_inline_to_root` appends a Create+NAME+InlineStruct or just an InlineStruct (if updating). (Phase 2b)
+- [x] Compaction on overflow: when the active block fills, GC live state plus the new write into a fresh commit on the alternate, bump revision. (Phase 2b.2)
+- [x] NOR-aligned program wrapper: `NorAlignedStorage` caches programs to `PROG_SIZE` aligned windows. (Phase 2b.3)
+- [ ] File write at arbitrary paths (not just root): requires path resolution to a directory + append. (Phase 2b.4)
 - [ ] File write with CTZ extension when content exceeds inline threshold: requires block allocator. (Phase 2d)
 - [x] `Fs::format` producing a superblock the C reference can mount. (Phase 2a; bit accuracy verified against `meta::MetadataReader` round-trip; C-reference cross-check pending the conformance harness.)
 - [ ] Sync semantics (`Fs::sync`, drop on close).

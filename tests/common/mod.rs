@@ -119,6 +119,97 @@ impl BlockBuilder {
     }
 }
 
+/// In memory [`Storage`] backing that enforces strict NOR flash
+/// semantics: programs may only start at `PROG_SIZE` aligned addresses,
+/// must cover a `PROG_SIZE` window, and may only flip bits from `1` to
+/// `0`. Any violation panics — tests using this storage assert that
+/// the kernel + `NorAlignedStorage` wrapper produce NOR-compliant
+/// programs.
+#[derive(Debug)]
+pub struct StrictNorStorage {
+    pub data: alloc::vec::Vec<u8>,
+}
+
+impl StrictNorStorage {
+    pub const READ_SIZE: usize = 16;
+    pub const PROG_SIZE: usize = 16;
+    pub const BLOCK_SIZE: usize = 256;
+    pub const BLOCK_COUNT: u32 = 8;
+    pub const CACHE_SIZE: usize = 64;
+    pub const LOOKAHEAD_SIZE: usize = 8;
+
+    pub fn new() -> Self {
+        Self { data: alloc::vec![0xFFu8; Self::BLOCK_SIZE * Self::BLOCK_COUNT as usize] }
+    }
+}
+
+impl Default for StrictNorStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Storage for StrictNorStorage {
+    type Error = ();
+    const READ_SIZE: usize = Self::READ_SIZE;
+    const PROG_SIZE: usize = Self::PROG_SIZE;
+    const BLOCK_SIZE: usize = Self::BLOCK_SIZE;
+    const BLOCK_COUNT: u32 = Self::BLOCK_COUNT;
+    const CACHE_SIZE: usize = Self::CACHE_SIZE;
+    const LOOKAHEAD_SIZE: usize = Self::LOOKAHEAD_SIZE;
+
+    fn read(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), ()> {
+        let start = (block as usize) * Self::BLOCK_SIZE + (off as usize);
+        if start + buf.len() > self.data.len() {
+            return Err(());
+        }
+        buf.copy_from_slice(&self.data[start..start + buf.len()]);
+        Ok(())
+    }
+
+    fn program(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), ()> {
+        assert_eq!(
+            off as usize % Self::PROG_SIZE,
+            0,
+            "NOR program must be PROG_SIZE-aligned, got off={off}"
+        );
+        assert_eq!(
+            data.len() % Self::PROG_SIZE,
+            0,
+            "NOR program must be a PROG_SIZE multiple, got len={}",
+            data.len()
+        );
+        let start = (block as usize) * Self::BLOCK_SIZE + (off as usize);
+        if start + data.len() > self.data.len() {
+            return Err(());
+        }
+        // NOR-only semantics: only 1 -> 0 transitions allowed.
+        for (existing, &new) in self.data[start..start + data.len()].iter().zip(data) {
+            assert_eq!(
+                *existing & new,
+                new,
+                "NOR program flipped a 0 bit to 1 (existing={existing:#x}, new={new:#x})"
+            );
+        }
+        for (existing, &new) in self.data[start..start + data.len()].iter_mut().zip(data) {
+            *existing &= new;
+        }
+        Ok(())
+    }
+
+    fn erase(&mut self, block: u32) -> Result<(), ()> {
+        let start = (block as usize) * Self::BLOCK_SIZE;
+        let end = start + Self::BLOCK_SIZE;
+        if end > self.data.len() {
+            return Err(());
+        }
+        for b in &mut self.data[start..end] {
+            *b = 0xFF;
+        }
+        Ok(())
+    }
+}
+
 /// In memory [`Storage`] backing for the integration tests.
 ///
 /// Holds `BLOCK_SIZE * BLOCK_COUNT` bytes in a `Vec` and implements the
