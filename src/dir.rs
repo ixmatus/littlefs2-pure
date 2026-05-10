@@ -84,9 +84,119 @@ impl<'a> Iterator for Entries<'a> {
 }
 
 /// Construct an entry iterator over a metadata pair.
+///
+/// **Raw walker.** Yields every NAME tag in commit order, including
+/// names of entries that were subsequently deleted by a [`TagType::Delete`]
+/// splice tag. Use [`live_entries`] for splice-correct enumeration.
 #[must_use]
 pub fn entries<'a>(pair: &MetadataPair<'a>) -> Entries<'a> {
     Entries { inner: pair.reader.iter_tags() }
+}
+
+/// Maximum number of live entries per metadata pair supported by
+/// [`live_entries`].
+///
+/// The pair's tag stream is bounded by block_size, and each entry needs
+/// at minimum a 4 byte NAME tag plus a 12 byte STRUCT tag, so a 4 KiB
+/// block tops out around 250 entries; 256 covers that with margin. The
+/// state array is `MAX_LIVE_ENTRIES * sizeof(EntrySlot)` bytes on the
+/// stack, so a smaller cap may be appropriate for tight embedded
+/// targets (this is a future tunable).
+pub const MAX_LIVE_ENTRIES: usize = 256;
+
+/// Walk a metadata pair's tag stream, applying splice (Create / Delete)
+/// renumbering, and invoke `f` for each live entry in current id order.
+///
+/// "Live" means the entry has a NAME tag and has not been removed by a
+/// subsequent [`TagType::Delete`] tag in the same commit log. Ids are
+/// assigned by walk position after renumbering, not by the on disk id
+/// field of the originating NAME tag.
+///
+/// Returns the total number of live entries on success. Returns
+/// [`crate::error::Error::OutOfRange`] if the directory at any point
+/// exceeds [`MAX_LIVE_ENTRIES`], or [`crate::error::Error::Corrupt`] if
+/// a splice tag references an id outside the current count.
+///
+/// # Algorithm
+///
+/// Mirrors the splice handling in `lfs_dir_fetchmatch` (`lfs.c:1095`).
+/// Walking forward in commit order, the iterator maintains an array of
+/// "slots" indexed by current id. A Create at id `i` shifts slots up;
+/// a Delete at id `i` shifts them down. NAME tags at id `i` populate
+/// the slot's name and kind. At the end, slots `0..count` hold the
+/// final state.
+pub fn live_entries<'a, F, E>(
+    pair: &MetadataPair<'a>,
+    mut f: F,
+) -> Result<usize, crate::error::Error>
+where
+    F: FnMut(DirEntry<'a>) -> Result<(), E>,
+    E: Into<crate::error::Error>,
+{
+    let mut slots: [Option<DirEntry<'a>>; MAX_LIVE_ENTRIES] = [None; MAX_LIVE_ENTRIES];
+    let mut count: usize = 0;
+
+    for entry in pair.reader.iter_tags() {
+        let tag = entry.tag;
+        let id = tag.id() as usize;
+        match tag.tag_type() {
+            TagType::Create => {
+                if count >= MAX_LIVE_ENTRIES {
+                    return Err(crate::error::Error::OutOfRange);
+                }
+                if id > count {
+                    return Err(crate::error::Error::Corrupt);
+                }
+                let mut i = count;
+                while i > id {
+                    slots[i] = slots[i - 1];
+                    i -= 1;
+                }
+                slots[id] = None;
+                count += 1;
+            }
+            TagType::Delete => {
+                if id >= count {
+                    return Err(crate::error::Error::Corrupt);
+                }
+                let mut i = id;
+                while i + 1 < count {
+                    slots[i] = slots[i + 1];
+                    i += 1;
+                }
+                slots[count - 1] = None;
+                count -= 1;
+            }
+            TagType::RegularFile | TagType::Directory => {
+                if id >= count {
+                    // A NAME tag without a prior Create is allowed at the
+                    // boundary `id == count` (legacy commits without an
+                    // explicit Create implicitly bump the count). Reject
+                    // anything beyond.
+                    if id == count && count < MAX_LIVE_ENTRIES {
+                        count += 1;
+                    } else {
+                        return Err(crate::error::Error::Corrupt);
+                    }
+                }
+                let kind = if matches!(tag.tag_type(), TagType::RegularFile) {
+                    EntryKind::RegularFile
+                } else {
+                    EntryKind::Directory
+                };
+                slots[id] = Some(DirEntry { id: id as u16, name: entry.body, kind });
+            }
+            _ => {} // STRUCT / CCRC / FCRC / etc. don't affect the entry roster.
+        }
+    }
+
+    for (i, slot) in slots.iter().enumerate().take(count) {
+        if let Some(mut e) = *slot {
+            e.id = i as u16;
+            f(e).map_err(Into::into)?;
+        }
+    }
+    Ok(count)
 }
 
 /// A resolved entry: the directory entry plus its STRUCT body.

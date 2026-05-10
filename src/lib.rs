@@ -56,7 +56,7 @@ pub mod tag;
 
 pub use crate::block::{BlockAddress, BlockPair};
 pub use crate::ctz::CtzStruct;
-pub use crate::dir::{entries, lookup, DirEntry, EntryKind, Resolved};
+pub use crate::dir::{entries, live_entries, lookup, DirEntry, EntryKind, Resolved};
 pub use crate::error::{Error, Result};
 pub use crate::fs::{Fs, ResolvedPath};
 pub use crate::meta::{MetadataPair, MetadataReader, TagEntry};

@@ -6,6 +6,21 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **Splice handling (`dir::live_entries`, Phase 1i.1).** New
+  enumerator that applies Create / Delete renumbering during the walk.
+  Maintains a `[Option<DirEntry<'a>>; MAX_LIVE_ENTRIES]` slot array,
+  shifting on each splice tag, and emits the final live entries in
+  current id order. The existing `dir::entries` is preserved as the
+  raw walker. 7 integration tests cover Create/Name, Create then
+  Delete, mid-delete renumbering, Create after Delete reusing
+  renumbered slot, splice across commits.
+- **HardTail chasing (Phase 1i.2).** `MetadataReader` now scans the
+  committed region for the latest Tail tag and exposes
+  `tail()` and `is_hard_tail()`. `Fs::resolve` chases HardTails at
+  every component (both intermediate and final), matching
+  `lfs_dir_find`'s inner loop (`lfs.c:1538`). 2 integration tests:
+  resolution succeeds through a HardTail; SoftTail correctly does
+  not get chased.
 - **`Fs::resolve` and `ResolvedPath` (Phase 1h).** Full absolute-path
   resolution: walks from the root metadata pair through every
   intermediate directory by name, returning the final entry plus the

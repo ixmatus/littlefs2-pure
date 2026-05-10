@@ -186,40 +186,78 @@ impl<S: Storage> Fs<S> {
             return Err(Error::InvalidPath);
         }
 
+        // Walk intermediate path components, descending through any
+        // matched directories and chasing HardTail-threaded
+        // continuations as needed. Each intermediate step returns a
+        // `BlockPair` (Copy) so the buffer borrows don't escape.
         let mut current = self.root;
-
-        // Walk every component, descending on each Directory match.
-        // Bounds: a LittleFS path has at most NAME_MAX-bounded components;
-        // typical depths are small. We re-read the pair on each step.
         let mut components = path.components().peekable();
-        loop {
+        let leaf_name = loop {
             let name = components.next().ok_or(Error::InvalidPath)?;
-            let is_last = components.peek().is_none();
+            if components.peek().is_none() {
+                break name;
+            }
+            current = self.find_dir_pair(current, name.as_bytes(), buf_a, buf_b)?;
+        };
 
-            // Read the current pair into the caller buffers.
+        // Final component: look up in the current pair, chasing HardTails.
+        // The matching read leaves buf_a/buf_b populated with that pair's
+        // bytes; we return a `ResolvedPath<'b>` borrowing from them.
+        loop {
             self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
             self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-
-            if is_last {
-                // Final component: parse the pair, look up the name,
-                // return the resolved view. The lifetimes flow naturally
-                // through MetadataPair<'b> into Resolved<'b>.
-                let pair = MetadataPair::parse(current.a, buf_a, current.b, buf_b)?;
-                let resolved = crate::dir::lookup(&pair, name.as_bytes()).ok_or(Error::NotFound)?;
-                return Ok(ResolvedPath {
-                    pair: BlockPair::new(pair.active_block, pair.alternate_block),
-                    entry: resolved.entry,
-                    struct_type: resolved.struct_type,
-                    struct_body: resolved.struct_body,
-                });
+            // We need to drop the pair borrow before potentially looping
+            // back to re-read. Scope it tightly.
+            let tail_to_follow = {
+                let pair = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
+                if crate::dir::lookup(&pair, leaf_name.as_bytes()).is_some() {
+                    None
+                } else if pair.reader.is_hard_tail() {
+                    pair.reader.tail()
+                } else {
+                    return Err(Error::NotFound);
+                }
+            };
+            if let Some(next) = tail_to_follow {
+                current = next;
+                continue;
             }
+            // Found here; re-parse to produce the returned 'b-lifetime view.
+            let pair = MetadataPair::parse(current.a, buf_a, current.b, buf_b)?;
+            let resolved = crate::dir::lookup(&pair, leaf_name.as_bytes()).expect(
+                "lookup succeeded once already in this iteration; the data has not changed",
+            );
+            return Ok(ResolvedPath {
+                pair: BlockPair::new(pair.active_block, pair.alternate_block),
+                entry: resolved.entry,
+                struct_type: resolved.struct_type,
+                struct_body: resolved.struct_body,
+            });
+        }
+    }
 
-            // Intermediate component: must resolve to a Directory.
-            // Borrow the pair only long enough to extract the DirStruct
-            // body's two block addresses, then drop and continue.
-            let next_pair = {
-                let pair = MetadataPair::parse(current.a, buf_a, current.b, buf_b)?;
-                let resolved = crate::dir::lookup(&pair, name.as_bytes()).ok_or(Error::NotFound)?;
+    /// Locate a Directory entry by name within `dir_pair` (chasing
+    /// HardTail-threaded continuations), and return the address of its
+    /// metadata pair. Returns [`Error::NotFound`] if the name does not
+    /// resolve to a Directory in the chain.
+    ///
+    /// Used internally by [`Fs::resolve`] for intermediate path
+    /// components. Exposed-via-method form because the helper does not
+    /// retain a borrow of `buf_a` / `buf_b` past return, decoupling
+    /// the caller's lifetime requirements.
+    fn find_dir_pair(
+        &mut self,
+        dir_pair: BlockPair,
+        name: &[u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<BlockPair, Error> {
+        let mut current = dir_pair;
+        loop {
+            self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+            self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            let pair = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
+            if let Some(resolved) = crate::dir::lookup(&pair, name) {
                 if resolved.entry.kind != crate::dir::EntryKind::Directory {
                     return Err(Error::NotFound);
                 }
@@ -240,9 +278,15 @@ impl<S: Storage> Fs<S> {
                     resolved.struct_body[6],
                     resolved.struct_body[7],
                 ]);
-                BlockPair::new(BlockAddress::new(a), BlockAddress::new(b))
-            };
-            current = next_pair;
+                return Ok(BlockPair::new(BlockAddress::new(a), BlockAddress::new(b)));
+            }
+            if pair.reader.is_hard_tail() {
+                if let Some(tail) = pair.reader.tail() {
+                    current = tail;
+                    continue;
+                }
+            }
+            return Err(Error::NotFound);
         }
     }
 
