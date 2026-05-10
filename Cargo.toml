@@ -1,0 +1,70 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.84"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ixmatus/littlefs2-pure"
+authors = ["Parnell Springmeyer <parnell@digitalmentat.com>"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+unreadable_literal = "allow"
+cast_possible_truncation = "allow"
+cast_lossless = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+similar_names = "allow"
+items_after_statements = "allow"
+too_many_lines = "allow"
+# Proper nouns (LittleFS, XOR, CTZ, CRC) and acronyms appear constantly
+# in our docs; backticking each occurrence adds noise without clarity.
+doc_markdown = "allow"
+
+[package]
+name = "littlefs2-pure"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Pure Rust no_std implementation of the LittleFS v2 on-disk format. 0.x is the foundation layer; v1.0 will ship full read and write."
+keywords = ["littlefs", "filesystem", "embedded", "no-std", "flash"]
+categories = ["embedded", "filesystem", "no-std", "no-std::no-alloc"]
+
+[features]
+# Default to a pure no_std no_alloc surface. Embedded users get the
+# baseline; richer hosts opt into `alloc` and `std`.
+default = []
+# Enable `alloc`-dependent APIs (Vec-based read buffers, owned PathBuf).
+alloc = []
+# Enable `std::io::Read` / `std::io::Write` adapters and the std::error::Error impl.
+std = ["alloc"]
+# Compile Kani proof harnesses. Off in normal builds.
+kani = []
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+debug = false

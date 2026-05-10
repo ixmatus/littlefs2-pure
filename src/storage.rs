@@ -1,0 +1,100 @@
+//! The hardware boundary.
+//!
+//! Everything above the [`Storage`] trait is generic in `S: Storage` and
+//! knows nothing about flash chips, memory mapped files, or `embedded-hal`
+//! versions. Host code that wants to back a filesystem with an OS file wraps
+//! the file in a `Storage` impl; that wrapper is the only place that needs
+//! `std`.
+//!
+//! The associated constants advertise the geometry. The methods read,
+//! program, and erase aligned regions and report I/O failures through the
+//! associated [`Storage::Error`] type. Misalignment is a precondition
+//! violation, not an error return: callers in the kernel always align before
+//! calling, and the trait may panic or return an unspecified error on
+//! misaligned input. Embedded callers should treat misalignment as a bug.
+
+use core::fmt::Debug;
+use core::result::Result;
+
+/// The hardware abstraction for a LittleFS backing store.
+///
+/// All offsets and sizes are in bytes. The block coordinate `(block, off)`
+/// addresses byte `block * BLOCK_SIZE + off`. The trait does no bounds
+/// checking; callers in the kernel enforce all geometry invariants.
+///
+/// # Geometry invariants
+///
+/// - `READ_SIZE`, `PROG_SIZE`, and `CACHE_SIZE` are powers of two.
+/// - `BLOCK_SIZE` is a positive multiple of `PROG_SIZE` (and therefore of
+///   `READ_SIZE`).
+/// - Every call to [`read`](Self::read), [`program`](Self::program), and
+///   [`erase`](Self::erase) operates on regions aligned to and sized as a
+///   multiple of the respective unit.
+pub trait Storage {
+    /// The error type for the underlying device.
+    type Error: Debug;
+
+    /// Minimum read granularity, in bytes. Typical NOR flash: 1, 16, or 256.
+    const READ_SIZE: usize;
+
+    /// Minimum program granularity, in bytes. Typical NOR flash: 1, 16, or
+    /// 256. Must be at least as large as `READ_SIZE` per the LittleFS spec.
+    const PROG_SIZE: usize;
+
+    /// Size of one erase block, in bytes. Typical NOR flash: 4 KiB.
+    const BLOCK_SIZE: usize;
+
+    /// Total number of erase blocks on the device.
+    const BLOCK_COUNT: u32;
+
+    /// Wear leveling rotation interval, in number of metadata commits before
+    /// rotating across the metadata pair. `500` is the C reference default.
+    /// Set to a negative value to disable wear leveling.
+    const BLOCK_CYCLES: i32 = 500;
+
+    /// Working cache size in bytes, used by both metadata and file
+    /// operations. Must be a multiple of `PROG_SIZE` and a factor of
+    /// `BLOCK_SIZE`.
+    const CACHE_SIZE: usize;
+
+    /// Lookahead buffer size in bytes for the block allocator. Each bit
+    /// tracks one block; the buffer is rotated as the filesystem walks for
+    /// free blocks. Must be a multiple of 8.
+    const LOOKAHEAD_SIZE: usize;
+
+    /// Read `buf.len()` bytes starting at `(block, off)` into `buf`.
+    fn read(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), Self::Error>;
+
+    /// Program `data.len()` bytes into the region starting at `(block, off)`.
+    /// The target region must have been erased since the last program of the
+    /// same bytes; rewriting without an intervening erase is undefined.
+    fn program(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), Self::Error>;
+
+    /// Erase one block. After erase the block reads as all `0xFF` bytes.
+    fn erase(&mut self, block: u32) -> Result<(), Self::Error>;
+
+    /// Flush any internal caches in the backing store. The kernel calls this
+    /// after a commit, before claiming the commit is durable.
+    fn sync(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// A trait for storage that supports only reads. Useful for inspecting a
+/// committed image without the lifetime cost of `&mut self`.
+///
+/// All `Storage` impls implicitly satisfy the read surface; this trait exists
+/// for read only consumers that should not require a mutable reference.
+pub trait ReadOnlyStorage {
+    /// The error type for the underlying device.
+    type Error: Debug;
+
+    /// Block size in bytes (same semantics as [`Storage::BLOCK_SIZE`]).
+    const BLOCK_SIZE: usize;
+
+    /// Total number of blocks (same semantics as [`Storage::BLOCK_COUNT`]).
+    const BLOCK_COUNT: u32;
+
+    /// Read `buf.len()` bytes starting at `(block, off)` into `buf`.
+    fn read(&self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), Self::Error>;
+}
