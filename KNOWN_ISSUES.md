@@ -12,7 +12,7 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 - [x] Single-pair name lookup with STRUCT pairing. (`src/dir.rs::lookup`, Phase 1f sliver)
 - [ ] Splice handling: Delete tags renumber entries with higher ids; the current iterator yields deleted entries. (Phase 1e.2)
 - [ ] HardTail chasing: directories split across multiple metadata pairs. (Phase 1e.3)
-- [ ] Full path resolution: walk from root by name, descending into subdirectories. (Phase 1e.4)
+- [x] Full path resolution: walk from root by name, descending into subdirectories. (`src/fs.rs::resolve`, Phase 1h)
 - [x] File read for inline structs: the InlineStruct body *is* the file content; `dir::lookup` returns it directly. (Phase 1f sliver)
 - [x] CTZ struct codec and geometry math: 8 byte body decode/encode, skip pointer count per block, content bytes per block, file offset -> (block, abs_offset) translation. (`src/ctz.rs`, Phase 1g foundations)
 - [x] CTZ storage-backed read: walk the chain backward from head, fetch each block's content portion, reassemble. (`src/ctz.rs::read_ctz`, Phase 1g full)

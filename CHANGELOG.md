@@ -6,6 +6,15 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **`Fs::resolve` and `ResolvedPath` (Phase 1h).** Full absolute-path
+  resolution: walks from the root metadata pair through every
+  intermediate directory by name, returning the final entry plus the
+  pair it lives in. Buffers passed in by the caller; after return they
+  contain the bytes of the final pair and the returned `ResolvedPath`
+  borrows from them.
+  Errors: `InvalidPath` for `/`, `NotFound` for missing components
+  (leaf or intermediate) and for intermediate components that are
+  regular files, `Corrupt` for malformed `DirStruct` bodies.
 - **`ctz::read_ctz` storage-backed CTZ file read (Phase 1g full).**
   Walks the skip list chain backward from head using the
   `count = 2 - (index & 1)` rule from `lfs_ctz_traverse` (`lfs.c:2990`),
