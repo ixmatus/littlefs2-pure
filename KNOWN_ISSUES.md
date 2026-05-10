@@ -43,8 +43,12 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 - [x] `exists`: typed wrapper over `resolve`. (Phase 2b.4)
 - [x] `mkdir`: create a directory at an arbitrary path. (`src/fs.rs::mkdir`, Phase 2e)
 - [x] `write_to_path` / `remove_at_path` / `list_dir`: path-based file ops on arbitrary directories. (Phase 2e)
-- [ ] `rmdir`: remove an empty directory. Currently `remove_at_path` works on directories but doesn't validate emptiness or free the directory's pair. (Phase 2g)
-- [ ] `rename`: move an entry between directories. (Phase 2g)
+- [x] `rmdir`: remove an empty directory with emptiness check. (`src/fs.rs::rmdir`, Phase 2g.1)
+- [x] `remove_at_path` rejects directory targets (must use `rmdir`). (Phase 2g.1)
+- [x] `read_at_path` / `size_of` (offset-aware random read; works for inline + CTZ). (Phase 2g.3)
+- [x] `truncate_path` (shrink or zero-extend a file via atomic rewrite). (Phase 2g.4)
+- [x] `rename` within the same directory. (`src/fs.rs::rename_in_dir`, Phase 2g.2)
+- [ ] Cross-directory rename (move an entry from one directory to another). Needs Delete-from-source + Create-in-destination with proper splice handling. (Phase 2g.5)
 - [ ] User attribute write.
 - [ ] Atomic move state recovery.
 

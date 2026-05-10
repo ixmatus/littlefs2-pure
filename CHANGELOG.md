@@ -6,6 +6,33 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **`Fs::rename_in_dir` (Phase 2g.2).** Same-parent rename via a new
+  `WriteOp::RenameInPlace { id, name_type, new_name }` variant. The
+  reader picks the latest NAME for any given id, so appending a new
+  NAME at the existing id is sufficient. Useful for SMIL audit log
+  rotation (`/audit/log` → `/audit/log.archived`). Cross-directory
+  rename is a follow-up (needs Delete-from-source + Create-in-dest
+  with proper splice handling).
+- **`Fs::rmdir` (Phase 2g.1).** Remove an empty directory at a path.
+  Verifies the entry is a Directory and that its metadata pair has no
+  live entries before removing it. Returns `Error::NotEmpty` if the
+  directory still has contents; `Error::AlreadyExists` if the target
+  is a regular file (use `remove_at_path`). After removal, the
+  directory's metadata pair becomes unreachable and the allocator
+  reclaims its blocks on the next scan.
+- **`remove_at_path` rejects directories.** Now returns
+  `Error::AlreadyExists` for directory targets, forcing callers to
+  use `rmdir` explicitly (avoids orphaning the dir's contents).
+- **`Fs::read_at_path` and `Fs::size_of` (Phase 2g.3).**
+  `read_at_path(path, offset, &mut out, ...)` reads up to `out.len()`
+  bytes starting at `offset` from any file (inline or CTZ); the
+  layout is hidden. `size_of` returns the file's byte length.
+  Implemented via a new `ctz::read_ctz_at` that handles arbitrary
+  start offsets in the chain.
+- **`Fs::truncate_path` (Phase 2g.4).** Resize a file to exactly
+  `new_size` bytes. Shrinking drops trailing bytes; extending
+  zero-pads. Atomic full-rewrite (same model as `append_to_path`).
+- **`Error::NotEmpty`** variant.
 - **`Fs::append_to_path` and CTZ updates (Phase 2f.1).** Atomic
   full-rewrite append: reads existing content, concatenates with the
   new bytes, writes back via `write_to_path`. Handles all three
