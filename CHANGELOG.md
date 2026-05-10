@@ -6,6 +6,51 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **`NorAlignedStorage` wrapper (Phase 2b.3).** Adapter that converts
+  byte-granular `program` calls from the kernel into `PROG_SIZE`
+  aligned NOR-compliant programs. Caches the active program window in
+  a stack-allocated buffer (default `MAX_PROG_SIZE = 512`), flushes on
+  window change or `sync`, and enforces 1-to-0 only bit transitions
+  internally. Integration tests run the full format + write + remount
+  loop through a strict-NOR backing storage that panics on any 0-to-1
+  bit flip or misaligned program; the wrapper makes them all pass.
+- **Compaction (Phase 2b.2).** `write_inline_to_root` now transparently
+  compacts when the active block fills: builds a fresh commit on the
+  alternate block containing every live entry plus the new write,
+  bumps the revision counter, programs and erases. Subsequent mount
+  picks the alternate via the standard revision-based selection.
+  The superblock is preserved as id 0 of the root pair.
+- **Upsert semantics for `write_inline_to_root` (Phase 2b.1).** Writing
+  to an existing name now appends an `InlineStruct` at the existing
+  entry's id (later tag wins), instead of returning `AlreadyExists`.
+  Update commits are smaller than create commits, so the typical "save
+  changed config" workload extends the active block's life
+  significantly before compaction triggers.
+- **`Fs::write_inline_to_root` (Phase 2b).** Append a small file to
+  the root directory. Reads the active block, runs `live_entries` to
+  determine the next free id, builds a new commit (Create + NAME +
+  InlineStruct) on top of the existing committed region using
+  `Commit::new_appending`, and programs only the new bytes to flash.
+  Rejects duplicates (`Error::AlreadyExists`); returns
+  `Error::OutOfRange` if the commit would overflow the block (Phase
+  2e compaction lifts this).
+- **`meta::Commit::new_appending`.** Continue a metadata block at a
+  given offset with a pre-existing XOR base, supporting the append-
+  to-existing-pair pattern.
+- **`meta::Commit` slice-based commit builder (Phase 2a foundation).**
+  No-alloc, no-std builder for metadata commits. Takes a caller-supplied
+  byte slice; writes the revision header at offset 0; appends tags via
+  `tag()`; finalizes with `finish(chunk)` which emits the CCRC and
+  applies the post-commit parity flip. Decoupled from storage I/O so
+  callers can stage commits in memory and program them in one shot.
+- **`Fs::format` (Phase 2a).** Initial write-path operation: erases
+  blocks 0 and 1, then writes a single commit on block 0 containing the
+  superblock NAME magic (`b"littlefs"`) and the 24-byte InlineStruct
+  carrying the device geometry. Block 1 is left in pristine erased state
+  as the metadata pair's alternate.
+  Round-trip verified: `format` then `mount` succeeds and returns a
+  superblock matching the device geometry; the operation is idempotent
+  (the second format produces byte-identical bytes).
 - **Splice handling (`dir::live_entries`, Phase 1i.1).** New
   enumerator that applies Create / Delete renumbering during the walk.
   Maintains a `[Option<DirEntry<'a>>; MAX_LIVE_ENTRIES]` slot array,

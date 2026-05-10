@@ -278,6 +278,117 @@ fn scan_for_tail(block: &[u8], committed_end: usize) -> (Option<BlockPair>, bool
     (latest, is_hard)
 }
 
+/// Builder for one or more commits on a fresh (erased) metadata block.
+///
+/// Takes a caller-supplied byte slice of at least the block size, writes
+/// the revision header at offset 0, then appends tags via [`Commit::tag`].
+/// Each call to [`Commit::finish`] emits a CCRC and resets the running
+/// CRC; further [`Commit::tag`] calls start a new commit. [`Commit::done`]
+/// returns the number of bytes written.
+///
+/// The builder does **not** touch the storage device. It produces the
+/// on-disk byte layout in the caller's buffer; the caller is responsible
+/// for erasing the block and programming the buffer's contents. This
+/// separation keeps the builder no_std and no_alloc, and lets callers
+/// stage multiple commits in memory before committing to flash.
+///
+/// The byte layout matches what [`MetadataReader`] consumes (verified
+/// against `lfs_dir_commit` in the C reference).
+#[derive(Debug)]
+pub struct Commit<'a> {
+    buf: &'a mut [u8],
+    offset: usize,
+    ptag: u32,
+    crc: u32,
+}
+
+impl<'a> Commit<'a> {
+    /// Begin a metadata block by writing `revision` (LE `u32`) at offset
+    /// `0` and initializing the running XOR base and CRC accumulator.
+    ///
+    /// `buf` must be at least 8 bytes (4 for revision + 4 for a future
+    /// tag word) but is typically the full block size. Bytes past the
+    /// last commit are left untouched; callers usually pre-fill the
+    /// buffer with `0xFF` so it reads as erased.
+    pub fn new(buf: &'a mut [u8], revision: u32) -> Result<Self, Error> {
+        if buf.len() < 8 {
+            return Err(Error::OutOfRange);
+        }
+        buf[0..4].copy_from_slice(&revision.to_le_bytes());
+        let crc = crc::update(crc::INIT, &buf[0..4]);
+        Ok(Self { buf, offset: 4, ptag: 0xFFFF_FFFF, crc })
+    }
+
+    /// Continue an existing metadata block by appending a new commit at
+    /// `offset` with the given pre-existing XOR base `ptag`.
+    ///
+    /// Typically `offset` is [`MetadataReader::committed_end`] and
+    /// `ptag` is [`MetadataReader::next_ptag`] for the pair being
+    /// extended. The CRC accumulator starts fresh at [`crc::INIT`]
+    /// because every commit's CRC is independent.
+    ///
+    /// Bytes before `offset` are left untouched. Bytes from `offset`
+    /// onward are overwritten by `tag` and `finish` calls.
+    pub fn new_appending(buf: &'a mut [u8], offset: usize, ptag: u32) -> Result<Self, Error> {
+        if buf.len() < offset + 8 {
+            return Err(Error::OutOfRange);
+        }
+        Ok(Self { buf, offset, ptag, crc: crc::INIT })
+    }
+
+    /// Append a non-CCRC tag and its body to the in-progress commit.
+    ///
+    /// `body.len()` must equal `tag.body_len()`. Returns
+    /// [`Error::OutOfRange`] if the tag would overflow the buffer.
+    pub fn tag(&mut self, tag: Tag, body: &[u8]) -> Result<(), Error> {
+        if tag.is_ccrc() {
+            return Err(Error::InvalidTag);
+        }
+        if body.len() != tag.body_len() {
+            return Err(Error::InvalidTag);
+        }
+        let dsize = tag.dsize();
+        if self.offset + dsize > self.buf.len() {
+            return Err(Error::OutOfRange);
+        }
+        let raw = tag.into_bits() ^ self.ptag;
+        self.buf[self.offset..self.offset + 4].copy_from_slice(&raw.to_be_bytes());
+        self.crc = crc::update(self.crc, &raw.to_be_bytes());
+        if !body.is_empty() {
+            self.buf[self.offset + 4..self.offset + dsize].copy_from_slice(body);
+            self.crc = crc::update(self.crc, body);
+        }
+        self.ptag = tag.into_bits();
+        self.offset += dsize;
+        Ok(())
+    }
+
+    /// Finalize the current commit by emitting a CCRC with `chunk`.
+    /// The running CRC is included as the 4-byte LE body and is
+    /// reset for any subsequent commits. The XOR base is updated
+    /// for the next commit per the parity-flip rule.
+    pub fn finish(&mut self, chunk: u8) -> Result<(), Error> {
+        let ccrc_tag = Tag::new(true, crate::tag::TagType::CommitCrc(chunk), 0x3FF, 4);
+        if self.offset + 8 > self.buf.len() {
+            return Err(Error::OutOfRange);
+        }
+        let raw = ccrc_tag.into_bits() ^ self.ptag;
+        self.buf[self.offset..self.offset + 4].copy_from_slice(&raw.to_be_bytes());
+        self.crc = crc::update(self.crc, &raw.to_be_bytes());
+        self.buf[self.offset + 4..self.offset + 8].copy_from_slice(&self.crc.to_le_bytes());
+        self.ptag = ccrc_tag.into_bits() ^ ((u32::from(chunk) & 1) << 31);
+        self.crc = crc::INIT;
+        self.offset += 8;
+        Ok(())
+    }
+
+    /// Total bytes written so far, including the revision header.
+    #[must_use]
+    pub fn bytes_written(&self) -> usize {
+        self.offset
+    }
+}
+
 /// Iterator over tags in a [`MetadataReader`]'s committed region. Returned
 /// by [`MetadataReader::iter_tags`].
 #[derive(Clone, Debug)]
@@ -598,6 +709,62 @@ mod tests {
             MetadataPair::parse(BlockAddress::new(0), &block_a, BlockAddress::new(1), &block_b)
                 .unwrap_err();
         assert_eq!(err, Error::Corrupt);
+    }
+
+    #[test]
+    fn commit_builder_roundtrips_via_reader() {
+        let mut buf = vec![0xFFu8; 256];
+        let mut c = Commit::new(&mut buf, 42).unwrap();
+        c.tag(Tag::new(true, TagType::Superblock, 0, 8), b"littlefs").unwrap();
+        c.tag(Tag::new(true, TagType::InlineStruct, 0, 4), &[1, 2, 3, 4]).unwrap();
+        c.finish(0).unwrap();
+
+        let reader = MetadataReader::new(&buf).unwrap();
+        assert_eq!(reader.revision(), 42);
+        assert!(reader.has_commits());
+
+        let entries: Vec<_> = reader.iter_tags().collect();
+        assert_eq!(entries.len(), 3); // superblock NAME + InlineStruct + CCRC
+        assert_eq!(entries[0].tag.tag_type(), TagType::Superblock);
+        assert_eq!(entries[0].body, b"littlefs");
+        assert_eq!(entries[1].tag.tag_type(), TagType::InlineStruct);
+        assert_eq!(entries[1].body, &[1, 2, 3, 4]);
+        assert!(entries[2].tag.is_ccrc());
+    }
+
+    #[test]
+    fn commit_builder_rejects_ccrc_via_tag() {
+        let mut buf = vec![0xFFu8; 64];
+        let mut c = Commit::new(&mut buf, 1).unwrap();
+        let ccrc = Tag::new(true, TagType::CommitCrc(0), ID_NONE, 4);
+        let err = c.tag(ccrc, &[0u8; 4]).unwrap_err();
+        assert_eq!(err, Error::InvalidTag);
+    }
+
+    #[test]
+    fn commit_builder_rejects_body_length_mismatch() {
+        let mut buf = vec![0xFFu8; 64];
+        let mut c = Commit::new(&mut buf, 1).unwrap();
+        let t = Tag::new(true, TagType::InlineStruct, 0, 8);
+        // Tag says length 8 but body is only 4.
+        let err = c.tag(t, &[0u8; 4]).unwrap_err();
+        assert_eq!(err, Error::InvalidTag);
+    }
+
+    #[test]
+    fn commit_builder_rejects_overflow() {
+        let mut buf = [0xFFu8; 16];
+        let mut c = Commit::new(&mut buf, 1).unwrap();
+        // Tag with a body that doesn't fit (16 - 4 rev - 4 tag = 8 left, request 16).
+        let t = Tag::new(true, TagType::InlineStruct, 0, 16);
+        let err = c.tag(t, &[0u8; 16]).unwrap_err();
+        assert_eq!(err, Error::OutOfRange);
+    }
+
+    #[test]
+    fn commit_builder_short_buffer_rejected() {
+        let mut tiny = [0u8; 4]; // < 8
+        assert_eq!(Commit::new(&mut tiny, 0).unwrap_err(), Error::OutOfRange);
     }
 
     #[test]

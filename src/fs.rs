@@ -26,6 +26,230 @@ use crate::storage::Storage;
 use crate::superblock::Superblock;
 use crate::{BlockAddress, ROOT_BLOCK_PAIR};
 
+/// Maximum number of live entries per metadata pair the write kernel
+/// can compact in one operation.
+///
+/// Matches [`crate::dir::MAX_LIVE_ENTRIES`] so any pair that
+/// [`crate::dir::live_entries`] accepts can also be compacted.
+const MAX_LIVE_ENTRIES: usize = crate::dir::MAX_LIVE_ENTRIES;
+
+/// Offsets and lengths of a live entry's NAME and STRUCT tags within
+/// the source metadata block. Used by the compaction path to copy
+/// live entries to the alternate block without owning the source data.
+///
+/// Encoded enums use sentinel `0xff` to mean "absent".
+///
+/// **The superblock counts as an entry.** It occupies id `0` in the
+/// root pair, with NAME kind `Superblock` and STRUCT kind
+/// `InlineStruct` (24 byte geometry body). Compaction preserves it as
+/// id `0`, so subsequent file entries start at id `1`.
+#[derive(Clone, Copy)]
+struct SlotOffsets {
+    name_off: u16,
+    name_len: u16,
+    name_kind: u8, // 0 = RegularFile, 1 = Directory, 2 = Superblock, 0xff = absent
+    struct_off: u16,
+    struct_len: u16,
+    struct_kind: u8, // 0 = InlineStruct, 1 = CtzStruct, 2 = DirStruct, 0xff = absent
+}
+
+impl SlotOffsets {
+    const EMPTY: Self = Self {
+        name_off: 0,
+        name_len: 0,
+        name_kind: 0xff,
+        struct_off: 0,
+        struct_len: 0,
+        struct_kind: 0xff,
+    };
+}
+
+/// Walk a metadata pair's tag stream, applying splice (Create/Delete)
+/// renumbering, and populate `slots` with offset-and-length pointers
+/// into the source buffer for each live entry's latest NAME and STRUCT
+/// tags. Returns the number of live entries.
+///
+/// `active_is_a` selects which of `buf_a`/`buf_b` is the source.
+fn gather_live_slots(
+    pair: &MetadataPair<'_>,
+    active_is_a: bool,
+    buf_a: &[u8],
+    buf_b: &[u8],
+    slots: &mut [SlotOffsets; MAX_LIVE_ENTRIES],
+) -> Result<usize, Error> {
+    use crate::tag::TagType;
+
+    let source: &[u8] = if active_is_a { buf_a } else { buf_b };
+    let base = source.as_ptr() as usize;
+    let mut count: usize = 0;
+
+    for entry in pair.reader.iter_tags() {
+        let tag = entry.tag;
+        let id = tag.id() as usize;
+        let body_off = (entry.body.as_ptr() as usize).saturating_sub(base);
+        let body_len = entry.body.len();
+        match tag.tag_type() {
+            TagType::Create => {
+                if count >= MAX_LIVE_ENTRIES {
+                    return Err(Error::OutOfRange);
+                }
+                if id > count {
+                    return Err(Error::Corrupt);
+                }
+                let mut i = count;
+                while i > id {
+                    slots[i] = slots[i - 1];
+                    i -= 1;
+                }
+                slots[id] = SlotOffsets::EMPTY;
+                count += 1;
+            }
+            TagType::Delete => {
+                if id >= count {
+                    return Err(Error::Corrupt);
+                }
+                let mut i = id;
+                while i + 1 < count {
+                    slots[i] = slots[i + 1];
+                    i += 1;
+                }
+                slots[count - 1] = SlotOffsets::EMPTY;
+                count -= 1;
+            }
+            TagType::RegularFile | TagType::Directory | TagType::Superblock => {
+                if id >= count {
+                    if id == count && count < MAX_LIVE_ENTRIES {
+                        slots[id] = SlotOffsets::EMPTY;
+                        count += 1;
+                    } else {
+                        return Err(Error::Corrupt);
+                    }
+                }
+                slots[id].name_off = u16::try_from(body_off).map_err(|_| Error::OutOfRange)?;
+                slots[id].name_len = u16::try_from(body_len).map_err(|_| Error::OutOfRange)?;
+                slots[id].name_kind = match tag.tag_type() {
+                    TagType::RegularFile => 0,
+                    TagType::Directory => 1,
+                    TagType::Superblock => 2,
+                    _ => unreachable!(),
+                };
+            }
+            TagType::InlineStruct | TagType::CtzStruct | TagType::DirStruct if id < count => {
+                slots[id].struct_off = u16::try_from(body_off).map_err(|_| Error::OutOfRange)?;
+                slots[id].struct_len = u16::try_from(body_len).map_err(|_| Error::OutOfRange)?;
+                slots[id].struct_kind = match tag.tag_type() {
+                    TagType::InlineStruct => 0,
+                    TagType::CtzStruct => 1,
+                    TagType::DirStruct => 2,
+                    _ => unreachable!(),
+                };
+            }
+            _ => {}
+        }
+    }
+    Ok(count)
+}
+
+/// A pending write operation: create a new entry or update an existing
+/// one. Used by [`Fs::write_inline_to_root`] to dispatch the two
+/// commit shapes.
+#[derive(Clone, Copy)]
+enum WriteOp<'a> {
+    /// Create a new entry at `id` (the next free id) with NAME `name`
+    /// and InlineStruct `content`.
+    Create { id: u16, name: &'a [u8], content: &'a [u8] },
+    /// Update the existing entry at `id` by appending a new
+    /// InlineStruct with `content`. The NAME and entry kind are
+    /// preserved by the existing tags in the commit log.
+    Update { id: u16, content: &'a [u8] },
+}
+
+/// Emit the tags for a [`WriteOp`] to an in-progress commit.
+fn emit_op(commit: &mut crate::meta::Commit<'_>, op: &WriteOp<'_>) -> Result<(), Error> {
+    use crate::tag::{Tag, TagType};
+    match *op {
+        WriteOp::Create { id, name, content } => {
+            commit.tag(Tag::new(true, TagType::Create, id, 0), &[])?;
+            commit.tag(Tag::new(true, TagType::RegularFile, id, name.len() as u16), name)?;
+            commit.tag(Tag::new(true, TagType::InlineStruct, id, content.len() as u16), content)?;
+        }
+        WriteOp::Update { id, content } => {
+            commit.tag(Tag::new(true, TagType::InlineStruct, id, content.len() as u16), content)?;
+        }
+    }
+    Ok(())
+}
+
+/// Build a compacted commit on `alt_buf`: replay every live entry from
+/// `slots[..count]` (reading source bytes from `source_buf`) and apply
+/// `op` (either creating a new entry at the end or replacing an
+/// existing entry's struct body). Returns the total bytes written.
+/// `alt_buf` is pre-filled with `0xFF` (erased state).
+fn build_compact_commit(
+    alt_buf: &mut [u8],
+    source_buf: &[u8],
+    new_revision: u32,
+    slots: &[SlotOffsets; MAX_LIVE_ENTRIES],
+    count: usize,
+    op: &WriteOp<'_>,
+) -> Result<usize, Error> {
+    use crate::tag::TagType;
+
+    for b in alt_buf.iter_mut() {
+        *b = 0xFF;
+    }
+    let mut commit = crate::meta::Commit::new(alt_buf, new_revision)?;
+    for (i, s) in slots.iter().enumerate().take(count) {
+        let id = u16::try_from(i).map_err(|_| Error::OutOfRange)?;
+        if s.name_kind == 0xff || s.struct_kind == 0xff {
+            return Err(Error::Corrupt);
+        }
+        let name_type = match s.name_kind {
+            0 => TagType::RegularFile,
+            1 => TagType::Directory,
+            2 => TagType::Superblock,
+            _ => return Err(Error::Corrupt),
+        };
+        let struct_type = match s.struct_kind {
+            0 => TagType::InlineStruct,
+            1 => TagType::CtzStruct,
+            2 => TagType::DirStruct,
+            _ => return Err(Error::Corrupt),
+        };
+        let name = &source_buf[s.name_off as usize..s.name_off as usize + s.name_len as usize];
+        commit.tag(crate::tag::Tag::new(true, TagType::Create, id, 0), &[])?;
+        commit.tag(crate::tag::Tag::new(true, name_type, id, s.name_len), name)?;
+
+        // If this is the target of an Update, substitute the new content
+        // for the struct body. Otherwise copy the source's struct as-is.
+        if let WriteOp::Update { id: update_id, content } = *op {
+            if id == update_id {
+                commit.tag(
+                    crate::tag::Tag::new(true, TagType::InlineStruct, id, content.len() as u16),
+                    content,
+                )?;
+                continue;
+            }
+        }
+        let struct_body =
+            &source_buf[s.struct_off as usize..s.struct_off as usize + s.struct_len as usize];
+        commit.tag(crate::tag::Tag::new(true, struct_type, id, s.struct_len), struct_body)?;
+    }
+    // Create: append the new entry at id == count.
+    if let WriteOp::Create { id, name, content } = *op {
+        debug_assert_eq!(id as usize, count, "Create id must equal current live count");
+        commit.tag(crate::tag::Tag::new(true, TagType::Create, id, 0), &[])?;
+        commit
+            .tag(crate::tag::Tag::new(true, TagType::RegularFile, id, name.len() as u16), name)?;
+        commit.tag(
+            crate::tag::Tag::new(true, TagType::InlineStruct, id, content.len() as u16),
+            content,
+        )?;
+    }
+    commit.finish(0)?;
+    Ok(commit.bytes_written())
+}
+
 /// A path resolution result.
 ///
 /// Returned by [`Fs::resolve`]. The `entry`, `struct_type`, and
@@ -57,6 +281,185 @@ pub struct Fs<S: Storage> {
 }
 
 impl<S: Storage> Fs<S> {
+    /// Write or update a small inline file at the filesystem root
+    /// (upsert semantics).
+    ///
+    /// If no entry named `name` exists, appends a `Create` + `NAME` +
+    /// `InlineStruct` triple at the next free id. If an entry with that
+    /// name already exists, appends a single `InlineStruct` tag at the
+    /// existing entry's id with the new content (later tags supersede
+    /// earlier ones, so reads return the new content).
+    ///
+    /// If the active block has enough free bytes, the new commit is
+    /// appended in place (fast path: one `program` call, no erase).
+    /// If the active block is too full, the kernel transparently
+    /// **compacts** the live state into a fresh commit on the alternate
+    /// block (with revision bumped), applying the create or update in
+    /// the same commit. The alternate becomes the new active via the
+    /// standard revision-based pair selection on the next mount.
+    ///
+    /// **Remaining limits.** Inline-only (content must fit alongside
+    /// the live state in one block); root-only. CTZ writes (Phase 2d)
+    /// and nested paths (Phase 2b.2) lift those.
+    pub fn write_inline_to_root(
+        &mut self,
+        name: &[u8],
+        content: &[u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
+            return Err(Error::GeometryMismatch);
+        }
+        if name.is_empty() || name.len() > 0x3FF || content.len() > 0x3FF {
+            return Err(Error::InvalidPath);
+        }
+
+        // Read both root blocks.
+        self.storage.read(0, 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(1, 0, buf_b).map_err(|_| Error::Io)?;
+
+        // Gather the live state and decide which op (create vs update) to apply.
+        let active_addr;
+        let alternate_addr;
+        let active_is_a;
+        let committed_end;
+        let next_ptag;
+        let old_revision;
+        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+        let count: usize;
+        let existing_id: Option<u16>;
+        {
+            let pair =
+                MetadataPair::parse(BlockAddress::new(0), &*buf_a, BlockAddress::new(1), &*buf_b)?;
+            active_addr = pair.active_block;
+            alternate_addr = pair.alternate_block;
+            active_is_a = active_addr == BlockAddress::new(0);
+            committed_end = pair.reader.committed_end();
+            next_ptag = pair.reader.next_ptag();
+            old_revision = pair.reader.revision();
+            existing_id = crate::dir::lookup(&pair, name).map(|r| r.entry.id);
+            count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
+        }
+
+        let op = if let Some(id) = existing_id {
+            WriteOp::Update { id, content }
+        } else {
+            let new_id = u16::try_from(count).map_err(|_| Error::OutOfRange)?;
+            if new_id == crate::tag::ID_NONE {
+                return Err(Error::OutOfRange);
+            }
+            WriteOp::Create { id: new_id, name, content }
+        };
+
+        // Commit size: Update is one InlineStruct + CCRC; Create is
+        // Create + NAME + InlineStruct + CCRC.
+        let op_dsize = match op {
+            WriteOp::Update { content, .. } => (4 + content.len()) + 8,
+            WriteOp::Create { name, content, .. } => 4 + (4 + name.len()) + (4 + content.len()) + 8,
+        };
+
+        if committed_end + op_dsize <= S::BLOCK_SIZE {
+            // ---- APPEND PATH ----
+            let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
+            let new_end = {
+                let mut commit =
+                    crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
+                emit_op(&mut commit, &op)?;
+                commit.finish(0)?;
+                commit.bytes_written()
+            };
+            self.storage
+                .program(
+                    active_addr.as_u32(),
+                    committed_end as u32,
+                    &active_buf[committed_end..new_end],
+                )
+                .map_err(|_| Error::Io)?;
+        } else {
+            // ---- COMPACT PATH ----
+            let new_revision = old_revision.wrapping_add(1);
+            let new_end = if active_is_a {
+                build_compact_commit(buf_b, buf_a, new_revision, &slots, count, &op)?
+            } else {
+                build_compact_commit(buf_a, buf_b, new_revision, &slots, count, &op)?
+            };
+            self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
+            let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+            self.storage
+                .program(alternate_addr.as_u32(), 0, &alt_buf[..new_end])
+                .map_err(|_| Error::Io)?;
+        }
+
+        self.storage.sync().map_err(|_| Error::Io)?;
+        Ok(())
+    }
+
+    /// Format the storage device with a fresh, empty LittleFS v2
+    /// filesystem.
+    ///
+    /// Erases blocks `0` and `1` (the root metadata pair), then writes
+    /// a single commit on block `0` containing:
+    ///
+    /// 1. Revision counter `1` (4 bytes LE) at offset `0`.
+    /// 2. A `Superblock` NAME tag with body `b"littlefs"`.
+    /// 3. An `InlineStruct` tag at id `0` whose 24 byte body encodes the
+    ///    geometry: version = [`crate::DISK_VERSION`], block_size =
+    ///    `S::BLOCK_SIZE`, block_count = `S::BLOCK_COUNT`, name_max /
+    ///    file_max / attr_max all zero (defaults).
+    /// 4. A CCRC tag with chunk `0`.
+    ///
+    /// `scratch` must be at least [`S::BLOCK_SIZE`](Storage::BLOCK_SIZE)
+    /// bytes; the function pre-fills it with `0xFF` and writes the
+    /// commit into it before programming.
+    ///
+    /// After this call returns, `storage` can be passed to [`Fs::mount`]
+    /// to obtain a usable handle. Block `1` is left in pristine erased
+    /// state to serve as the metadata pair's alternate.
+    pub fn format(storage: &mut S, scratch: &mut [u8]) -> Result<(), Error> {
+        if scratch.len() < S::BLOCK_SIZE {
+            return Err(Error::GeometryMismatch);
+        }
+        let scratch = &mut scratch[..S::BLOCK_SIZE];
+        // Pre-fill with the erased state so any bytes past the CCRC
+        // mirror what a freshly erased flash region would read as.
+        for b in scratch.iter_mut() {
+            *b = 0xFF;
+        }
+
+        let sb = Superblock {
+            version: crate::DISK_VERSION,
+            block_size: S::BLOCK_SIZE as u32,
+            block_count: S::BLOCK_COUNT,
+            name_max: 0,
+            file_max: 0,
+            attr_max: 0,
+        };
+        let sb_body = sb.to_bytes();
+
+        let mut commit = crate::meta::Commit::new(scratch, 1)?;
+        commit
+            .tag(crate::tag::Tag::new(true, crate::tag::TagType::Superblock, 0, 8), crate::MAGIC)?;
+        commit.tag(
+            crate::tag::Tag::new(
+                true,
+                crate::tag::TagType::InlineStruct,
+                0,
+                Superblock::SIZE as u16,
+            ),
+            &sb_body,
+        )?;
+        commit.finish(0)?;
+
+        // Erase + program block 0 with the committed superblock pair.
+        storage.erase(0).map_err(|_| Error::Io)?;
+        storage.program(0, 0, scratch).map_err(|_| Error::Io)?;
+        // Erase block 1 to leave it as a fresh alternate.
+        storage.erase(1).map_err(|_| Error::Io)?;
+        storage.sync().map_err(|_| Error::Io)?;
+        Ok(())
+    }
+
     /// Mount a filesystem.
     ///
     /// Reads blocks `0` and `1` from `storage` into `block_a_buf` and
