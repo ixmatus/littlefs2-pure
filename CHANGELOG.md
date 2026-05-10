@@ -6,6 +6,23 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **CTZ file writes (Phase 2d) via `Fs::write_to_root` and
+  `Fs::write_ctz_to_root`.** `write_to_root` auto-dispatches inline vs
+  CTZ based on content size (`INLINE_MAX = 128` bytes). The CTZ path
+  allocates fresh blocks via the allocator, writes the skip-list
+  chain block-by-block (skip pointers at each block's head, then
+  content), and appends a metadata commit with `Create` + `RegularFile`
+  NAME + `CtzStruct` referencing the chain head. Round-trip verified
+  via `resolve` + `read_ctz` over both fresh writes and post-remount.
+  Capped at `MAX_CTZ_WRITE_BLOCKS = 256` (~1 MiB at 4 KiB blocks).
+- **Block allocator (`src/alloc.rs`, Phase 2c).**
+  `scan_used_blocks(storage, root, ...)` BFS-walks the filesystem
+  from the root pair, marking every reachable block in a bitmap:
+  visits each metadata pair once, follows `DirStruct` and `Tail`
+  references into other pairs, walks `CtzStruct` chains backward
+  marking each block. `alloc_blocks(out_slice, ...)` returns the
+  lowest-numbered unused blocks. `Bitmap` caps device size at 4096
+  blocks; deeper traversal limited by a 32-pair BFS queue.
 - **`Fs::remove_from_root`, `Fs::list_root`, `Fs::exists` (Phase 2b.4).**
   Closes the CRUD surface needed by SMIL's audit-style consumers.
   `remove_from_root` appends a Delete tag (or skips the slot during

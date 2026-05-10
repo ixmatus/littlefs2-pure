@@ -33,6 +33,15 @@ use crate::{BlockAddress, ROOT_BLOCK_PAIR};
 /// [`crate::dir::live_entries`] accepts can also be compacted.
 const MAX_LIVE_ENTRIES: usize = crate::dir::MAX_LIVE_ENTRIES;
 
+/// Maximum chain length a single CTZ write can produce.
+///
+/// At 4 KiB blocks this caps a single CTZ file at ~1 MiB; at 256 byte
+/// blocks (the test geometry) it caps at 64 KiB. The chain address
+/// table is stack-allocated as `[BlockAddress; MAX_CTZ_WRITE_BLOCKS]`
+/// (1 KiB at the current cap), so larger files need a streaming CTZ
+/// writer (Phase 2f).
+const MAX_CTZ_WRITE_BLOCKS: usize = 256;
+
 /// Offsets and lengths of a live entry's NAME and STRUCT tags within
 /// the source metadata block. Used by the compaction path to copy
 /// live entries to the alternate block without owning the source data.
@@ -150,14 +159,18 @@ fn gather_live_slots(
     Ok(count)
 }
 
-/// A pending write operation. Used by [`Fs::write_inline_to_root`] and
-/// [`Fs::remove_from_root`] to dispatch through the same append-vs-compact
-/// machinery.
+/// A pending write operation. Used by [`Fs::write_inline_to_root`],
+/// [`Fs::remove_from_root`], and the CTZ write path to dispatch
+/// through the same append-vs-compact machinery.
 #[derive(Clone, Copy)]
 enum WriteOp<'a> {
     /// Create a new entry at `id` (the next free id) with NAME `name`
     /// and InlineStruct `content`.
     Create { id: u16, name: &'a [u8], content: &'a [u8] },
+    /// Create a new entry at `id` whose content lives in a CTZ chain
+    /// at `head_block` (the chain's tail block, per LittleFS
+    /// convention). `total_size` is the file's byte length.
+    CreateCtz { id: u16, name: &'a [u8], head_block: u32, total_size: u32 },
     /// Update the existing entry at `id` by appending a new
     /// InlineStruct with `content`. The NAME and entry kind are
     /// preserved by the existing tags in the commit log.
@@ -175,6 +188,14 @@ fn emit_op(commit: &mut crate::meta::Commit<'_>, op: &WriteOp<'_>) -> Result<(),
             commit.tag(Tag::new(true, TagType::Create, id, 0), &[])?;
             commit.tag(Tag::new(true, TagType::RegularFile, id, name.len() as u16), name)?;
             commit.tag(Tag::new(true, TagType::InlineStruct, id, content.len() as u16), content)?;
+        }
+        WriteOp::CreateCtz { id, name, head_block, total_size } => {
+            commit.tag(Tag::new(true, TagType::Create, id, 0), &[])?;
+            commit.tag(Tag::new(true, TagType::RegularFile, id, name.len() as u16), name)?;
+            let mut body = [0u8; 8];
+            body[0..4].copy_from_slice(&head_block.to_le_bytes());
+            body[4..8].copy_from_slice(&total_size.to_le_bytes());
+            commit.tag(Tag::new(true, TagType::CtzStruct, id, 8), &body)?;
         }
         WriteOp::Update { id, content } => {
             commit.tag(Tag::new(true, TagType::InlineStruct, id, content.len() as u16), content)?;
@@ -209,8 +230,16 @@ fn build_compact_commit(
         *b = 0xFF;
     }
     let mut commit = crate::meta::Commit::new(alt_buf, new_revision)?;
+
+    // `emit_id` is the id assigned in the compacted output; it diverges
+    // from the source slot index after a Remove skip.
+    let mut emit_id: u16 = 0;
     for (i, s) in slots.iter().enumerate().take(count) {
-        let id = u16::try_from(i).map_err(|_| Error::OutOfRange)?;
+        if let WriteOp::Remove { id: remove_id } = *op {
+            if (i as u16) == remove_id {
+                continue; // drop this entry; do not bump emit_id
+            }
+        }
         if s.name_kind == 0xff || s.struct_kind == 0xff {
             return Err(Error::Corrupt);
         }
@@ -227,34 +256,59 @@ fn build_compact_commit(
             _ => return Err(Error::Corrupt),
         };
         let name = &source_buf[s.name_off as usize..s.name_off as usize + s.name_len as usize];
-        commit.tag(crate::tag::Tag::new(true, TagType::Create, id, 0), &[])?;
-        commit.tag(crate::tag::Tag::new(true, name_type, id, s.name_len), name)?;
+        commit.tag(crate::tag::Tag::new(true, TagType::Create, emit_id, 0), &[])?;
+        commit.tag(crate::tag::Tag::new(true, name_type, emit_id, s.name_len), name)?;
 
         // If this is the target of an Update, substitute the new content
         // for the struct body. Otherwise copy the source's struct as-is.
         if let WriteOp::Update { id: update_id, content } = *op {
-            if id == update_id {
+            if (i as u16) == update_id {
                 commit.tag(
-                    crate::tag::Tag::new(true, TagType::InlineStruct, id, content.len() as u16),
+                    crate::tag::Tag::new(
+                        true,
+                        TagType::InlineStruct,
+                        emit_id,
+                        content.len() as u16,
+                    ),
                     content,
                 )?;
+                emit_id += 1;
                 continue;
             }
         }
         let struct_body =
             &source_buf[s.struct_off as usize..s.struct_off as usize + s.struct_len as usize];
-        commit.tag(crate::tag::Tag::new(true, struct_type, id, s.struct_len), struct_body)?;
+        commit.tag(crate::tag::Tag::new(true, struct_type, emit_id, s.struct_len), struct_body)?;
+        emit_id += 1;
     }
-    // Create: append the new entry at id == count.
-    if let WriteOp::Create { id, name, content } = *op {
-        debug_assert_eq!(id as usize, count, "Create id must equal current live count");
-        commit.tag(crate::tag::Tag::new(true, TagType::Create, id, 0), &[])?;
-        commit
-            .tag(crate::tag::Tag::new(true, TagType::RegularFile, id, name.len() as u16), name)?;
-        commit.tag(
-            crate::tag::Tag::new(true, TagType::InlineStruct, id, content.len() as u16),
-            content,
-        )?;
+
+    // Append the new entry at id == emit_id.
+    match *op {
+        WriteOp::Create { id, name, content } => {
+            debug_assert_eq!(id, emit_id, "Create id must equal post-replay emit count");
+            commit.tag(crate::tag::Tag::new(true, TagType::Create, id, 0), &[])?;
+            commit.tag(
+                crate::tag::Tag::new(true, TagType::RegularFile, id, name.len() as u16),
+                name,
+            )?;
+            commit.tag(
+                crate::tag::Tag::new(true, TagType::InlineStruct, id, content.len() as u16),
+                content,
+            )?;
+        }
+        WriteOp::CreateCtz { id, name, head_block, total_size } => {
+            debug_assert_eq!(id, emit_id, "CreateCtz id must equal post-replay emit count");
+            commit.tag(crate::tag::Tag::new(true, TagType::Create, id, 0), &[])?;
+            commit.tag(
+                crate::tag::Tag::new(true, TagType::RegularFile, id, name.len() as u16),
+                name,
+            )?;
+            let mut body = [0u8; 8];
+            body[0..4].copy_from_slice(&head_block.to_le_bytes());
+            body[4..8].copy_from_slice(&total_size.to_le_bytes());
+            commit.tag(crate::tag::Tag::new(true, TagType::CtzStruct, id, 8), &body)?;
+        }
+        _ => {}
     }
     commit.finish(0)?;
     Ok(commit.bytes_written())
@@ -291,6 +345,202 @@ pub struct Fs<S: Storage> {
 }
 
 impl<S: Storage> Fs<S> {
+    /// Threshold above which [`Self::write_to_root`] switches from
+    /// inline storage (the file content lives inside the metadata pair
+    /// as an `InlineStruct` body) to CTZ storage (the file content
+    /// lives in dedicated blocks linked by a skip list).
+    ///
+    /// Files at or below this size go inline; larger files go CTZ.
+    /// The threshold is conservative; callers wanting more control can
+    /// call [`Self::write_inline_to_root`] (always inline, up to 1023
+    /// bytes) or [`Self::write_ctz_to_root`] (always CTZ).
+    pub const INLINE_MAX: usize = 128;
+
+    /// Write or update a file at the filesystem root, choosing the
+    /// storage layout (inline vs CTZ) based on content size.
+    ///
+    /// Files at or below [`Self::INLINE_MAX`] bytes are stored inline;
+    /// larger files are stored as a CTZ skip list. The user-visible
+    /// API is the same in both cases: subsequent `resolve` calls
+    /// return either an `InlineStruct` whose body is the content, or a
+    /// `CtzStruct` whose body parses into a `(head_block, size)` pair
+    /// that [`Self::read_ctz`] reassembles.
+    ///
+    /// **Update semantics are inline-only.** Re-writing an existing
+    /// name with a content size above `INLINE_MAX` returns
+    /// [`Error::OutOfRange`] for now. The general case requires
+    /// freeing the old CTZ chain plus allocating a new one, which is
+    /// safe but unimplemented (Phase 2f follow-up).
+    pub fn write_to_root(
+        &mut self,
+        name: &[u8],
+        content: &[u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        if content.len() <= Self::INLINE_MAX {
+            self.write_inline_to_root(name, content, buf_a, buf_b)
+        } else {
+            self.write_ctz_to_root(name, content, buf_a, buf_b)
+        }
+    }
+
+    /// Write a file at the filesystem root as a CTZ skip list.
+    ///
+    /// Allocates fresh blocks for the chain, writes them, then appends
+    /// a metadata commit with `Create` + `RegularFile` NAME +
+    /// `CtzStruct` referencing the head block.
+    ///
+    /// **Scope.** Root-only, create-only (not update). The name must
+    /// not already exist. CTZ-on-CTZ updates (freeing the old chain
+    /// and allocating a new one) are a Phase 2f follow-up.
+    pub fn write_ctz_to_root(
+        &mut self,
+        name: &[u8],
+        content: &[u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        use crate::ctz::{block_count, skip_pointers_in_block};
+
+        if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
+            return Err(Error::GeometryMismatch);
+        }
+        if name.is_empty() || name.len() > 0x3FF {
+            return Err(Error::InvalidPath);
+        }
+        // Reject CTZ updates for now; only create.
+        {
+            self.storage.read(0, 0, buf_a).map_err(|_| Error::Io)?;
+            self.storage.read(1, 0, buf_b).map_err(|_| Error::Io)?;
+            let pair =
+                MetadataPair::parse(BlockAddress::new(0), &*buf_a, BlockAddress::new(1), &*buf_b)?;
+            if crate::dir::lookup(&pair, name).is_some() {
+                return Err(Error::AlreadyExists);
+            }
+        }
+
+        let bs = S::BLOCK_SIZE as u32;
+        let total_blocks_u32 = block_count(content.len() as u32, bs);
+        if total_blocks_u32 == 0 {
+            // Empty content -> degenerate; CTZ requires at least one block.
+            // Fall back to inline (which handles size==0 cleanly).
+            return self.write_inline_to_root(name, content, buf_a, buf_b);
+        }
+        let total_blocks = total_blocks_u32 as usize;
+        if total_blocks > MAX_CTZ_WRITE_BLOCKS {
+            return Err(Error::OutOfRange);
+        }
+
+        // Allocate physical blocks for the chain.
+        let mut chain = [BlockAddress::NONE; MAX_CTZ_WRITE_BLOCKS];
+        crate::alloc::alloc_blocks(
+            &mut self.storage,
+            self.root,
+            &mut chain[..total_blocks],
+            buf_a,
+            buf_b,
+        )?;
+
+        // Build each chain block in `buf_a`, erase + program it.
+        let mut content_off = 0usize;
+        for i in 0..total_blocks {
+            let i32 = i as u32;
+            let header = 4 * skip_pointers_in_block(i32) as usize;
+            // Fill block with 0xFF (erased state).
+            for b in buf_a.iter_mut() {
+                *b = 0xFF;
+            }
+            // Skip pointers: block i has ctz(i)+1 pointers addressing
+            // blocks i - 2^k for k = 0..=ctz(i). Each pointer is the
+            // physical address of that chain index.
+            let pointer_count = skip_pointers_in_block(i32) as usize;
+            for k in 0..pointer_count {
+                let target_idx = i - (1 << k);
+                let target_phys = chain[target_idx].as_u32();
+                let off = 4 * k;
+                buf_a[off..off + 4].copy_from_slice(&target_phys.to_le_bytes());
+            }
+            // Content slice.
+            let block_capacity = S::BLOCK_SIZE - header;
+            let take = block_capacity.min(content.len() - content_off);
+            buf_a[header..header + take].copy_from_slice(&content[content_off..content_off + take]);
+            content_off += take;
+
+            let phys = chain[i].as_u32();
+            self.storage.erase(phys).map_err(|_| Error::Io)?;
+            self.storage.program(phys, 0, &buf_a[..S::BLOCK_SIZE]).map_err(|_| Error::Io)?;
+        }
+        self.storage.sync().map_err(|_| Error::Io)?;
+
+        // Append the metadata commit.
+        // buf_a was consumed for chain bytes; re-read the root pair.
+        self.storage.read(0, 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(1, 0, buf_b).map_err(|_| Error::Io)?;
+
+        let active_addr;
+        let alternate_addr;
+        let active_is_a;
+        let committed_end;
+        let next_ptag;
+        let old_revision;
+        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+        let count: usize;
+        {
+            let pair =
+                MetadataPair::parse(BlockAddress::new(0), &*buf_a, BlockAddress::new(1), &*buf_b)?;
+            active_addr = pair.active_block;
+            alternate_addr = pair.alternate_block;
+            active_is_a = active_addr == BlockAddress::new(0);
+            committed_end = pair.reader.committed_end();
+            next_ptag = pair.reader.next_ptag();
+            old_revision = pair.reader.revision();
+            count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
+        }
+
+        let new_id = u16::try_from(count).map_err(|_| Error::OutOfRange)?;
+        if new_id == crate::tag::ID_NONE {
+            return Err(Error::OutOfRange);
+        }
+        let head_block = chain[total_blocks - 1].as_u32();
+        let op =
+            WriteOp::CreateCtz { id: new_id, name, head_block, total_size: content.len() as u32 };
+        // dsize: Create (4) + NAME (4+name.len) + CtzStruct (4+8) + CCRC (8).
+        let op_dsize = 4 + (4 + name.len()) + (4 + 8) + 8;
+
+        if committed_end + op_dsize <= S::BLOCK_SIZE {
+            let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
+            let new_end = {
+                let mut commit =
+                    crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
+                emit_op(&mut commit, &op)?;
+                commit.finish(0)?;
+                commit.bytes_written()
+            };
+            self.storage
+                .program(
+                    active_addr.as_u32(),
+                    committed_end as u32,
+                    &active_buf[committed_end..new_end],
+                )
+                .map_err(|_| Error::Io)?;
+        } else {
+            let new_revision = old_revision.wrapping_add(1);
+            let new_end = if active_is_a {
+                build_compact_commit(buf_b, buf_a, new_revision, &slots, count, &op)?
+            } else {
+                build_compact_commit(buf_a, buf_b, new_revision, &slots, count, &op)?
+            };
+            self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
+            let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+            self.storage
+                .program(alternate_addr.as_u32(), 0, &alt_buf[..new_end])
+                .map_err(|_| Error::Io)?;
+        }
+        self.storage.sync().map_err(|_| Error::Io)?;
+        Ok(())
+    }
+
     /// Check whether an entry exists at the given absolute path.
     ///
     /// Equivalent to `self.resolve(path, ...).is_ok()` but kinder to
@@ -518,6 +768,7 @@ impl<S: Storage> Fs<S> {
         let op_dsize = match op {
             WriteOp::Update { content, .. } => (4 + content.len()) + 8,
             WriteOp::Create { name, content, .. } => 4 + (4 + name.len()) + (4 + content.len()) + 8,
+            WriteOp::CreateCtz { name, .. } => 4 + (4 + name.len()) + (4 + 8) + 8,
             WriteOp::Remove { .. } => 4 + 8,
         };
 
