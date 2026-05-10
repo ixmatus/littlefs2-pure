@@ -29,10 +29,16 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 - [x] Compaction on overflow: when the active block fills, GC live state plus the new write into a fresh commit on the alternate, bump revision. (Phase 2b.2)
 - [x] NOR-aligned program wrapper: `NorAlignedStorage` caches programs to `PROG_SIZE` aligned windows. (Phase 2b.3)
 - [ ] File write at arbitrary paths (not just root): requires path resolution to a directory + append. (Phase 2b.4)
-- [ ] File write with CTZ extension when content exceeds inline threshold: requires block allocator. (Phase 2d)
+- [x] Block allocator: scan-based, BFS walk from root, tracks used blocks via bitmap. (`src/alloc.rs`, Phase 2c)
+- [x] File write with CTZ extension when content exceeds inline threshold: `Fs::write_to_root` / `Fs::write_ctz_to_root` allocate blocks and lay out the skip-list chain. (Phase 2d)
+- [ ] CTZ-on-CTZ updates (writing to an existing name where the new content is > `INLINE_MAX`): currently returns `OutOfRange`. Needs old-chain free + new-chain alloc. (Phase 2f follow-up)
+- [ ] CTZ-on-inline updates (writing > INLINE_MAX to an existing inline name): same as above. (Phase 2f follow-up)
 - [x] `Fs::format` producing a superblock the C reference can mount. (Phase 2a; bit accuracy verified against `meta::MetadataReader` round-trip; C-reference cross-check pending the conformance harness.)
 - [ ] Sync semantics (`Fs::sync`, drop on close).
-- [ ] mkdir, rmdir, rename, remove.
+- [x] `remove_from_root`: delete a file by name from the root, splice-correct. (Phase 2b.4)
+- [x] `list_root`: enumerate root entries, splice-correct, skipping the superblock. (Phase 2b.4)
+- [x] `exists`: typed wrapper over `resolve`. (Phase 2b.4)
+- [ ] `mkdir`, `rmdir`, `rename`. (Phase 2e, 2g)
 - [ ] User attribute write.
 - [ ] Atomic move state recovery.
 

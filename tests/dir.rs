@@ -169,7 +169,9 @@ fn lookup_finds_directory() {
     let dir_block = build_directory_block(
         1,
         &[DirEntrySpec {
-            id: 3,
+            // Sole entry in this pair, so it must occupy id 0
+            // (splice-aware lookup expects contiguous ids).
+            id: 0,
             name: b"subdir",
             name_type: TagType::Directory,
             struct_type: TagType::DirStruct,
@@ -201,7 +203,7 @@ fn lookup_finds_directory() {
         .unwrap();
 
     let resolved = lookup(&pair, b"subdir").unwrap();
-    assert_eq!(resolved.entry.id, 3);
+    assert_eq!(resolved.entry.id, 0);
     assert_eq!(resolved.entry.kind, EntryKind::Directory);
     assert_eq!(resolved.struct_type, TagType::DirStruct);
     // Decode the pair address from the DirStruct body.
