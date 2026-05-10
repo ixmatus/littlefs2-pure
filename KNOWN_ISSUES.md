@@ -21,11 +21,12 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 
 ## Write path (Phase 2)
 
-- [ ] Commit construction: tag stream encoding, CCRC tail, FCRC for redundancy.
+- [x] Slice-based commit builder (`meta::Commit`): tag stream encoding + CCRC tail. (Phase 2a)
+- [ ] Commit construction with FCRC redundancy. The current builder emits CCRC only; FCRC for next-prog erase detection is not yet integrated. (Phase 2 follow-up)
 - [ ] Block allocator with the lookahead buffer.
 - [ ] Compaction on full metadata pair.
 - [ ] File write: inline up to a threshold, CTZ extension above it.
-- [ ] `Fs::format` producing a superblock the C reference can mount.
+- [x] `Fs::format` producing a superblock the C reference can mount. (Phase 2a; bit accuracy verified against `meta::MetadataReader` round-trip; C-reference cross-check pending the conformance harness.)
 - [ ] Sync semantics (`Fs::sync`, drop on close).
 - [ ] mkdir, rmdir, rename, remove.
 - [ ] User attribute write.

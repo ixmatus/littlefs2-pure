@@ -9,7 +9,9 @@
 //! independent implementations of the same algorithm), so this is a
 //! genuine cross check, not a self consistency invariant.
 
-use littlefs2_pure::meta::MetadataReader;
+extern crate alloc;
+
+use littlefs2_pure::meta::{Commit, MetadataReader};
 use littlefs2_pure::tag::{Tag, TagType};
 use proptest::prelude::*;
 
@@ -113,6 +115,37 @@ proptest! {
             let ccrc = iter.next().expect("missing CCRC at commit boundary");
             prop_assert!(ccrc.tag.is_ccrc());
         }
+        prop_assert!(iter.next().is_none());
+    }
+
+    /// The kernel's slice-based `Commit` builder produces a byte layout
+    /// that the `MetadataReader` can parse and walk. Asserts the tag
+    /// stream is reproduced verbatim (including the trailing CCRC).
+    #[test]
+    fn kernel_commit_builder_roundtrips(
+        revision: u32,
+        tags in proptest::collection::vec(arb_tag_with_body(), 0..16),
+    ) {
+        let mut buf = alloc::vec![0xFFu8; 2048];
+        {
+            let mut c = Commit::new(&mut buf, revision).unwrap();
+            for (tag, body) in &tags {
+                c.tag(*tag, body).unwrap();
+            }
+            c.finish(0).unwrap();
+        }
+
+        let r = MetadataReader::new(&buf).unwrap();
+        prop_assert_eq!(r.revision(), revision);
+        prop_assert!(r.has_commits());
+        let mut iter = r.iter_tags();
+        for (expected_tag, expected_body) in &tags {
+            let e = iter.next().expect("ran out of tags");
+            prop_assert_eq!(e.tag, *expected_tag);
+            prop_assert_eq!(e.body, expected_body.as_slice());
+        }
+        let ccrc = iter.next().expect("missing CCRC");
+        prop_assert!(ccrc.tag.is_ccrc());
         prop_assert!(iter.next().is_none());
     }
 

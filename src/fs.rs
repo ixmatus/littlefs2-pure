@@ -57,6 +57,71 @@ pub struct Fs<S: Storage> {
 }
 
 impl<S: Storage> Fs<S> {
+    /// Format the storage device with a fresh, empty LittleFS v2
+    /// filesystem.
+    ///
+    /// Erases blocks `0` and `1` (the root metadata pair), then writes
+    /// a single commit on block `0` containing:
+    ///
+    /// 1. Revision counter `1` (4 bytes LE) at offset `0`.
+    /// 2. A `Superblock` NAME tag with body `b"littlefs"`.
+    /// 3. An `InlineStruct` tag at id `0` whose 24 byte body encodes the
+    ///    geometry: version = [`crate::DISK_VERSION`], block_size =
+    ///    `S::BLOCK_SIZE`, block_count = `S::BLOCK_COUNT`, name_max /
+    ///    file_max / attr_max all zero (defaults).
+    /// 4. A CCRC tag with chunk `0`.
+    ///
+    /// `scratch` must be at least [`S::BLOCK_SIZE`](Storage::BLOCK_SIZE)
+    /// bytes; the function pre-fills it with `0xFF` and writes the
+    /// commit into it before programming.
+    ///
+    /// After this call returns, `storage` can be passed to [`Fs::mount`]
+    /// to obtain a usable handle. Block `1` is left in pristine erased
+    /// state to serve as the metadata pair's alternate.
+    pub fn format(storage: &mut S, scratch: &mut [u8]) -> Result<(), Error> {
+        if scratch.len() < S::BLOCK_SIZE {
+            return Err(Error::GeometryMismatch);
+        }
+        let scratch = &mut scratch[..S::BLOCK_SIZE];
+        // Pre-fill with the erased state so any bytes past the CCRC
+        // mirror what a freshly erased flash region would read as.
+        for b in scratch.iter_mut() {
+            *b = 0xFF;
+        }
+
+        let sb = Superblock {
+            version: crate::DISK_VERSION,
+            block_size: S::BLOCK_SIZE as u32,
+            block_count: S::BLOCK_COUNT,
+            name_max: 0,
+            file_max: 0,
+            attr_max: 0,
+        };
+        let sb_body = sb.to_bytes();
+
+        let mut commit = crate::meta::Commit::new(scratch, 1)?;
+        commit
+            .tag(crate::tag::Tag::new(true, crate::tag::TagType::Superblock, 0, 8), crate::MAGIC)?;
+        commit.tag(
+            crate::tag::Tag::new(
+                true,
+                crate::tag::TagType::InlineStruct,
+                0,
+                Superblock::SIZE as u16,
+            ),
+            &sb_body,
+        )?;
+        commit.finish(0)?;
+
+        // Erase + program block 0 with the committed superblock pair.
+        storage.erase(0).map_err(|_| Error::Io)?;
+        storage.program(0, 0, scratch).map_err(|_| Error::Io)?;
+        // Erase block 1 to leave it as a fresh alternate.
+        storage.erase(1).map_err(|_| Error::Io)?;
+        storage.sync().map_err(|_| Error::Io)?;
+        Ok(())
+    }
+
     /// Mount a filesystem.
     ///
     /// Reads blocks `0` and `1` from `storage` into `block_a_buf` and
