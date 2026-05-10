@@ -5,8 +5,9 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 ## Read path (Phase 1)
 
 - [x] Metadata block reader: walk commits, verify CRC, surface tag stream. (`src/meta.rs`, Phase 1a)
-- [ ] Metadata *pair* reader: pick the active block of a pair by revision counter (wrap aware signed comparison), fall back to the alternate if the active fails. (Phase 1b)
-- [ ] Superblock parser: detect the LittleFS magic, parse version, geometry, name_max, file_max, attr_max.
+- [x] Metadata *pair* reader: pick the active block of a pair by revision counter (wrap aware signed comparison), fall back to the alternate if the active fails. (`src/meta.rs::MetadataPair`, Phase 1b)
+- [x] Superblock parser: detect the LittleFS magic, parse version, geometry, name_max, file_max, attr_max. (`src/superblock.rs`, Phase 1c)
+- [ ] Storage-backed mount (Fs::mount). Reads blocks 0 and 1 via the Storage trait, runs MetadataPair::parse, then Superblock::from_pair. Glue layer; the heavy lifting is now in place.
 - [ ] Directory traversal: open root, list children, resolve absolute paths.
 - [ ] File read: inline structs (small files stored inside metadata) and CTZ skip list (block chained files).
 - [ ] User attribute read.

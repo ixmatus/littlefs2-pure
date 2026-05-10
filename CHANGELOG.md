@@ -6,7 +6,20 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
-- **Metadata pair reader (`meta::MetadataReader`).** Walks a metadata block,
+- **Superblock parser (`superblock::Superblock`).** Decodes the 24 byte
+  INLINESTRUCT body (six little endian `u32`s: version, block_size,
+  block_count, name_max, file_max, attr_max) and validates the magic NAME
+  tag carries `b"littlefs"`. `from_pair` is the mount entry point:
+  rejects images with the wrong major version, with a newer minor than
+  the crate supports, or missing the magic. Older minor versions parse
+  successfully. Layout pinned against `lfs_superblock_fromle32`
+  (`lfs.c:474`).
+- **Metadata pair selector (`meta::MetadataPair`).** Picks the active
+  block of a two block pair using `rev_scmp` (signed revision counter
+  comparison, wrap aware, matching `lfs_scmp` at `lfs_util.h:164`). Falls
+  back to the alternate if the active has no verified commits; returns
+  `Error::Corrupt` if neither has.
+- **Metadata block reader (`meta::MetadataReader`).** Walks a metadata block,
   verifies every CCRC, exposes tags from successfully committed regions via
   the `iter_tags` iterator. Bit accuracy verified against the C reference's
   `lfs_dir_fetchmatch` (lfs.c:1095): big endian tag word, little endian

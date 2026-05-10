@@ -43,6 +43,7 @@ pub mod error;
 pub mod meta;
 pub mod path;
 pub mod storage;
+pub mod superblock;
 pub mod tag;
 
 // `src/verify/` (Kani harnesses) is added in Phase 3 alongside the commit
@@ -52,8 +53,10 @@ pub mod tag;
 
 pub use crate::block::{BlockAddress, BlockPair};
 pub use crate::error::{Error, Result};
+pub use crate::meta::{MetadataPair, MetadataReader, TagEntry};
 pub use crate::path::Path;
 pub use crate::storage::Storage;
+pub use crate::superblock::Superblock;
 pub use crate::tag::{AbstractType, Tag, TagType};
 
 /// The LittleFS v2 on disk format version this crate targets.

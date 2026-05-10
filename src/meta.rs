@@ -46,6 +46,7 @@
 //! emitting one [`TagEntry`] per tag (CCRC tags included, so callers can
 //! observe commit boundaries; higher level walkers filter them out).
 
+use crate::block::BlockAddress;
 use crate::crc;
 use crate::error::Error;
 use crate::tag::Tag;
@@ -200,6 +201,82 @@ pub struct TagIter<'a> {
     ptag: u32,
 }
 
+/// Signed revision comparison.
+///
+/// Mirrors `lfs_scmp` in the C reference's `lfs_util.h`: returns
+/// `(int32_t)(a - b)`, which is positive when `a` is "newer than" `b` under
+/// modular ordering of the revision counter, negative when `a` is older,
+/// and zero when equal. Wraparound between near-zero and near-`u32::MAX`
+/// values stays correct.
+#[inline]
+#[must_use]
+pub fn rev_scmp(a: u32, b: u32) -> i32 {
+    a.wrapping_sub(b) as i32
+}
+
+/// Reader for a metadata *pair*: two erase blocks between which the
+/// filesystem rotates for wear leveling. The pair's active block is the
+/// one with the higher revision counter (signed comparison, wrap aware);
+/// if that block has no successfully verified commits, the alternate is
+/// used instead.
+#[derive(Clone, Copy, Debug)]
+pub struct MetadataPair<'a> {
+    /// Address of the active block (the one whose tags `reader` returns).
+    pub active_block: BlockAddress,
+    /// Address of the alternate (non-active) block.
+    pub alternate_block: BlockAddress,
+    /// Reader for the active block.
+    pub reader: MetadataReader<'a>,
+    /// `true` if the alternate block also has at least one verified commit.
+    /// Diagnostic only; not load bearing.
+    pub alternate_valid: bool,
+}
+
+impl<'a> MetadataPair<'a> {
+    /// Parse a metadata pair from two block buffers.
+    ///
+    /// `addr_a` and `addr_b` are the block addresses; `block_a` and
+    /// `block_b` are their byte contents. Returns [`Error::Corrupt`] if
+    /// neither block has any successfully verified commit.
+    pub fn parse(
+        addr_a: BlockAddress,
+        block_a: &'a [u8],
+        addr_b: BlockAddress,
+        block_b: &'a [u8],
+    ) -> Result<Self, Error> {
+        let reader_a = MetadataReader::new(block_a)?;
+        let reader_b = MetadataReader::new(block_b)?;
+
+        // Pick the block with the higher revision. On a tie, pair[0] wins,
+        // matching the C reference's loop ordering in lfs_dir_fetchmatch
+        // (r stays 0 when neither lfs_scmp comparison is strictly positive).
+        let a_is_newer = rev_scmp(reader_a.revision(), reader_b.revision()) >= 0;
+        let (primary, primary_addr, secondary, secondary_addr) = if a_is_newer {
+            (reader_a, addr_a, reader_b, addr_b)
+        } else {
+            (reader_b, addr_b, reader_a, addr_a)
+        };
+
+        if primary.has_commits() {
+            return Ok(Self {
+                active_block: primary_addr,
+                alternate_block: secondary_addr,
+                reader: primary,
+                alternate_valid: secondary.has_commits(),
+            });
+        }
+        if secondary.has_commits() {
+            return Ok(Self {
+                active_block: secondary_addr,
+                alternate_block: primary_addr,
+                reader: secondary,
+                alternate_valid: false,
+            });
+        }
+        Err(Error::Corrupt)
+    }
+}
+
 impl<'a> Iterator for TagIter<'a> {
     type Item = TagEntry<'a>;
 
@@ -345,6 +422,95 @@ mod tests {
         block[10] ^= 0xFF;
         let r = MetadataReader::new(&block).unwrap();
         assert!(!r.has_commits(), "corrupted body must invalidate the commit");
+    }
+
+    #[test]
+    fn scmp_ordering() {
+        // Equal -> zero.
+        assert_eq!(rev_scmp(5, 5), 0);
+        // Strictly greater small numbers -> positive.
+        assert!(rev_scmp(10, 5) > 0);
+        // Strictly less -> negative.
+        assert!(rev_scmp(5, 10) < 0);
+        // Wraparound: 1 is newer than 0xFFFFFFFE.
+        assert!(rev_scmp(1, 0xFFFFFFFE) > 0);
+        // Wraparound: 0xFFFFFFFE is older than 1.
+        assert!(rev_scmp(0xFFFFFFFE, 1) < 0);
+        // Far wrap: 0 vs 0x80000000 is ambiguous (max distance).
+        // The C reference returns (int32_t)(0 - 0x80000000) = -0x80000000,
+        // which is negative, so 0 is "older". This is the documented
+        // limit of the wrap-aware comparison.
+        assert!(rev_scmp(0, 0x80000000) < 0);
+    }
+
+    #[test]
+    fn pair_picks_higher_revision() {
+        let tags = vec![(Tag::new(true, TagType::InlineStruct, 0, 4), vec![1, 2, 3, 4])];
+        let block_a = build_single_commit(5, &tags, 256);
+        let block_b = build_single_commit(7, &tags, 256);
+
+        let pair =
+            MetadataPair::parse(BlockAddress::new(10), &block_a, BlockAddress::new(11), &block_b)
+                .unwrap();
+        assert_eq!(pair.active_block, BlockAddress::new(11));
+        assert_eq!(pair.alternate_block, BlockAddress::new(10));
+        assert_eq!(pair.reader.revision(), 7);
+        assert!(pair.alternate_valid);
+    }
+
+    #[test]
+    fn pair_picks_a_on_revision_tie() {
+        let tags = vec![(Tag::new(true, TagType::InlineStruct, 0, 4), vec![1, 2, 3, 4])];
+        let block_a = build_single_commit(7, &tags, 256);
+        let block_b = build_single_commit(7, &tags, 256);
+        let pair =
+            MetadataPair::parse(BlockAddress::new(10), &block_a, BlockAddress::new(11), &block_b)
+                .unwrap();
+        assert_eq!(pair.active_block, BlockAddress::new(10), "ties resolve to pair[0]");
+    }
+
+    #[test]
+    fn pair_handles_revision_wraparound() {
+        // a has revision 0xFFFFFFFE; b has revision 0x00000001. Modular
+        // ordering says b is newer (3 steps ahead).
+        let tags = vec![(Tag::new(true, TagType::InlineStruct, 0, 4), vec![1, 2, 3, 4])];
+        let block_a = build_single_commit(0xFFFFFFFE, &tags, 256);
+        let block_b = build_single_commit(0x00000001, &tags, 256);
+        let pair =
+            MetadataPair::parse(BlockAddress::new(0), &block_a, BlockAddress::new(1), &block_b)
+                .unwrap();
+        assert_eq!(pair.reader.revision(), 0x00000001);
+        assert_eq!(pair.active_block, BlockAddress::new(1));
+    }
+
+    #[test]
+    fn pair_falls_back_to_alternate_when_active_empty() {
+        // b has the higher revision but no commits. Active should fall
+        // back to a.
+        let tags = vec![(Tag::new(true, TagType::InlineStruct, 0, 4), vec![1, 2, 3, 4])];
+        let block_a = build_single_commit(5, &tags, 256);
+        let mut block_b = vec![0xFFu8; 256];
+        block_b[0..4].copy_from_slice(&100u32.to_le_bytes());
+
+        let pair =
+            MetadataPair::parse(BlockAddress::new(10), &block_a, BlockAddress::new(11), &block_b)
+                .unwrap();
+        assert_eq!(pair.active_block, BlockAddress::new(10), "fall back to a with commits");
+        assert_eq!(pair.reader.revision(), 5);
+        assert!(!pair.alternate_valid);
+    }
+
+    #[test]
+    fn pair_errors_when_neither_has_commits() {
+        let mut block_a = vec![0xFFu8; 256];
+        block_a[0..4].copy_from_slice(&1u32.to_le_bytes());
+        let mut block_b = vec![0xFFu8; 256];
+        block_b[0..4].copy_from_slice(&2u32.to_le_bytes());
+
+        let err =
+            MetadataPair::parse(BlockAddress::new(0), &block_a, BlockAddress::new(1), &block_b)
+                .unwrap_err();
+        assert_eq!(err, Error::Corrupt);
     }
 
     #[test]
