@@ -46,10 +46,10 @@
 //! emitting one [`TagEntry`] per tag (CCRC tags included, so callers can
 //! observe commit boundaries; higher level walkers filter them out).
 
-use crate::block::BlockAddress;
+use crate::block::{BlockAddress, BlockPair};
 use crate::crc;
 use crate::error::Error;
-use crate::tag::Tag;
+use crate::tag::{Tag, TagType};
 
 /// One tag plus its body bytes, as emitted by [`MetadataReader::iter_tags`].
 #[derive(Clone, Copy, Debug)]
@@ -76,6 +76,14 @@ pub struct MetadataReader<'a> {
     /// the parity flip applied. Used by writers (Phase 2) to chain the next
     /// commit. Read only consumers can ignore.
     next_ptag: u32,
+    /// The most recent Tail tag's pair address, decoded from the 8 byte
+    /// body, or `None` if no Tail tag was present in any committed region.
+    tail: Option<BlockPair>,
+    /// `true` if the last Tail tag was a HardTail (entries continue in
+    /// the threaded pair); `false` if it was a SoftTail (just a global
+    /// directory thread, no entries in the next pair). Meaningless when
+    /// `tail` is `None`.
+    is_hard_tail: bool,
 }
 
 impl<'a> MetadataReader<'a> {
@@ -152,7 +160,11 @@ impl<'a> MetadataReader<'a> {
             }
         }
 
-        Ok(Self { block, revision, committed_end, next_ptag })
+        // Second pass to extract Tail info from the committed region.
+        // Latest Tail tag wins (commits in order; later supersedes).
+        let (tail, is_hard_tail) = scan_for_tail(block, committed_end);
+
+        Ok(Self { block, revision, committed_end, next_ptag, tail, is_hard_tail })
     }
 
     /// The on disk revision counter.
@@ -182,6 +194,29 @@ impl<'a> MetadataReader<'a> {
         self.next_ptag
     }
 
+    /// The most recent Tail tag's pair address, if any committed Tail
+    /// tag was seen.
+    ///
+    /// LittleFS uses Tail tags for two purposes:
+    /// - **HardTail** ([`TagType::HardTail`]): the directory's entries
+    ///   continue in the threaded pair. Lookups must chase the chain.
+    /// - **SoftTail** ([`TagType::SoftTail`]): a thread for the global
+    ///   filesystem-wide directory list. Lookups do *not* descend.
+    ///
+    /// Use [`Self::is_hard_tail`] to discriminate.
+    #[must_use]
+    pub fn tail(&self) -> Option<BlockPair> {
+        self.tail
+    }
+
+    /// `true` if the last Tail tag in the committed region was a HardTail
+    /// (entries continue in the threaded pair). Returns `false` if no
+    /// Tail tag was present or if the last was a SoftTail.
+    #[must_use]
+    pub fn is_hard_tail(&self) -> bool {
+        self.is_hard_tail
+    }
+
     /// Iterate over tags in commit order, from the verified region of the
     /// block. Includes CCRC and FCRC tags so callers can observe commit
     /// structure; higher level walkers filter to data tags.
@@ -189,6 +224,58 @@ impl<'a> MetadataReader<'a> {
     pub fn iter_tags(&self) -> TagIter<'a> {
         TagIter { block: self.block, offset: 0, end: self.committed_end, ptag: 0xFFFF_FFFF }
     }
+}
+
+/// Scan the committed region for the latest Tail tag (Soft or Hard)
+/// and decode its 8 byte body as a `BlockPair`. Returns
+/// `(Some(pair), is_hard)` if a Tail was found, `(None, false)`
+/// otherwise.
+fn scan_for_tail(block: &[u8], committed_end: usize) -> (Option<BlockPair>, bool) {
+    let mut ptag: u32 = 0xFFFF_FFFF;
+    let mut off: usize = 0;
+    let mut latest: Option<BlockPair> = None;
+    let mut is_hard = false;
+    loop {
+        off += Tag::from_bits(ptag).dsize();
+        if off + 4 > committed_end {
+            break;
+        }
+        let raw_tag =
+            u32::from_be_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
+        let decoded = raw_tag ^ ptag;
+        let tag = Tag::from_bits(decoded);
+        if !tag.is_valid() {
+            break;
+        }
+        if off + tag.dsize() > committed_end {
+            break;
+        }
+
+        if matches!(tag.tag_type(), TagType::HardTail | TagType::SoftTail) && tag.body_len() == 8 {
+            let body_start = off + 4;
+            let a = u32::from_le_bytes([
+                block[body_start],
+                block[body_start + 1],
+                block[body_start + 2],
+                block[body_start + 3],
+            ]);
+            let b = u32::from_le_bytes([
+                block[body_start + 4],
+                block[body_start + 5],
+                block[body_start + 6],
+                block[body_start + 7],
+            ]);
+            latest = Some(BlockPair::new(BlockAddress::new(a), BlockAddress::new(b)));
+            is_hard = matches!(tag.tag_type(), TagType::HardTail);
+        }
+
+        // CCRC tags carry the parity flip on bit 31 of the next ptag.
+        ptag = decoded;
+        if let Some(chunk) = tag.ccrc_chunk() {
+            ptag ^= (u32::from(chunk) & 1) << 31;
+        }
+    }
+    (latest, is_hard)
 }
 
 /// Iterator over tags in a [`MetadataReader`]'s committed region. Returned

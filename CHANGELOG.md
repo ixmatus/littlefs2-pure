@@ -6,6 +6,48 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **Splice handling (`dir::live_entries`, Phase 1i.1).** New
+  enumerator that applies Create / Delete renumbering during the walk.
+  Maintains a `[Option<DirEntry<'a>>; MAX_LIVE_ENTRIES]` slot array,
+  shifting on each splice tag, and emits the final live entries in
+  current id order. The existing `dir::entries` is preserved as the
+  raw walker. 7 integration tests cover Create/Name, Create then
+  Delete, mid-delete renumbering, Create after Delete reusing
+  renumbered slot, splice across commits.
+- **HardTail chasing (Phase 1i.2).** `MetadataReader` now scans the
+  committed region for the latest Tail tag and exposes
+  `tail()` and `is_hard_tail()`. `Fs::resolve` chases HardTails at
+  every component (both intermediate and final), matching
+  `lfs_dir_find`'s inner loop (`lfs.c:1538`). 2 integration tests:
+  resolution succeeds through a HardTail; SoftTail correctly does
+  not get chased.
+- **`Fs::resolve` and `ResolvedPath` (Phase 1h).** Full absolute-path
+  resolution: walks from the root metadata pair through every
+  intermediate directory by name, returning the final entry plus the
+  pair it lives in. Buffers passed in by the caller; after return they
+  contain the bytes of the final pair and the returned `ResolvedPath`
+  borrows from them.
+  Errors: `InvalidPath` for `/`, `NotFound` for missing components
+  (leaf or intermediate) and for intermediate components that are
+  regular files, `Corrupt` for malformed `DirStruct` bodies.
+- **`ctz::read_ctz` storage-backed CTZ file read (Phase 1g full).**
+  Walks the skip list chain backward from head using the
+  `count = 2 - (index & 1)` rule from `lfs_ctz_traverse` (`lfs.c:2990`),
+  collecting block addresses into a stack-allocated array bounded by
+  `MAX_CTZ_BLOCKS` (= 256). Then reads each block's content portion
+  forward into the output buffer, skipping the `4 * skip_pointers_in_block(i)`
+  byte header. `Fs::read_ctz` is the convenience wrapper.
+- **`build_ctz_chain` test helper.** Constructs a valid CTZ chain in a
+  `MemStorage` from raw bytes: lays out blocks with the right number of
+  skip pointers per index, addressing physical blocks `base + i`.
+  Independent reimplementation of the write side; pairing it with
+  `read_ctz` is a true cross check, not a self-consistency invariant.
+- **9 integration tests** (`tests/ctz_read.rs`): zero bytes, fits in
+  block 0, exactly fills block 0, spans 2 blocks (touches block 1's
+  1-pointer header), spans 3 blocks (odd-index case), spans 5 blocks
+  (touches block 4's 3-pointer header — the power-of-two skip case),
+  full 6-block chain, partial read into short output, rejects
+  undersized scratch.
 - **CTZ skip list geometry math (Phase 1g foundations).** New module
   `ctz` carries the algorithms that map a logical file offset to a
   (block_index, absolute_offset_within_block) tuple. Matches

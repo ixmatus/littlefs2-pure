@@ -26,6 +26,25 @@ use crate::storage::Storage;
 use crate::superblock::Superblock;
 use crate::{BlockAddress, ROOT_BLOCK_PAIR};
 
+/// A path resolution result.
+///
+/// Returned by [`Fs::resolve`]. The `entry`, `struct_type`, and
+/// `struct_body` are the same fields [`crate::dir::Resolved`] carries;
+/// `pair` adds the metadata pair address where the entry was found
+/// (useful for follow-up reads, e.g., descending into the directory if
+/// `entry.kind == Directory`).
+#[derive(Clone, Copy, Debug)]
+pub struct ResolvedPath<'b> {
+    /// Address of the metadata pair holding the resolved entry.
+    pub pair: BlockPair,
+    /// The directory entry.
+    pub entry: crate::dir::DirEntry<'b>,
+    /// The type of the STRUCT tag that paired with the NAME.
+    pub struct_type: crate::tag::TagType,
+    /// The STRUCT tag's body bytes.
+    pub struct_body: &'b [u8],
+}
+
 /// A mounted LittleFS filesystem.
 ///
 /// Constructed by [`Fs::mount`]. Owns the underlying [`Storage`] and the
@@ -122,6 +141,153 @@ impl<S: Storage> Fs<S> {
     #[must_use]
     pub fn into_storage(self) -> S {
         self.storage
+    }
+
+    /// Read a CTZ backed file's content via [`ctz::read_ctz`].
+    ///
+    /// Convenience wrapper that forwards the storage handle.
+    pub fn read_ctz(
+        &mut self,
+        ctz: &crate::ctz::CtzStruct,
+        out: &mut [u8],
+        scratch: &mut [u8],
+    ) -> Result<usize, Error> {
+        crate::ctz::read_ctz(&mut self.storage, ctz, out, scratch)
+    }
+
+    /// Resolve an absolute path to its directory entry.
+    ///
+    /// Walks from the root metadata pair through every intermediate
+    /// directory by name, ending at the named entry. After this call
+    /// returns, `buf_a` and `buf_b` contain the bytes of the metadata
+    /// pair holding the final entry, and the returned [`ResolvedPath`]
+    /// borrows slices from them.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::GeometryMismatch`] if a buffer is the wrong size.
+    /// - [`Error::Io`] for any storage read failure.
+    /// - [`Error::NotFound`] if any path component does not exist or if
+    ///   a non final component resolves to a regular file.
+    /// - [`Error::Corrupt`] if an intermediate directory's `DirStruct`
+    ///   body is malformed (wrong length, etc.).
+    /// - [`Error::InvalidPath`] if `path` is the root `/` (no entry to
+    ///   resolve to).
+    pub fn resolve<'b>(
+        &mut self,
+        path: crate::path::Path<'_>,
+        buf_a: &'b mut [u8],
+        buf_b: &'b mut [u8],
+    ) -> Result<ResolvedPath<'b>, Error> {
+        if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
+            return Err(Error::GeometryMismatch);
+        }
+        if path.is_root() {
+            return Err(Error::InvalidPath);
+        }
+
+        // Walk intermediate path components, descending through any
+        // matched directories and chasing HardTail-threaded
+        // continuations as needed. Each intermediate step returns a
+        // `BlockPair` (Copy) so the buffer borrows don't escape.
+        let mut current = self.root;
+        let mut components = path.components().peekable();
+        let leaf_name = loop {
+            let name = components.next().ok_or(Error::InvalidPath)?;
+            if components.peek().is_none() {
+                break name;
+            }
+            current = self.find_dir_pair(current, name.as_bytes(), buf_a, buf_b)?;
+        };
+
+        // Final component: look up in the current pair, chasing HardTails.
+        // The matching read leaves buf_a/buf_b populated with that pair's
+        // bytes; we return a `ResolvedPath<'b>` borrowing from them.
+        loop {
+            self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+            self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            // We need to drop the pair borrow before potentially looping
+            // back to re-read. Scope it tightly.
+            let tail_to_follow = {
+                let pair = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
+                if crate::dir::lookup(&pair, leaf_name.as_bytes()).is_some() {
+                    None
+                } else if pair.reader.is_hard_tail() {
+                    pair.reader.tail()
+                } else {
+                    return Err(Error::NotFound);
+                }
+            };
+            if let Some(next) = tail_to_follow {
+                current = next;
+                continue;
+            }
+            // Found here; re-parse to produce the returned 'b-lifetime view.
+            let pair = MetadataPair::parse(current.a, buf_a, current.b, buf_b)?;
+            let resolved = crate::dir::lookup(&pair, leaf_name.as_bytes()).expect(
+                "lookup succeeded once already in this iteration; the data has not changed",
+            );
+            return Ok(ResolvedPath {
+                pair: BlockPair::new(pair.active_block, pair.alternate_block),
+                entry: resolved.entry,
+                struct_type: resolved.struct_type,
+                struct_body: resolved.struct_body,
+            });
+        }
+    }
+
+    /// Locate a Directory entry by name within `dir_pair` (chasing
+    /// HardTail-threaded continuations), and return the address of its
+    /// metadata pair. Returns [`Error::NotFound`] if the name does not
+    /// resolve to a Directory in the chain.
+    ///
+    /// Used internally by [`Fs::resolve`] for intermediate path
+    /// components. Exposed-via-method form because the helper does not
+    /// retain a borrow of `buf_a` / `buf_b` past return, decoupling
+    /// the caller's lifetime requirements.
+    fn find_dir_pair(
+        &mut self,
+        dir_pair: BlockPair,
+        name: &[u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<BlockPair, Error> {
+        let mut current = dir_pair;
+        loop {
+            self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+            self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            let pair = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
+            if let Some(resolved) = crate::dir::lookup(&pair, name) {
+                if resolved.entry.kind != crate::dir::EntryKind::Directory {
+                    return Err(Error::NotFound);
+                }
+                if resolved.struct_type != crate::tag::TagType::DirStruct
+                    || resolved.struct_body.len() != 8
+                {
+                    return Err(Error::Corrupt);
+                }
+                let a = u32::from_le_bytes([
+                    resolved.struct_body[0],
+                    resolved.struct_body[1],
+                    resolved.struct_body[2],
+                    resolved.struct_body[3],
+                ]);
+                let b = u32::from_le_bytes([
+                    resolved.struct_body[4],
+                    resolved.struct_body[5],
+                    resolved.struct_body[6],
+                    resolved.struct_body[7],
+                ]);
+                return Ok(BlockPair::new(BlockAddress::new(a), BlockAddress::new(b)));
+            }
+            if pair.reader.is_hard_tail() {
+                if let Some(tail) = pair.reader.tail() {
+                    current = tail;
+                    continue;
+                }
+            }
+            return Err(Error::NotFound);
+        }
     }
 
     /// Read a metadata pair from the storage device into the provided

@@ -10,12 +10,12 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 - [x] Storage-backed mount (`Fs::mount`). Reads blocks 0 and 1 via the `Storage` trait, runs `MetadataPair::parse`, then `Superblock::from_pair`. (`src/fs.rs`, Phase 1d)
 - [x] Single-pair directory entry iteration. (`src/dir.rs`, Phase 1e)
 - [x] Single-pair name lookup with STRUCT pairing. (`src/dir.rs::lookup`, Phase 1f sliver)
-- [ ] Splice handling: Delete tags renumber entries with higher ids; the current iterator yields deleted entries. (Phase 1e.2)
-- [ ] HardTail chasing: directories split across multiple metadata pairs. (Phase 1e.3)
-- [ ] Full path resolution: walk from root by name, descending into subdirectories. (Phase 1e.4)
+- [x] Splice handling: Delete tags renumber entries with higher ids; `dir::live_entries` applies the rules during walk. (`src/dir.rs`, Phase 1i.1)
+- [x] HardTail chasing: directories split across multiple metadata pairs. `Fs::resolve` chases HardTails at each path component. (`src/fs.rs`, Phase 1i.2)
+- [x] Full path resolution: walk from root by name, descending into subdirectories. (`src/fs.rs::resolve`, Phase 1h)
 - [x] File read for inline structs: the InlineStruct body *is* the file content; `dir::lookup` returns it directly. (Phase 1f sliver)
 - [x] CTZ struct codec and geometry math: 8 byte body decode/encode, skip pointer count per block, content bytes per block, file offset -> (block, abs_offset) translation. (`src/ctz.rs`, Phase 1g foundations)
-- [ ] CTZ storage-backed read: walk the chain backward from head, fetch each block's content portion, reassemble. Builds on `block_index_at_offset`. (Phase 1g full)
+- [x] CTZ storage-backed read: walk the chain backward from head, fetch each block's content portion, reassemble. (`src/ctz.rs::read_ctz`, Phase 1g full)
 - [ ] User attribute read.
 - [ ] Mount level error reporting: distinguish "not a LittleFS v2 image" from "geometry mismatch" from "corrupt metadata".
 
