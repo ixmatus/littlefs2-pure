@@ -605,6 +605,130 @@ impl<S: Storage> Fs<S> {
         Ok(())
     }
 
+    /// Read up to `out.len()` bytes from the file at `path` starting
+    /// at `offset`. Returns the number of bytes copied (may be less
+    /// than `out.len()` if `offset + out.len() > file_size`).
+    ///
+    /// Works for both inline (`InlineStruct`) and CTZ-backed files;
+    /// the layout is hidden from callers.
+    pub fn read_at_path(
+        &mut self,
+        path: crate::path::Path<'_>,
+        offset: u32,
+        out: &mut [u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<usize, Error> {
+        if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
+            return Err(Error::GeometryMismatch);
+        }
+        // Decode the entry's layout. The body_copy inline buffer caps
+        // inline files at 1023 bytes (the LittleFS tag length limit).
+        // The Inline variant is much larger than Ctz; the size diff is
+        // intentional and bounded by the inline tag length.
+        #[allow(clippy::large_enum_variant)]
+        enum Layout {
+            Inline { size: usize, body_copy: [u8; 1024] },
+            Ctz(crate::ctz::CtzStruct),
+        }
+        let layout = {
+            let r = self.resolve(path, buf_a, buf_b)?;
+            if r.entry.kind != crate::dir::EntryKind::RegularFile {
+                return Err(Error::AlreadyExists);
+            }
+            match r.struct_type {
+                crate::tag::TagType::InlineStruct => {
+                    let n = r.struct_body.len();
+                    if n > 1024 {
+                        return Err(Error::OutOfRange);
+                    }
+                    let mut body_copy = [0u8; 1024];
+                    body_copy[..n].copy_from_slice(r.struct_body);
+                    Layout::Inline { size: n, body_copy }
+                }
+                crate::tag::TagType::CtzStruct => {
+                    Layout::Ctz(crate::ctz::CtzStruct::from_bytes(r.struct_body)?)
+                }
+                _ => return Err(Error::Corrupt),
+            }
+        };
+
+        match layout {
+            Layout::Inline { size, body_copy } => {
+                let off = offset as usize;
+                if off >= size {
+                    return Ok(0);
+                }
+                let take = (size - off).min(out.len());
+                out[..take].copy_from_slice(&body_copy[off..off + take]);
+                Ok(take)
+            }
+            Layout::Ctz(ctz) => {
+                crate::ctz::read_ctz_at(&mut self.storage, &ctz, offset, out, buf_a)
+            }
+        }
+    }
+
+    /// Return the size in bytes of the file at `path`.
+    pub fn size_of(
+        &mut self,
+        path: crate::path::Path<'_>,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<u32, Error> {
+        let r = self.resolve(path, buf_a, buf_b)?;
+        if r.entry.kind != crate::dir::EntryKind::RegularFile {
+            return Err(Error::AlreadyExists);
+        }
+        match r.struct_type {
+            crate::tag::TagType::InlineStruct => Ok(r.struct_body.len() as u32),
+            crate::tag::TagType::CtzStruct => {
+                Ok(crate::ctz::CtzStruct::from_bytes(r.struct_body)?.size)
+            }
+            _ => Err(Error::Corrupt),
+        }
+    }
+
+    /// Truncate the file at `path` to exactly `new_size` bytes.
+    ///
+    /// If `new_size < current_size`, the trailing bytes are dropped.
+    /// If `new_size > current_size`, the file is zero-extended.
+    /// Atomic full-rewrite (same model as [`Self::append_to_path`]).
+    pub fn truncate_path(
+        &mut self,
+        path: crate::path::Path<'_>,
+        new_size: u32,
+        content_scratch: &mut [u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        if (new_size as usize) > content_scratch.len() {
+            return Err(Error::OutOfRange);
+        }
+        let current_size = match self.size_of(path, buf_a, buf_b) {
+            Ok(s) => s,
+            Err(Error::NotFound) => 0,
+            Err(e) => return Err(e),
+        };
+        let copy_len = new_size.min(current_size);
+        if copy_len > 0 {
+            let n = self.read_at_path(
+                path,
+                0,
+                &mut content_scratch[..copy_len as usize],
+                buf_a,
+                buf_b,
+            )?;
+            debug_assert_eq!(n, copy_len as usize);
+        }
+        if new_size > current_size {
+            for byte in &mut content_scratch[current_size as usize..new_size as usize] {
+                *byte = 0;
+            }
+        }
+        self.write_to_path(path, &content_scratch[..new_size as usize], buf_a, buf_b)
+    }
+
     /// Append bytes to the file at `path`. Creates the file if it does
     /// not exist; otherwise reads the existing content, concatenates
     /// `additional`, and rewrites via [`Self::write_to_path`].
@@ -865,7 +989,8 @@ impl<S: Storage> Fs<S> {
     }
 
     /// Remove a file at `path`. Returns [`Error::NotFound`] if the
-    /// file does not exist.
+    /// file does not exist; [`Error::AlreadyExists`] if the path
+    /// resolves to a directory (use [`Self::rmdir`] instead).
     pub fn remove_at_path(
         &mut self,
         path: crate::path::Path<'_>,
@@ -873,6 +998,81 @@ impl<S: Storage> Fs<S> {
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
         let (parent, leaf) = self.resolve_parent(path, buf_a, buf_b)?;
+        // Reject directories: removing a directory entry without
+        // checking emptiness would orphan its content. Use rmdir.
+        self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        {
+            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
+            match crate::dir::lookup(&p, leaf.as_bytes()) {
+                Some(r) if r.entry.kind == crate::dir::EntryKind::Directory => {
+                    return Err(Error::AlreadyExists);
+                }
+                Some(_) => {}
+                None => return Err(Error::NotFound),
+            }
+        }
+        self.remove_from_pair(parent, leaf.as_bytes(), buf_a, buf_b)
+    }
+
+    /// Remove an empty directory at `path`.
+    ///
+    /// Verifies the entry is a Directory and its metadata pair has no
+    /// live entries before removing it. The directory's metadata pair
+    /// becomes unreachable after the parent's entry is removed; the
+    /// allocator reclaims its blocks on the next scan.
+    pub fn rmdir(
+        &mut self,
+        path: crate::path::Path<'_>,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        let (parent, leaf) = self.resolve_parent(path, buf_a, buf_b)?;
+
+        // Resolve the entry; validate it's a Directory; grab its pair.
+        self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let dir_pair = {
+            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
+            let resolved = crate::dir::lookup(&p, leaf.as_bytes()).ok_or(Error::NotFound)?;
+            if resolved.entry.kind != crate::dir::EntryKind::Directory {
+                return Err(Error::AlreadyExists);
+            }
+            if resolved.struct_type != crate::tag::TagType::DirStruct
+                || resolved.struct_body.len() != 8
+            {
+                return Err(Error::Corrupt);
+            }
+            let a = u32::from_le_bytes([
+                resolved.struct_body[0],
+                resolved.struct_body[1],
+                resolved.struct_body[2],
+                resolved.struct_body[3],
+            ]);
+            let b = u32::from_le_bytes([
+                resolved.struct_body[4],
+                resolved.struct_body[5],
+                resolved.struct_body[6],
+                resolved.struct_body[7],
+            ]);
+            BlockPair::new(BlockAddress::new(a), BlockAddress::new(b))
+        };
+
+        // Read the directory's pair and verify it's empty.
+        self.storage.read(dir_pair.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(dir_pair.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        {
+            let dp = MetadataPair::parse(dir_pair.a, &*buf_a, dir_pair.b, &*buf_b)?;
+            let mut live_count = 0usize;
+            crate::dir::live_entries(&dp, |_| {
+                live_count += 1;
+                Ok::<(), Error>(())
+            })?;
+            if live_count > 0 {
+                return Err(Error::NotEmpty);
+            }
+        }
+
         self.remove_from_pair(parent, leaf.as_bytes(), buf_a, buf_b)
     }
 

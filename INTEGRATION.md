@@ -19,7 +19,11 @@ This file points downstream consumers (SMIL firmware, etc.) at the relevant entr
 | Create a directory | `Fs::mkdir(path, ...)` | Allocates a fresh metadata pair, writes empty initial commit |
 | Remove a file at root | `Fs::remove_from_root(name, ...)` | Splice-correct; deleted entries no longer resolve |
 | Append to a file (atomic full-rewrite) | `Fs::append_to_path(path, additional, content_scratch, ...)` | Creates if missing; handles inline↔CTZ transitions |
-| Remove a file at path | `Fs::remove_at_path(path, ...)` | Resolves parent, then removes |
+| Read at offset (inline + CTZ) | `Fs::read_at_path(path, offset, &mut out, ...)` | Returns bytes copied; works on any layout |
+| File size | `Fs::size_of(path, ...)` | Returns byte length (inline or CTZ) |
+| Truncate / extend | `Fs::truncate_path(path, new_size, content_scratch, ...)` | Shrink drops trailing bytes; extend zero-pads |
+| Remove a file at path | `Fs::remove_at_path(path, ...)` | Rejects directories; use `rmdir` instead |
+| Remove empty directory | `Fs::rmdir(path, ...)` | Errors with `NotEmpty` if the dir has contents |
 | List a directory | `Fs::list_dir(path, callback, ...)` | Splice-correct, skips superblock; single-pair only (no HardTail chasing yet) |
 | List root directory | `Fs::list_root(callback, ...)` | Skips the superblock; renumbers across splice |
 | NOR-aligned program wrapper | `NorAlignedStorage::new(your_storage)` | Caches programs to `PROG_SIZE` windows |
@@ -28,11 +32,10 @@ This file points downstream consumers (SMIL firmware, etc.) at the relevant entr
 
 | Capability | Tracking |
 |---|---|
-| Stateful `File<'fs, S>` handle with `open / read / write / seek / set_len / sync` | Phase 2f.2 (the existing `append_to_path` covers append-only workloads atomically) |
+| Stateful `File<'fs, S>` handle with `open / read / write / seek / set_len / sync` | Phase 2f.2 (the existing `append_to_path` + `read_at_path` + `truncate_path` together cover the common cases atomically) |
 | Streaming append for huge files (no full read-rewrite) | Phase 2f.2 (true incremental CTZ chain extension) |
-| `rmdir` (with emptiness check + pair free) | Phase 2g |
-| `rename` | Phase 2g |
-| Multi-pair directory listing (HardTail chasing in `list_dir`) | Phase 2g |
+| `rename` | Phase 2g.2 |
+| Multi-pair directory listing (HardTail chasing in `list_dir`) | Phase 2g.5 |
 | Power-loss fuzz / Kani harnesses | Phase 3 |
 
 For the SMIL audit logger specifically: `create_dir`, `File::write` with append/truncate, `File::seek`, and `set_len` all map to Phases 2c–2f. The current write surface is sufficient for upsert-style configuration files (small keys + small values), not for log-style streaming writes.

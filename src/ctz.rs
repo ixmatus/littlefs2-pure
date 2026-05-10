@@ -189,10 +189,29 @@ pub fn read_ctz<S: Storage>(
     out: &mut [u8],
     scratch: &mut [u8],
 ) -> Result<usize, Error> {
+    read_ctz_at(storage, ctz, 0, out, scratch)
+}
+
+/// Read up to `out.len()` bytes of a CTZ file starting at byte offset
+/// `start_off`. Returns the number of bytes copied (may be less than
+/// `out.len()` if `start_off + out.len() > ctz.size`).
+///
+/// Like [`read_ctz`] but seek-aware. The implementation still walks
+/// the whole chain backward to collect block addresses (same
+/// `MAX_CTZ_BLOCKS` cap); only the read step is offset-aware. A
+/// log-time seek (using skip pointers from the head, à la
+/// `lfs_ctz_find`) is a future optimization.
+pub fn read_ctz_at<S: Storage>(
+    storage: &mut S,
+    ctz: &CtzStruct,
+    start_off: u32,
+    out: &mut [u8],
+    scratch: &mut [u8],
+) -> Result<usize, Error> {
     if scratch.len() < S::BLOCK_SIZE {
         return Err(Error::GeometryMismatch);
     }
-    if ctz.size == 0 || out.is_empty() {
+    if ctz.size == 0 || out.is_empty() || start_off >= ctz.size {
         return Ok(0);
     }
 
@@ -230,21 +249,41 @@ pub fn read_ctz<S: Storage>(
         }
     }
 
-    // Forward read: pull each block's content portion into `out`.
-    let target = out.len().min(ctz.size as usize);
+    // Forward read: pull each block's content portion into `out`,
+    // skipping logical bytes before `start_off`.
+    let end_off = ctz.size.min(start_off.saturating_add(out.len() as u32));
+    let target_bytes = (end_off - start_off) as usize;
     let mut out_off = 0usize;
+    let mut logical_off = 0u32;
     for i in 0..total_blocks {
-        let header = 4 * skip_pointers_in_block(i) as usize;
-        let block_content_max = (bs as usize) - header;
-        let remaining = target - out_off;
-        let copy_len = block_content_max.min(remaining);
-        if copy_len == 0 {
+        if out_off >= target_bytes {
             break;
         }
+        let header = 4 * skip_pointers_in_block(i) as usize;
+        let block_content_max = (bs as usize) - header;
+        let block_logical_start = logical_off;
+        let block_logical_end = logical_off + block_content_max as u32;
+        // Skip blocks entirely before start_off.
+        if block_logical_end <= start_off {
+            logical_off = block_logical_end;
+            continue;
+        }
+        // Determine the slice of this block's content to copy.
+        let skip_in_block = (start_off.saturating_sub(block_logical_start)) as usize;
+        let take = (block_content_max - skip_in_block).min(target_bytes - out_off);
+        if take == 0 {
+            logical_off = block_logical_end;
+            continue;
+        }
         storage
-            .read(blocks[i as usize].as_u32(), header as u32, &mut out[out_off..out_off + copy_len])
+            .read(
+                blocks[i as usize].as_u32(),
+                (header + skip_in_block) as u32,
+                &mut out[out_off..out_off + take],
+            )
             .map_err(|_| Error::Io)?;
-        out_off += copy_len;
+        out_off += take;
+        logical_off = block_logical_end;
     }
     Ok(out_off)
 }

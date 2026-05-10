@@ -64,6 +64,11 @@ pub enum Error {
     /// repair. Logged with as much context as possible; users should treat
     /// this as a fatal mount error.
     Corrupt,
+
+    /// Attempted to remove a directory that still has live entries.
+    /// Caller must remove the contents first (or use a recursive
+    /// helper if one becomes available).
+    NotEmpty,
 }
 
 impl fmt::Display for Error {
@@ -82,6 +87,7 @@ impl fmt::Display for Error {
             Self::AlreadyExists => "name already exists",
             Self::GeometryMismatch => "storage geometry does not match the superblock",
             Self::Corrupt => "filesystem is corrupt",
+            Self::NotEmpty => "directory is not empty",
         };
         f.write_str(s)
     }
