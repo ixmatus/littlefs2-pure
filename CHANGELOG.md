@@ -6,6 +6,23 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **`Fs::mount` (storage-backed glue).** Composes `MetadataPair::parse` and
+  `Superblock::from_pair` against a `Storage` backed device. Caller passes
+  in two scratch buffers (each exactly `S::BLOCK_SIZE` bytes); after mount
+  returns, the buffers can be reused. The returned `Fs<S>` holds the
+  storage, the decoded superblock, and the root pair address.
+  Geometry validation: the on disk `block_size` and `block_count` must
+  match the `Storage` trait's advertised constants, else
+  `Error::GeometryMismatch`.
+- **`tests/common::MemStorage`.** In memory `Storage` implementation for
+  integration tests. Geometry baked into the type (256 byte blocks, 8
+  blocks) so the trait's associated constants resolve. Does not yet
+  enforce NOR flash semantics (program-can-only-flip-1-to-0); the read
+  kernel does not require it. Phase 2 will tighten this.
+- **`tests/mount.rs`.** Seven integration tests: well formed image
+  mounts, both blocks corrupt -> Error::Corrupt, geometry mismatch on
+  block_size and block_count, wrong buffer size, unformatted device,
+  storage accessor round trip.
 - **Superblock parser (`superblock::Superblock`).** Decodes the 24 byte
   INLINESTRUCT body (six little endian `u32`s: version, block_size,
   block_count, name_max, file_max, attr_max) and validates the magic NAME

@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 use littlefs2_pure::crc;
+use littlefs2_pure::storage::Storage;
 use littlefs2_pure::tag::{Tag, TagType, ID_NONE};
 
 /// Test only metadata block builder.
@@ -115,4 +116,128 @@ impl BlockBuilder {
     pub fn finish(self) -> alloc::vec::Vec<u8> {
         self.buf
     }
+}
+
+/// In memory [`Storage`] backing for the integration tests.
+///
+/// Holds `BLOCK_SIZE * BLOCK_COUNT` bytes in a `Vec` and implements the
+/// read / program / erase contract against that buffer. Geometry constants
+/// are baked into the type so the trait's associated consts can refer to
+/// them; tests pick a small fixed geometry (256 byte blocks, 8 total
+/// blocks) sufficient to host the foundational fixtures.
+///
+/// The implementation deliberately does not enforce NOR flash semantics
+/// (program may only flip `1` to `0`) because the read kernel does not
+/// depend on that constraint. The write kernel landing in Phase 2 will
+/// upgrade this to a stricter model.
+#[derive(Debug)]
+pub struct MemStorage {
+    pub data: alloc::vec::Vec<u8>,
+}
+
+impl MemStorage {
+    pub const READ_SIZE: usize = 16;
+    pub const PROG_SIZE: usize = 16;
+    pub const BLOCK_SIZE: usize = 256;
+    pub const BLOCK_COUNT: u32 = 8;
+    pub const CACHE_SIZE: usize = 64;
+    pub const LOOKAHEAD_SIZE: usize = 8;
+
+    pub fn new() -> Self {
+        Self { data: alloc::vec![0xFFu8; Self::BLOCK_SIZE * Self::BLOCK_COUNT as usize] }
+    }
+
+    pub fn write_block(&mut self, block: u32, bytes: &[u8]) {
+        let start = (block as usize) * Self::BLOCK_SIZE;
+        self.data[start..start + bytes.len()].copy_from_slice(bytes);
+    }
+}
+
+impl Default for MemStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Storage for MemStorage {
+    type Error = ();
+    const READ_SIZE: usize = Self::READ_SIZE;
+    const PROG_SIZE: usize = Self::PROG_SIZE;
+    const BLOCK_SIZE: usize = Self::BLOCK_SIZE;
+    const BLOCK_COUNT: u32 = Self::BLOCK_COUNT;
+    const CACHE_SIZE: usize = Self::CACHE_SIZE;
+    const LOOKAHEAD_SIZE: usize = Self::LOOKAHEAD_SIZE;
+
+    fn read(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), ()> {
+        let start = (block as usize) * Self::BLOCK_SIZE + (off as usize);
+        if start + buf.len() > self.data.len() {
+            return Err(());
+        }
+        buf.copy_from_slice(&self.data[start..start + buf.len()]);
+        Ok(())
+    }
+
+    fn program(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), ()> {
+        let start = (block as usize) * Self::BLOCK_SIZE + (off as usize);
+        if start + data.len() > self.data.len() {
+            return Err(());
+        }
+        self.data[start..start + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+
+    fn erase(&mut self, block: u32) -> Result<(), ()> {
+        let start = (block as usize) * Self::BLOCK_SIZE;
+        let end = start + Self::BLOCK_SIZE;
+        if end > self.data.len() {
+            return Err(());
+        }
+        for b in &mut self.data[start..end] {
+            *b = 0xFF;
+        }
+        Ok(())
+    }
+}
+
+/// Construct a single commit metadata block containing a superblock
+/// (NAME magic + INLINESTRUCT geometry), matching what
+/// [`Superblock::from_pair`] expects for mount.
+pub fn build_superblock_block(
+    sb: &littlefs2_pure::Superblock,
+    block_size: usize,
+) -> alloc::vec::Vec<u8> {
+    let mut buf = alloc::vec![0xFFu8; block_size];
+    buf[0..4].copy_from_slice(&1u32.to_le_bytes());
+
+    let mut ptag: u32 = 0xFFFF_FFFF;
+    let mut running_crc = crc::update(crc::INIT, &buf[0..4]);
+    let mut off = 4usize;
+
+    let name_tag = Tag::new(true, TagType::Superblock, 0, 8);
+    let raw = name_tag.into_bits() ^ ptag;
+    buf[off..off + 4].copy_from_slice(&raw.to_be_bytes());
+    running_crc = crc::update(running_crc, &raw.to_be_bytes());
+    buf[off + 4..off + 12].copy_from_slice(littlefs2_pure::MAGIC);
+    running_crc = crc::update(running_crc, littlefs2_pure::MAGIC);
+    ptag = name_tag.into_bits();
+    off += 12;
+
+    let inline_tag =
+        Tag::new(true, TagType::InlineStruct, 0, littlefs2_pure::Superblock::SIZE as u16);
+    let raw = inline_tag.into_bits() ^ ptag;
+    buf[off..off + 4].copy_from_slice(&raw.to_be_bytes());
+    running_crc = crc::update(running_crc, &raw.to_be_bytes());
+    let body = sb.to_bytes();
+    buf[off + 4..off + 4 + littlefs2_pure::Superblock::SIZE].copy_from_slice(&body);
+    running_crc = crc::update(running_crc, &body);
+    ptag = inline_tag.into_bits();
+    off += 4 + littlefs2_pure::Superblock::SIZE;
+
+    let ccrc_tag = Tag::new(true, TagType::CommitCrc(0), ID_NONE, 4);
+    let raw = ccrc_tag.into_bits() ^ ptag;
+    buf[off..off + 4].copy_from_slice(&raw.to_be_bytes());
+    running_crc = crc::update(running_crc, &raw.to_be_bytes());
+    buf[off + 4..off + 8].copy_from_slice(&running_crc.to_le_bytes());
+
+    buf
 }

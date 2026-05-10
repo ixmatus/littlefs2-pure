@@ -40,6 +40,7 @@ extern crate std;
 pub mod block;
 pub mod crc;
 pub mod error;
+pub mod fs;
 pub mod meta;
 pub mod path;
 pub mod storage;
@@ -53,6 +54,7 @@ pub mod tag;
 
 pub use crate::block::{BlockAddress, BlockPair};
 pub use crate::error::{Error, Result};
+pub use crate::fs::Fs;
 pub use crate::meta::{MetadataPair, MetadataReader, TagEntry};
 pub use crate::path::Path;
 pub use crate::storage::Storage;
