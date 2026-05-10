@@ -167,7 +167,7 @@ where
                 slots[count - 1] = None;
                 count -= 1;
             }
-            TagType::RegularFile | TagType::Directory => {
+            TagType::RegularFile | TagType::Directory | TagType::Superblock => {
                 if id >= count {
                     // A NAME tag without a prior Create is allowed at the
                     // boundary `id == count` (legacy commits without an
@@ -179,12 +179,18 @@ where
                         return Err(crate::error::Error::Corrupt);
                     }
                 }
-                let kind = if matches!(tag.tag_type(), TagType::RegularFile) {
-                    EntryKind::RegularFile
-                } else {
-                    EntryKind::Directory
+                // The Superblock NAME counts toward the entry count
+                // (id 0 of the root pair) but is not emitted to the
+                // caller's callback. Track it as a `None` slot so the
+                // slot count stays in sync with `gather_live_slots` in
+                // the write path.
+                let kind = match tag.tag_type() {
+                    TagType::RegularFile => Some(EntryKind::RegularFile),
+                    TagType::Directory => Some(EntryKind::Directory),
+                    TagType::Superblock => None,
+                    _ => unreachable!(),
                 };
-                slots[id] = Some(DirEntry { id: id as u16, name: entry.body, kind });
+                slots[id] = kind.map(|k| DirEntry { id: id as u16, name: entry.body, kind: k });
             }
             _ => {} // STRUCT / CCRC / FCRC / etc. don't affect the entry roster.
         }
@@ -225,59 +231,110 @@ pub struct Resolved<'a> {
     pub struct_body: &'a [u8],
 }
 
+/// Internal slot used by [`lookup`] to track each live entry's
+/// latest NAME and STRUCT tag bodies, indexed by current id.
+#[derive(Clone, Copy)]
+struct LookupSlot<'a> {
+    /// `Some(name_bytes)` once a NAME has been seen at this id.
+    name: Option<&'a [u8]>,
+    /// `Some(kind)` for `RegularFile` / `Directory`; `None` for the
+    /// Superblock NAME (counted but not user visible).
+    kind: Option<EntryKind>,
+    /// `Some((struct_type, struct_body))` once a STRUCT has been seen.
+    struct_data: Option<(TagType, &'a [u8])>,
+}
+
+impl LookupSlot<'_> {
+    const EMPTY: Self = Self { name: None, kind: None, struct_data: None };
+}
+
 /// Look up a directory entry by name within a single metadata pair.
 ///
-/// Walks the tag stream looking for:
-///
-/// 1. A NAME tag (RegularFile or Directory) whose body equals `name`.
-/// 2. A STRUCT tag at the same id (a [`crate::TagType::InlineStruct`],
-///    [`crate::TagType::CtzStruct`], or [`crate::TagType::DirStruct`]).
-///
-/// Returns `None` if no NAME matches, or if the matching NAME's id has
-/// no STRUCT tag in the same pair. The "no STRUCT" case can happen in
-/// partially-written commits and is treated by this read path as
-/// "entry incomplete, do not yield".
+/// Walks the tag stream applying splice (Create / Delete) renumbering,
+/// and looks for a slot whose NAME body equals `name` and whose entry
+/// kind is a user visible one (RegularFile or Directory). Returns
+/// `None` if the entry is missing, has been deleted by a subsequent
+/// splice, or has no corresponding STRUCT tag in the pair.
 ///
 /// # Scope
 ///
-/// Single pair only. Does not chase HardTail tags into adjacent pairs.
-/// Does not apply splice / Delete renumbering. See module docs for the
-/// Phase 1e scope.
+/// Single pair only. Does not chase HardTail tags into adjacent pairs;
+/// callers wanting that should walk the chain themselves (or use
+/// [`crate::Fs::resolve`] which does).
 #[must_use]
 pub fn lookup<'a>(pair: &MetadataPair<'a>, name: &[u8]) -> Option<Resolved<'a>> {
-    // First pass: find the NAME tag with the matching body, record its
-    // id and kind.
-    let mut found: Option<(u16, EntryKind, &'a [u8])> = None;
+    let mut slots: [LookupSlot<'a>; MAX_LIVE_ENTRIES] = [LookupSlot::EMPTY; MAX_LIVE_ENTRIES];
+    let mut count: usize = 0;
+
     for entry in pair.reader.iter_tags() {
-        match entry.tag.tag_type() {
-            TagType::RegularFile if entry.body == name => {
-                found = Some((entry.tag.id(), EntryKind::RegularFile, entry.body));
+        let tag = entry.tag;
+        let id = tag.id() as usize;
+        match tag.tag_type() {
+            TagType::Create => {
+                if count >= MAX_LIVE_ENTRIES || id > count {
+                    return None;
+                }
+                let mut i = count;
+                while i > id {
+                    slots[i] = slots[i - 1];
+                    i -= 1;
+                }
+                slots[id] = LookupSlot::EMPTY;
+                count += 1;
             }
-            TagType::Directory if entry.body == name => {
-                found = Some((entry.tag.id(), EntryKind::Directory, entry.body));
+            TagType::Delete => {
+                if id >= count {
+                    return None;
+                }
+                let mut i = id;
+                while i + 1 < count {
+                    slots[i] = slots[i + 1];
+                    i += 1;
+                }
+                slots[count - 1] = LookupSlot::EMPTY;
+                count -= 1;
+            }
+            TagType::RegularFile | TagType::Directory | TagType::Superblock => {
+                if id >= count {
+                    if id == count && count < MAX_LIVE_ENTRIES {
+                        slots[id] = LookupSlot::EMPTY;
+                        count += 1;
+                    } else {
+                        return None;
+                    }
+                }
+                slots[id].name = Some(entry.body);
+                slots[id].kind = match tag.tag_type() {
+                    TagType::RegularFile => Some(EntryKind::RegularFile),
+                    TagType::Directory => Some(EntryKind::Directory),
+                    TagType::Superblock => None,
+                    _ => unreachable!(),
+                };
+            }
+            ty @ (TagType::InlineStruct | TagType::CtzStruct | TagType::DirStruct)
+                if id < count =>
+            {
+                slots[id].struct_data = Some((ty, entry.body));
             }
             _ => {}
         }
     }
-    let (id, kind, name_slice) = found?;
 
-    // Second pass: find a STRUCT tag at the same id. Latest wins
-    // (mirroring the "later commits supersede earlier" rule).
-    let mut struct_body: Option<(crate::tag::TagType, &'a [u8])> = None;
-    for entry in pair.reader.iter_tags() {
-        if entry.tag.id() != id {
+    // Find a slot whose name matches and whose kind is user visible
+    // (i.e., not the Superblock).
+    for (i, slot) in slots.iter().enumerate().take(count) {
+        let (Some(slot_name), Some(kind), Some((struct_type, struct_body))) =
+            (slot.name, slot.kind, slot.struct_data)
+        else {
             continue;
-        }
-        if let ty @ (TagType::InlineStruct | TagType::CtzStruct | TagType::DirStruct) =
-            entry.tag.tag_type()
-        {
-            struct_body = Some((ty, entry.body));
+        };
+        if slot_name == name {
+            return Some(Resolved {
+                entry: DirEntry { id: i as u16, name: slot_name, kind },
+                struct_type,
+                struct_body,
+            });
         }
     }
-    let (struct_type, body) = struct_body?;
-    Some(Resolved {
-        entry: DirEntry { id, name: name_slice, kind },
-        struct_type,
-        struct_body: body,
-    })
+    None
 }

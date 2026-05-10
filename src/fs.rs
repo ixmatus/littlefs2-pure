@@ -150,9 +150,9 @@ fn gather_live_slots(
     Ok(count)
 }
 
-/// A pending write operation: create a new entry or update an existing
-/// one. Used by [`Fs::write_inline_to_root`] to dispatch the two
-/// commit shapes.
+/// A pending write operation. Used by [`Fs::write_inline_to_root`] and
+/// [`Fs::remove_from_root`] to dispatch through the same append-vs-compact
+/// machinery.
 #[derive(Clone, Copy)]
 enum WriteOp<'a> {
     /// Create a new entry at `id` (the next free id) with NAME `name`
@@ -162,6 +162,9 @@ enum WriteOp<'a> {
     /// InlineStruct with `content`. The NAME and entry kind are
     /// preserved by the existing tags in the commit log.
     Update { id: u16, content: &'a [u8] },
+    /// Remove the entry at `id`. Append path emits a `Delete` tag;
+    /// compact path skips the slot and renumbers subsequent ids down.
+    Remove { id: u16 },
 }
 
 /// Emit the tags for a [`WriteOp`] to an in-progress commit.
@@ -175,6 +178,13 @@ fn emit_op(commit: &mut crate::meta::Commit<'_>, op: &WriteOp<'_>) -> Result<(),
         }
         WriteOp::Update { id, content } => {
             commit.tag(Tag::new(true, TagType::InlineStruct, id, content.len() as u16), content)?;
+        }
+        WriteOp::Remove { id } => {
+            // Delete tag's length field is the special sentinel 0x3FF
+            // (no body). Subsequent entries with higher ids renumber
+            // down at read time via `dir::live_entries`'s splice
+            // handling.
+            commit.tag(Tag::new(true, TagType::Delete, id, 0x3FF), &[])?;
         }
     }
     Ok(())
@@ -281,6 +291,158 @@ pub struct Fs<S: Storage> {
 }
 
 impl<S: Storage> Fs<S> {
+    /// Check whether an entry exists at the given absolute path.
+    ///
+    /// Equivalent to `self.resolve(path, ...).is_ok()` but kinder to
+    /// the caller: returns `Ok(true)` for present, `Ok(false)` for a
+    /// clean "not found" (missing leaf, missing intermediate, or
+    /// intermediate-is-file), and an `Err` for I/O or corruption.
+    pub fn exists(
+        &mut self,
+        path: crate::path::Path<'_>,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<bool, Error> {
+        match self.resolve(path, buf_a, buf_b) {
+            Ok(_) => Ok(true),
+            Err(Error::NotFound) => Ok(false),
+            Err(Error::InvalidPath) if path.is_root() => Ok(true), // root always exists
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Remove an entry from the filesystem root by name.
+    ///
+    /// If the name resolves, appends a `Delete` tag at the entry's id
+    /// (or skips that slot during compaction if the active block is
+    /// full). Subsequent entries with higher ids are renumbered down,
+    /// matching the splice semantics in [`crate::dir::live_entries`].
+    ///
+    /// Returns [`Error::NotFound`] if the name does not exist.
+    ///
+    /// **Scope.** Root-only. Removing non-empty directories is not
+    /// validated yet (the API will happily Delete a directory entry
+    /// without checking its contents — Phase 2f follow-up). Files are
+    /// the safe case and the SMIL calculator's primary need.
+    pub fn remove_from_root(
+        &mut self,
+        name: &[u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
+            return Err(Error::GeometryMismatch);
+        }
+        if name.is_empty() {
+            return Err(Error::InvalidPath);
+        }
+
+        self.storage.read(0, 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(1, 0, buf_b).map_err(|_| Error::Io)?;
+
+        let active_addr;
+        let alternate_addr;
+        let active_is_a;
+        let committed_end;
+        let next_ptag;
+        let old_revision;
+        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+        let count: usize;
+        let target_id: u16;
+        {
+            let pair =
+                MetadataPair::parse(BlockAddress::new(0), &*buf_a, BlockAddress::new(1), &*buf_b)?;
+            active_addr = pair.active_block;
+            alternate_addr = pair.alternate_block;
+            active_is_a = active_addr == BlockAddress::new(0);
+            committed_end = pair.reader.committed_end();
+            next_ptag = pair.reader.next_ptag();
+            old_revision = pair.reader.revision();
+
+            match crate::dir::lookup(&pair, name) {
+                Some(r) => target_id = r.entry.id,
+                None => return Err(Error::NotFound),
+            }
+            count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
+        }
+
+        let op = WriteOp::Remove { id: target_id };
+        let op_dsize = 4 + 8; // Delete tag (4) + CCRC (4 + 4)
+
+        if committed_end + op_dsize <= S::BLOCK_SIZE {
+            // ---- APPEND PATH ----
+            let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
+            let new_end = {
+                let mut commit =
+                    crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
+                emit_op(&mut commit, &op)?;
+                commit.finish(0)?;
+                commit.bytes_written()
+            };
+            self.storage
+                .program(
+                    active_addr.as_u32(),
+                    committed_end as u32,
+                    &active_buf[committed_end..new_end],
+                )
+                .map_err(|_| Error::Io)?;
+        } else {
+            // ---- COMPACT PATH ----
+            let new_revision = old_revision.wrapping_add(1);
+            let new_end = if active_is_a {
+                build_compact_commit(buf_b, buf_a, new_revision, &slots, count, &op)?
+            } else {
+                build_compact_commit(buf_a, buf_b, new_revision, &slots, count, &op)?
+            };
+            self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
+            let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+            self.storage
+                .program(alternate_addr.as_u32(), 0, &alt_buf[..new_end])
+                .map_err(|_| Error::Io)?;
+        }
+
+        self.storage.sync().map_err(|_| Error::Io)?;
+        Ok(())
+    }
+
+    /// List the regular file and subdirectory names at the filesystem
+    /// root, calling `f` for each.
+    ///
+    /// Skips the superblock entry. Applies splice (Create/Delete)
+    /// renumbering, so deleted entries do not leak through. The names
+    /// passed to `f` are raw bytes (LittleFS does not enforce UTF-8);
+    /// callers that need a `str` should validate.
+    ///
+    /// Returns the live entry count.
+    pub fn list_root<F>(
+        &mut self,
+        mut f: F,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(&crate::dir::DirEntry<'_>),
+    {
+        if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
+            return Err(Error::GeometryMismatch);
+        }
+        self.storage.read(0, 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(1, 0, buf_b).map_err(|_| Error::Io)?;
+        let pair = MetadataPair::parse(BlockAddress::new(0), buf_a, BlockAddress::new(1), buf_b)?;
+        let mut emitted = 0usize;
+        crate::dir::live_entries(&pair, |e| {
+            // Skip the superblock entry by kind. The superblock NAME
+            // appears as TagType::Superblock but live_entries only
+            // emits DirEntry { kind: RegularFile | Directory }, so it
+            // never appears here. Defensive though: if a future
+            // refactor surfaces it, we still skip on kind.
+            f(&e);
+            emitted += 1;
+            Ok::<(), Error>(())
+        })?;
+        Ok(emitted)
+    }
+
     /// Write or update a small inline file at the filesystem root
     /// (upsert semantics).
     ///
@@ -352,11 +514,11 @@ impl<S: Storage> Fs<S> {
             WriteOp::Create { id: new_id, name, content }
         };
 
-        // Commit size: Update is one InlineStruct + CCRC; Create is
-        // Create + NAME + InlineStruct + CCRC.
+        // Commit size for each WriteOp shape, plus the trailing CCRC (8).
         let op_dsize = match op {
             WriteOp::Update { content, .. } => (4 + content.len()) + 8,
             WriteOp::Create { name, content, .. } => 4 + (4 + name.len()) + (4 + content.len()) + 8,
+            WriteOp::Remove { .. } => 4 + 8,
         };
 
         if committed_end + op_dsize <= S::BLOCK_SIZE {

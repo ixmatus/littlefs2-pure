@@ -6,6 +6,29 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **`Fs::remove_from_root`, `Fs::list_root`, `Fs::exists` (Phase 2b.4).**
+  Closes the CRUD surface needed by SMIL's audit-style consumers.
+  `remove_from_root` appends a Delete tag (or skips the slot during
+  compaction); `list_root` enumerates user entries (skipping the
+  superblock); `exists` is a typed wrapper over `resolve` returning
+  `bool`.
+- **`dir::lookup` and `dir::live_entries` now apply splice
+  renumbering (bug fix).** Prior to this commit, `lookup` would
+  return deleted entries (because it scanned for the latest NAME
+  match without applying Splice), and `live_entries` errored on a
+  Create at id 1 in a freshly formatted pair (because it counted the
+  user entries differently from `gather_live_slots`'s write side).
+  Both functions now share the same slot-tracking algorithm and
+  agree on counts. Superblock NAME tags are counted internally but
+  not surfaced through the iterator/lookup.
+- **CI workflow** (`.github/workflows/ci.yml`) running on every push:
+  host fmt + clippy + test, plus cross-compile against
+  `thumbv6m-none-eabi`, `thumbv8m.main-none-eabi`, and
+  `thumbv8m.main-none-eabihf` (the SMIL firmware target). All three
+  embedded targets check clean today.
+- **INTEGRATION.md** for downstream consumers: a one-page rundown of
+  what works, what's pending, and the suggested step-by-step
+  integration path. SMIL audit-feedback driven.
 - **`NorAlignedStorage` wrapper (Phase 2b.3).** Adapter that converts
   byte-granular `program` calls from the kernel into `PROG_SIZE`
   aligned NOR-compliant programs. Caches the active program window in

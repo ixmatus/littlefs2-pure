@@ -32,7 +32,10 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 - [ ] File write with CTZ extension when content exceeds inline threshold: requires block allocator. (Phase 2d)
 - [x] `Fs::format` producing a superblock the C reference can mount. (Phase 2a; bit accuracy verified against `meta::MetadataReader` round-trip; C-reference cross-check pending the conformance harness.)
 - [ ] Sync semantics (`Fs::sync`, drop on close).
-- [ ] mkdir, rmdir, rename, remove.
+- [x] `remove_from_root`: delete a file by name from the root, splice-correct. (Phase 2b.4)
+- [x] `list_root`: enumerate root entries, splice-correct, skipping the superblock. (Phase 2b.4)
+- [x] `exists`: typed wrapper over `resolve`. (Phase 2b.4)
+- [ ] `mkdir`, `rmdir`, `rename`. (Phase 2e, 2g)
 - [ ] User attribute write.
 - [ ] Atomic move state recovery.
 
