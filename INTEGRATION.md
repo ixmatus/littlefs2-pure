@@ -24,6 +24,7 @@ This file points downstream consumers (SMIL firmware, etc.) at the relevant entr
 | Truncate / extend | `Fs::truncate_path(path, new_size, content_scratch, ...)` | Shrink drops trailing bytes; extend zero-pads |
 | Remove a file at path | `Fs::remove_at_path(path, ...)` | Rejects directories; use `rmdir` instead |
 | Remove empty directory | `Fs::rmdir(path, ...)` | Errors with `NotEmpty` if the dir has contents |
+| Rename within same directory | `Fs::rename_in_dir(old_path, new_path, ...)` | Same parent required; cross-dir is a future enhancement |
 | List a directory | `Fs::list_dir(path, callback, ...)` | Splice-correct, skips superblock; single-pair only (no HardTail chasing yet) |
 | List root directory | `Fs::list_root(callback, ...)` | Skips the superblock; renumbers across splice |
 | NOR-aligned program wrapper | `NorAlignedStorage::new(your_storage)` | Caches programs to `PROG_SIZE` windows |
@@ -34,7 +35,7 @@ This file points downstream consumers (SMIL firmware, etc.) at the relevant entr
 |---|---|
 | Stateful `File<'fs, S>` handle with `open / read / write / seek / set_len / sync` | Phase 2f.2 (the existing `append_to_path` + `read_at_path` + `truncate_path` together cover the common cases atomically) |
 | Streaming append for huge files (no full read-rewrite) | Phase 2f.2 (true incremental CTZ chain extension) |
-| `rename` | Phase 2g.2 |
+| Cross-directory rename | Phase 2g.5 (same-directory rename is shipped) |
 | Multi-pair directory listing (HardTail chasing in `list_dir`) | Phase 2g.5 |
 | Power-loss fuzz / Kani harnesses | Phase 3 |
 

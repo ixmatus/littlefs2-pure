@@ -6,6 +6,13 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **`Fs::rename_in_dir` (Phase 2g.2).** Same-parent rename via a new
+  `WriteOp::RenameInPlace { id, name_type, new_name }` variant. The
+  reader picks the latest NAME for any given id, so appending a new
+  NAME at the existing id is sufficient. Useful for SMIL audit log
+  rotation (`/audit/log` → `/audit/log.archived`). Cross-directory
+  rename is a follow-up (needs Delete-from-source + Create-in-dest
+  with proper splice handling).
 - **`Fs::rmdir` (Phase 2g.1).** Remove an empty directory at a path.
   Verifies the entry is a Directory and that its metadata pair has no
   live entries before removing it. Returns `Error::NotEmpty` if the

@@ -47,7 +47,8 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 - [x] `remove_at_path` rejects directory targets (must use `rmdir`). (Phase 2g.1)
 - [x] `read_at_path` / `size_of` (offset-aware random read; works for inline + CTZ). (Phase 2g.3)
 - [x] `truncate_path` (shrink or zero-extend a file via atomic rewrite). (Phase 2g.4)
-- [ ] `rename`: move/rename an entry. (Phase 2g.2)
+- [x] `rename` within the same directory. (`src/fs.rs::rename_in_dir`, Phase 2g.2)
+- [ ] Cross-directory rename (move an entry from one directory to another). Needs Delete-from-source + Create-in-destination with proper splice handling. (Phase 2g.5)
 - [ ] User attribute write.
 - [ ] Atomic move state recovery.
 

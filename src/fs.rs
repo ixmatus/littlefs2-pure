@@ -188,6 +188,10 @@ enum WriteOp<'a> {
     /// Create a new subdirectory entry at `id` with NAME `name` and
     /// `DirStruct` body pointing at `dir_pair`.
     CreateDir { id: u16, name: &'a [u8], dir_pair: BlockPair },
+    /// Update the NAME tag of the entry at `id` to `new_name`. The
+    /// entry's kind (`name_type`) is preserved; the STRUCT tag is
+    /// untouched. Used by [`Fs::rename_in_dir`].
+    RenameInPlace { id: u16, name_type: crate::tag::TagType, new_name: &'a [u8] },
 }
 
 /// Emit the tags for a [`WriteOp`] to an in-progress commit.
@@ -230,6 +234,12 @@ fn emit_op(commit: &mut crate::meta::Commit<'_>, op: &WriteOp<'_>) -> Result<(),
             body[0..4].copy_from_slice(&dir_pair.a.as_u32().to_le_bytes());
             body[4..8].copy_from_slice(&dir_pair.b.as_u32().to_le_bytes());
             commit.tag(Tag::new(true, TagType::DirStruct, id, 8), &body)?;
+        }
+        WriteOp::RenameInPlace { id, name_type, new_name } => {
+            // Append a NAME tag at the existing id with the new
+            // bytes. The reader's lookup picks the latest NAME for a
+            // given id, so the entry surfaces under `new_name`.
+            commit.tag(Tag::new(true, name_type, id, new_name.len() as u16), new_name)?;
         }
     }
     Ok(())
@@ -298,6 +308,21 @@ fn build_compact_commit(
                 )?;
                 emit_id += 1;
                 continue;
+            }
+        }
+        // RenameInPlace overrides the NAME emitted above by emitting a
+        // newer NAME after, but for compact we want to emit just one
+        // NAME. Backtrack: re-emit the slot from scratch using the new
+        // name. We've already emitted Create + NAME(old); emit a
+        // newer NAME(new) which shadows the old at read time. The
+        // STRUCT below follows normally.
+        if let WriteOp::RenameInPlace { id: rename_id, name_type, new_name } = *op {
+            if (i as u16) == rename_id {
+                commit.tag(
+                    crate::tag::Tag::new(true, name_type, emit_id, new_name.len() as u16),
+                    new_name,
+                )?;
+                // Fall through to emit struct body unchanged.
             }
         }
         let struct_body =
@@ -1015,6 +1040,118 @@ impl<S: Storage> Fs<S> {
         self.remove_from_pair(parent, leaf.as_bytes(), buf_a, buf_b)
     }
 
+    /// Rename an entry in place within its current directory.
+    ///
+    /// Both paths must share the same parent directory. Appends a new
+    /// NAME tag at the existing entry's id with `new_name`; the
+    /// reader picks the latest NAME for a given id, so the entry now
+    /// surfaces under the new name.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotFound`] if the source path does not exist.
+    /// - [`Error::InvalidPath`] if the two paths have different
+    ///   parent directories, or if either is the root.
+    /// - [`Error::AlreadyExists`] if `new_name` already exists in the
+    ///   parent and references a different id.
+    pub fn rename_in_dir(
+        &mut self,
+        old_path: crate::path::Path<'_>,
+        new_path: crate::path::Path<'_>,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        let (old_parent, old_leaf) = self.resolve_parent(old_path, buf_a, buf_b)?;
+        let (new_parent, new_leaf) = self.resolve_parent(new_path, buf_a, buf_b)?;
+        if old_parent != new_parent {
+            return Err(Error::InvalidPath);
+        }
+        let parent = old_parent;
+        let new_leaf_bytes = new_leaf.as_bytes();
+        let old_leaf_bytes = old_leaf.as_bytes();
+        if new_leaf_bytes.is_empty() || new_leaf_bytes.len() > 0x3FF {
+            return Err(Error::InvalidPath);
+        }
+        if old_leaf_bytes == new_leaf_bytes {
+            return Ok(()); // no-op
+        }
+
+        // Resolve old entry; reject collision with a different entry.
+        self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let (old_id, kind);
+        {
+            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
+            let old_res = crate::dir::lookup(&p, old_leaf_bytes).ok_or(Error::NotFound)?;
+            old_id = old_res.entry.id;
+            kind = old_res.entry.kind;
+            if let Some(collision) = crate::dir::lookup(&p, new_leaf_bytes) {
+                if collision.entry.id != old_id {
+                    return Err(Error::AlreadyExists);
+                }
+            }
+        }
+
+        // Gather pair state for the append-or-compact dispatch.
+        let active_addr;
+        let alternate_addr;
+        let active_is_a;
+        let committed_end;
+        let next_ptag;
+        let old_revision;
+        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+        let count: usize;
+        {
+            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
+            active_addr = p.active_block;
+            alternate_addr = p.alternate_block;
+            active_is_a = active_addr == parent.a;
+            committed_end = p.reader.committed_end();
+            next_ptag = p.reader.next_ptag();
+            old_revision = p.reader.revision();
+            count = gather_live_slots(&p, active_is_a, buf_a, buf_b, &mut slots)?;
+        }
+
+        let name_type = match kind {
+            crate::dir::EntryKind::RegularFile => crate::tag::TagType::RegularFile,
+            crate::dir::EntryKind::Directory => crate::tag::TagType::Directory,
+        };
+        let op = WriteOp::RenameInPlace { id: old_id, name_type, new_name: new_leaf_bytes };
+        let op_dsize = (4 + new_leaf_bytes.len()) + 8;
+
+        if committed_end + op_dsize <= S::BLOCK_SIZE {
+            let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
+            let new_end = {
+                let mut commit =
+                    crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
+                emit_op(&mut commit, &op)?;
+                commit.finish(0)?;
+                commit.bytes_written()
+            };
+            self.storage
+                .program(
+                    active_addr.as_u32(),
+                    committed_end as u32,
+                    &active_buf[committed_end..new_end],
+                )
+                .map_err(|_| Error::Io)?;
+        } else {
+            let new_revision = old_revision.wrapping_add(1);
+            let new_end = if active_is_a {
+                build_compact_commit(buf_b, buf_a, new_revision, &slots, count, &op)?
+            } else {
+                build_compact_commit(buf_a, buf_b, new_revision, &slots, count, &op)?
+            };
+            self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
+            let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+            self.storage
+                .program(alternate_addr.as_u32(), 0, &alt_buf[..new_end])
+                .map_err(|_| Error::Io)?;
+        }
+        self.storage.sync().map_err(|_| Error::Io)?;
+        Ok(())
+    }
+
     /// Remove an empty directory at `path`.
     ///
     /// Verifies the entry is a Directory and its metadata pair has no
@@ -1390,6 +1527,7 @@ impl<S: Storage> Fs<S> {
                 4 + (4 + name.len()) + (4 + 8) + 8
             }
             WriteOp::Remove { .. } => 4 + 8,
+            WriteOp::RenameInPlace { new_name, .. } => (4 + new_name.len()) + 8,
         };
 
         if committed_end + op_dsize <= S::BLOCK_SIZE {
