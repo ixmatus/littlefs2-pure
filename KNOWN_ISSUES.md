@@ -56,9 +56,10 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 
 - [ ] Power loss safety: a torn write at any page boundary leaves the filesystem mountable as either the pre commit or post commit state.
 - [ ] Wear leveling: `block_cycles` rotation across each metadata pair.
-- [ ] Fuzz harnesses on the parsers and the commit reader.
-- [ ] Kani harness: revision counter comparison totality under wrap.
-- [ ] Kani harness: commit accept or reject dispatch totality.
+- [x] Fuzz harnesses on the parsers and the commit reader. `fuzz/` (libFuzzer, nightly-only, outside the main workspace) covers `MetadataReader::new`, `Tag::from_bits`, `Path::new`, `Superblock::from_bytes`, and `CtzStruct::from_bytes`. Each target asserts totality + post-conditions; runtime is unbounded by design, so they are run ad-hoc rather than in CI. (Phase 3)
+- [x] Kani harness: revision counter comparison totality under wrap. `verify::meta_proofs` proves `rev_scmp` total, reflexive, antisymmetric, and that an increment-by-one is always "newer." (Phase 3)
+- [x] Kani harness: commit accept or reject dispatch totality. `verify::commit_proofs` proves `MetadataReader::new` does not panic on arbitrary inputs, rejects short blocks, and keeps `committed_end <= block.len()`. Bounded at 32-byte blocks; longer adversarial inputs are covered by the fuzz target. (Phase 3)
+- [x] Kani harness: tag dispatch + CRC equivalence. `verify::tag_proofs` and `verify::crc_proofs` discharge the remaining totality / agreement obligations on the bit-level primitives. (Phase 3)
 
 ## Conformance (Phase 3, parallel)
 

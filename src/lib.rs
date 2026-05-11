@@ -51,10 +51,12 @@ pub mod storage;
 pub mod superblock;
 pub mod tag;
 
-// `src/verify/` (Kani harnesses) is added in Phase 3 alongside the commit
-// reader. The `kani` feature exists in Cargo.toml so downstream crates can
-// already depend on the feature flag, but the module body is not yet
-// authored. See `docs/PLAN.md`.
+/// Kani proof harnesses. Compiled and discharged by `cargo kani
+/// --features=kani`; ignored by `cargo build` / `cargo test`. Each
+/// submodule documents what totality property it discharges and
+/// against what specification.
+#[cfg(kani)]
+pub mod verify;
 
 pub use crate::block::{BlockAddress, BlockPair};
 pub use crate::ctz::CtzStruct;
