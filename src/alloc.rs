@@ -271,3 +271,152 @@ pub fn alloc_blocks<S: Storage>(
     }
     Ok(())
 }
+
+/// Walk the filesystem from `root` and mark every reachable block,
+/// using a single block-sized buffer for the scan.
+///
+/// The two-buffer [`scan_used_blocks`] is sharper because
+/// [`MetadataPair::parse`] needs both blocks at once to pick the active
+/// one. The single-buffer variant trades sharpness for the freedom to
+/// run a scan while the second buffer holds something else (notably
+/// the freshly compacted bytes during a wear-levelling relocation):
+/// it reads each block of each pair sequentially, walks whatever
+/// commits parse there, and unions every referenced pair / CTZ chain.
+/// Blocks reachable from EITHER half of a pair are marked, so the
+/// result is a safe over-approximation of "in use".
+pub fn scan_used_with_single_buf<S: Storage>(
+    storage: &mut S,
+    root: BlockPair,
+    used: &mut Bitmap,
+    buf: &mut [u8],
+) -> Result<(), Error> {
+    if buf.len() < S::BLOCK_SIZE {
+        return Err(Error::GeometryMismatch);
+    }
+    let buf = &mut buf[..S::BLOCK_SIZE];
+
+    let mut queue: [BlockPair; MAX_QUEUED_PAIRS] =
+        [BlockPair::new(BlockAddress::NONE, BlockAddress::NONE); MAX_QUEUED_PAIRS];
+    queue[0] = root;
+    let mut tail = 1usize;
+    let mut head = 0usize;
+
+    while head < tail {
+        let pair = queue[head];
+        head += 1;
+
+        used.set(pair.a.as_u32())?;
+        used.set(pair.b.as_u32())?;
+
+        let mut child_pairs: [BlockPair; MAX_QUEUED_PAIRS] =
+            [BlockPair::new(BlockAddress::NONE, BlockAddress::NONE); MAX_QUEUED_PAIRS];
+        let mut child_count = 0usize;
+        let mut ctz_chains: [(u32, u32); MAX_QUEUED_PAIRS] = [(0, 0); MAX_QUEUED_PAIRS];
+        let mut ctz_count = 0usize;
+
+        for &block in &[pair.a.as_u32(), pair.b.as_u32()] {
+            storage.read(block, 0, buf).map_err(|_| Error::Io)?;
+            let Ok(reader) = crate::meta::MetadataReader::new(&*buf) else {
+                continue;
+            };
+            if !reader.has_commits() {
+                continue;
+            }
+            for entry in reader.iter_tags() {
+                match entry.tag.tag_type() {
+                    TagType::DirStruct | TagType::HardTail | TagType::SoftTail
+                        if entry.body.len() == 8 =>
+                    {
+                        let a = u32::from_le_bytes([
+                            entry.body[0],
+                            entry.body[1],
+                            entry.body[2],
+                            entry.body[3],
+                        ]);
+                        let b = u32::from_le_bytes([
+                            entry.body[4],
+                            entry.body[5],
+                            entry.body[6],
+                            entry.body[7],
+                        ]);
+                        if !used.is_set(a) || !used.is_set(b) {
+                            let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
+                            // Dedup against the in-flight enqueue list.
+                            if !child_pairs[..child_count].contains(&child) {
+                                if child_count >= MAX_QUEUED_PAIRS {
+                                    return Err(Error::OutOfRange);
+                                }
+                                child_pairs[child_count] = child;
+                                child_count += 1;
+                            }
+                        }
+                    }
+                    TagType::CtzStruct if entry.body.len() == 8 => {
+                        let head_block = u32::from_le_bytes([
+                            entry.body[0],
+                            entry.body[1],
+                            entry.body[2],
+                            entry.body[3],
+                        ]);
+                        let size = u32::from_le_bytes([
+                            entry.body[4],
+                            entry.body[5],
+                            entry.body[6],
+                            entry.body[7],
+                        ]);
+                        if ctz_count >= MAX_QUEUED_PAIRS {
+                            return Err(Error::OutOfRange);
+                        }
+                        ctz_chains[ctz_count] = (head_block, size);
+                        ctz_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for &(head_block, size) in &ctz_chains[..ctz_count] {
+            walk_ctz_chain(storage, head_block, size, used)?;
+        }
+
+        for child in &child_pairs[..child_count] {
+            if tail >= MAX_QUEUED_PAIRS {
+                return Err(Error::OutOfRange);
+            }
+            queue[tail] = *child;
+            tail += 1;
+        }
+    }
+
+    Ok(())
+}
+
+/// Allocate one unused block using a single-buffer scan.
+///
+/// Companion to [`scan_used_with_single_buf`] for the wear-levelling
+/// relocation path: the compact buffer holding the new commit bytes
+/// must be preserved across the scan, so only the other buffer is
+/// available as scratch.
+///
+/// `excluded` blocks are treated as already-used even if the scan
+/// thinks they are free. The relocation path passes the pair's own
+/// alternate block here so the fresh allocation never collides with
+/// the very block about to be orphaned.
+pub fn alloc_one_block_with_single_buf<S: Storage>(
+    storage: &mut S,
+    root: BlockPair,
+    excluded: &[BlockAddress],
+    buf: &mut [u8],
+) -> Result<BlockAddress, Error> {
+    let mut used = Bitmap::EMPTY;
+    scan_used_with_single_buf(storage, root, &mut used, buf)?;
+    for ex in excluded {
+        used.set(ex.as_u32())?;
+    }
+    for b in 0..S::BLOCK_COUNT {
+        if !used.is_set(b) {
+            return Ok(BlockAddress::new(b));
+        }
+    }
+    Err(Error::OutOfRange)
+}

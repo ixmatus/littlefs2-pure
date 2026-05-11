@@ -1,0 +1,409 @@
+//! Integration tests for the pair-relocation wear-levelling path.
+//!
+//! Wear levelling for the metadata-pair layer redirects compaction
+//! from the in-pair alternate to a freshly allocated block every
+//! `((BLOCK_CYCLES + 1) | 1)` compactions. The new pair address is
+//! propagated to the parent's `DirStruct` reference as part of the
+//! same operation.
+//!
+//! Tests here use a dedicated `Storage` impl with `BLOCK_CYCLES = 1`
+//! (so wear levelling fires at `new_revision % 3 == 0`, i.e. roughly
+//! every third compaction) and `BLOCK_COUNT = 32` so the device has
+//! enough free space to host the freshly allocated blocks across
+//! many cycles.
+
+use littlefs2_pure::block::BlockPair;
+use littlefs2_pure::meta::MetadataPair;
+use littlefs2_pure::storage::Storage;
+use littlefs2_pure::{BlockAddress, Fs, Path, ROOT_BLOCK_PAIR};
+
+extern crate alloc as core_alloc;
+use core_alloc::vec;
+
+/// 32-block test geometry with aggressive wear levelling
+/// (`BLOCK_CYCLES = 1`). The disk is large enough that relocation
+/// always finds a free block.
+#[derive(Debug)]
+struct WearStorage {
+    data: core_alloc::vec::Vec<u8>,
+}
+
+impl WearStorage {
+    const READ_SIZE: usize = 16;
+    const PROG_SIZE: usize = 16;
+    const BLOCK_SIZE: usize = 256;
+    const BLOCK_COUNT: u32 = 32;
+    const CACHE_SIZE: usize = 64;
+    const LOOKAHEAD_SIZE: usize = 8;
+    const BLOCK_CYCLES: i32 = 1;
+
+    fn new() -> Self {
+        Self { data: vec![0xFFu8; Self::BLOCK_SIZE * Self::BLOCK_COUNT as usize] }
+    }
+}
+
+impl Storage for WearStorage {
+    type Error = ();
+    const READ_SIZE: usize = Self::READ_SIZE;
+    const PROG_SIZE: usize = Self::PROG_SIZE;
+    const BLOCK_SIZE: usize = Self::BLOCK_SIZE;
+    const BLOCK_COUNT: u32 = Self::BLOCK_COUNT;
+    const CACHE_SIZE: usize = Self::CACHE_SIZE;
+    const LOOKAHEAD_SIZE: usize = Self::LOOKAHEAD_SIZE;
+    const BLOCK_CYCLES: i32 = Self::BLOCK_CYCLES;
+
+    fn read(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), ()> {
+        let start = (block as usize) * Self::BLOCK_SIZE + (off as usize);
+        if start + buf.len() > self.data.len() {
+            return Err(());
+        }
+        buf.copy_from_slice(&self.data[start..start + buf.len()]);
+        Ok(())
+    }
+
+    fn program(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), ()> {
+        let start = (block as usize) * Self::BLOCK_SIZE + (off as usize);
+        if start + data.len() > self.data.len() {
+            return Err(());
+        }
+        self.data[start..start + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+
+    fn erase(&mut self, block: u32) -> Result<(), ()> {
+        let start = (block as usize) * Self::BLOCK_SIZE;
+        let end = start + Self::BLOCK_SIZE;
+        if end > self.data.len() {
+            return Err(());
+        }
+        for b in &mut self.data[start..end] {
+            *b = 0xFF;
+        }
+        Ok(())
+    }
+}
+
+/// Same geometry, but with wear levelling disabled.
+#[derive(Debug)]
+struct NoWearStorage {
+    data: core_alloc::vec::Vec<u8>,
+}
+
+impl NoWearStorage {
+    const BLOCK_SIZE: usize = 256;
+    const BLOCK_COUNT: u32 = 32;
+
+    fn new() -> Self {
+        Self { data: vec![0xFFu8; Self::BLOCK_SIZE * Self::BLOCK_COUNT as usize] }
+    }
+}
+
+impl Storage for NoWearStorage {
+    type Error = ();
+    const READ_SIZE: usize = 16;
+    const PROG_SIZE: usize = 16;
+    const BLOCK_SIZE: usize = Self::BLOCK_SIZE;
+    const BLOCK_COUNT: u32 = Self::BLOCK_COUNT;
+    const CACHE_SIZE: usize = 64;
+    const LOOKAHEAD_SIZE: usize = 8;
+    const BLOCK_CYCLES: i32 = -1;
+
+    fn read(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), ()> {
+        let start = (block as usize) * Self::BLOCK_SIZE + (off as usize);
+        if start + buf.len() > self.data.len() {
+            return Err(());
+        }
+        buf.copy_from_slice(&self.data[start..start + buf.len()]);
+        Ok(())
+    }
+
+    fn program(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), ()> {
+        let start = (block as usize) * Self::BLOCK_SIZE + (off as usize);
+        if start + data.len() > self.data.len() {
+            return Err(());
+        }
+        self.data[start..start + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+
+    fn erase(&mut self, block: u32) -> Result<(), ()> {
+        let start = (block as usize) * Self::BLOCK_SIZE;
+        let end = start + Self::BLOCK_SIZE;
+        if end > self.data.len() {
+            return Err(());
+        }
+        for b in &mut self.data[start..end] {
+            *b = 0xFF;
+        }
+        Ok(())
+    }
+}
+
+/// Resolve the on-disk `DirStruct` pair address for a subdirectory of
+/// the root by name. Returns the pair address the root's `DirStruct`
+/// entry currently references.
+fn read_subdir_pair_from_root<S: Storage>(fs: &mut Fs<S>, name: &[u8]) -> BlockPair {
+    let mut a = vec![0u8; S::BLOCK_SIZE];
+    let mut b = vec![0u8; S::BLOCK_SIZE];
+    let r = fs
+        .resolve(Path::new(core::str::from_utf8(name).unwrap()).unwrap(), &mut a, &mut b)
+        .expect("subdir resolves");
+    let body = r.struct_body;
+    assert_eq!(body.len(), 8, "DirStruct body is 8 bytes");
+    let pa = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    let pb = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    BlockPair::new(BlockAddress::new(pa), BlockAddress::new(pb))
+}
+
+#[test]
+fn root_never_relocates_under_heavy_compaction() {
+    let mut storage = WearStorage::new();
+    let mut scratch = vec![0u8; WearStorage::BLOCK_SIZE];
+    Fs::format(&mut storage, &mut scratch).unwrap();
+    let mut a = vec![0u8; WearStorage::BLOCK_SIZE];
+    let mut b = vec![0u8; WearStorage::BLOCK_SIZE];
+    let mut fs = Fs::mount(storage, &mut a, &mut b).unwrap();
+    assert_eq!(fs.root(), ROOT_BLOCK_PAIR);
+
+    // Hammer the root pair with rewrites of the same key. Each write
+    // is an append; eventually appends overflow the block and trigger
+    // compactions, which bump the revision counter. With BLOCK_CYCLES
+    // = 1 the predicate `(rev + 1) % 3 == 0` fires every ~3
+    // compactions on a non-root pair, but the root pair must stay at
+    // `(0, 1)` no matter what.
+    for i in 0..200u32 {
+        let val = vec![b'x'; 16 + (i % 16) as usize];
+        fs.write_inline_to_root(b"hot", &val, &mut a, &mut b).unwrap();
+    }
+    assert_eq!(fs.root(), ROOT_BLOCK_PAIR, "root pair never relocates");
+
+    // Read back the final value to confirm correctness through all
+    // those compactions.
+    let mut out = [0u8; 64];
+    let n = fs.read_at_path(Path::new("/hot").unwrap(), 0, &mut out, &mut a, &mut b).unwrap();
+    let expected_len = 16 + (199u32 % 16) as usize;
+    assert_eq!(n, expected_len);
+    assert!(out[..n].iter().all(|&b| b == b'x'));
+}
+
+#[test]
+fn subdir_pair_relocates_to_fresh_blocks() {
+    let mut storage = WearStorage::new();
+    let mut scratch = vec![0u8; WearStorage::BLOCK_SIZE];
+    Fs::format(&mut storage, &mut scratch).unwrap();
+    let mut a = vec![0u8; WearStorage::BLOCK_SIZE];
+    let mut b = vec![0u8; WearStorage::BLOCK_SIZE];
+    let mut fs = Fs::mount(storage, &mut a, &mut b).unwrap();
+
+    fs.mkdir(Path::new("/sub").unwrap(), &mut a, &mut b).unwrap();
+    let initial_pair = read_subdir_pair_from_root(&mut fs, b"/sub");
+
+    // Force compactions in /sub by rewriting a single key with
+    // growing contents until enough revisions accumulate to cross
+    // BLOCK_CYCLES at least once.
+    for i in 0..200u32 {
+        let val = vec![b'y'; 16 + (i % 32) as usize];
+        fs.write_inline_to_pair_for_test_or_path(b"/sub/k", &val, &mut a, &mut b).unwrap();
+    }
+
+    let final_pair = read_subdir_pair_from_root(&mut fs, b"/sub");
+    assert_ne!(
+        initial_pair, final_pair,
+        "subdir pair should have relocated after many compactions"
+    );
+
+    // Each relocation cycle replaces one block of the pair with a
+    // freshly allocated one; after enough cycles every block of the
+    // original pair has been rotated out. The wear distribution
+    // property is that the pair's address SET migrates over time,
+    // which `assert_ne!` above already captures. Verify the new pair
+    // addresses are distinct (a real pair, not a degenerate one).
+    assert_ne!(final_pair.a, final_pair.b);
+
+    // Read back the latest value through the parent's flipped
+    // DirStruct reference; the entry must still be reachable.
+    let mut out = vec![0u8; 64];
+    let n = fs.read_at_path(Path::new("/sub/k").unwrap(), 0, &mut out, &mut a, &mut b).unwrap();
+    let expected_len = 16 + (199u32 % 32) as usize;
+    assert_eq!(n, expected_len);
+    assert!(out[..n].iter().all(|&v| v == b'y'));
+}
+
+#[test]
+fn first_relocation_replaces_exactly_one_block() {
+    // After the first relocation cycle, exactly one block of the
+    // original pair survives (the one that was active when the
+    // relocate fired). Both blocks rotate over subsequent cycles,
+    // but the per-cycle invariant is "one block replaced at a time."
+    let mut storage = WearStorage::new();
+    let mut scratch = vec![0u8; WearStorage::BLOCK_SIZE];
+    Fs::format(&mut storage, &mut scratch).unwrap();
+    let mut a = vec![0u8; WearStorage::BLOCK_SIZE];
+    let mut b = vec![0u8; WearStorage::BLOCK_SIZE];
+    let mut fs = Fs::mount(storage, &mut a, &mut b).unwrap();
+
+    fs.mkdir(Path::new("/sub").unwrap(), &mut a, &mut b).unwrap();
+    let initial_pair = read_subdir_pair_from_root(&mut fs, b"/sub");
+
+    // Drive compactions one at a time, checking after each write
+    // whether the pair changed. Stop at the first relocation event.
+    let mut prev_pair = initial_pair;
+    let mut relocated_after: Option<u32> = None;
+    for i in 0..200u32 {
+        let val = vec![b'r'; 16 + (i % 16) as usize];
+        fs.write_inline_to_pair_for_test_or_path(b"/sub/k", &val, &mut a, &mut b).unwrap();
+        let now = read_subdir_pair_from_root(&mut fs, b"/sub");
+        if now != prev_pair {
+            relocated_after = Some(i);
+            prev_pair = now;
+            break;
+        }
+    }
+    let i = relocated_after.expect("wear levelling fired within 200 writes");
+    assert!(i > 0, "first relocation never on the very first write");
+    // After the first relocation: one block of the original pair is
+    // preserved, the other has been replaced with a freshly allocated
+    // address.
+    let original = [initial_pair.a, initial_pair.b];
+    let now = [prev_pair.a, prev_pair.b];
+    let overlap = original.iter().filter(|x| now.contains(x)).count();
+    assert_eq!(
+        overlap, 1,
+        "first relocation replaces exactly one block (initial={initial_pair:?}, after={prev_pair:?})",
+    );
+}
+
+#[test]
+fn relocated_subdir_data_survives_remount() {
+    let mut storage = WearStorage::new();
+    let mut scratch = vec![0u8; WearStorage::BLOCK_SIZE];
+    Fs::format(&mut storage, &mut scratch).unwrap();
+    let mut a = vec![0u8; WearStorage::BLOCK_SIZE];
+    let mut b = vec![0u8; WearStorage::BLOCK_SIZE];
+    let mut fs = Fs::mount(storage, &mut a, &mut b).unwrap();
+
+    fs.mkdir(Path::new("/sub").unwrap(), &mut a, &mut b).unwrap();
+    let initial_pair = read_subdir_pair_from_root(&mut fs, b"/sub");
+
+    // Drive enough compactions to trigger several relocations.
+    for i in 0..200u32 {
+        let val = vec![b'z'; 16 + (i % 24) as usize];
+        fs.write_inline_to_pair_for_test_or_path(b"/sub/k", &val, &mut a, &mut b).unwrap();
+    }
+    let pair_before_remount = read_subdir_pair_from_root(&mut fs, b"/sub");
+    assert_ne!(initial_pair, pair_before_remount);
+
+    let storage = fs.into_storage();
+    let mut fs = Fs::mount(storage, &mut a, &mut b).unwrap();
+    let pair_after_remount = read_subdir_pair_from_root(&mut fs, b"/sub");
+    assert_eq!(
+        pair_before_remount, pair_after_remount,
+        "DirStruct rewrite is durable across remount"
+    );
+
+    let mut out = vec![0u8; 64];
+    let n = fs.read_at_path(Path::new("/sub/k").unwrap(), 0, &mut out, &mut a, &mut b).unwrap();
+    let expected_len = 16 + (199u32 % 24) as usize;
+    assert_eq!(n, expected_len);
+    assert!(out[..n].iter().all(|&v| v == b'z'));
+}
+
+#[test]
+fn negative_block_cycles_disables_wear_levelling() {
+    let mut storage = NoWearStorage::new();
+    let mut scratch = vec![0u8; NoWearStorage::BLOCK_SIZE];
+    Fs::format(&mut storage, &mut scratch).unwrap();
+    let mut a = vec![0u8; NoWearStorage::BLOCK_SIZE];
+    let mut b = vec![0u8; NoWearStorage::BLOCK_SIZE];
+    let mut fs = Fs::mount(storage, &mut a, &mut b).unwrap();
+
+    fs.mkdir(Path::new("/sub").unwrap(), &mut a, &mut b).unwrap();
+    let initial_pair = read_subdir_pair_from_root(&mut fs, b"/sub");
+
+    for i in 0..200u32 {
+        let val = vec![b'w'; 16 + (i % 16) as usize];
+        fs.write_inline_to_pair_for_test_or_path(b"/sub/k", &val, &mut a, &mut b).unwrap();
+    }
+    let final_pair = read_subdir_pair_from_root(&mut fs, b"/sub");
+    assert_eq!(initial_pair, final_pair, "with BLOCK_CYCLES <= 0 the subdir pair never relocates");
+}
+
+#[test]
+fn nested_subdir_relocations_propagate_through_grandparent() {
+    let mut storage = WearStorage::new();
+    let mut scratch = vec![0u8; WearStorage::BLOCK_SIZE];
+    Fs::format(&mut storage, &mut scratch).unwrap();
+    let mut a = vec![0u8; WearStorage::BLOCK_SIZE];
+    let mut b = vec![0u8; WearStorage::BLOCK_SIZE];
+    let mut fs = Fs::mount(storage, &mut a, &mut b).unwrap();
+
+    fs.mkdir(Path::new("/g").unwrap(), &mut a, &mut b).unwrap();
+    fs.mkdir(Path::new("/g/p").unwrap(), &mut a, &mut b).unwrap();
+    let initial_p = read_subdir_pair_from_root_path(&mut fs, "/g/p");
+
+    for i in 0..200u32 {
+        let val = vec![b'q'; 16 + (i % 24) as usize];
+        fs.write_inline_to_pair_for_test_or_path(b"/g/p/k", &val, &mut a, &mut b).unwrap();
+    }
+    let final_p = read_subdir_pair_from_root_path(&mut fs, "/g/p");
+    assert_ne!(initial_p, final_p, "grand-child pair should have relocated");
+
+    // The grandparent's reference to /g must still resolve, and /g's
+    // reference to /g/p must equal the new pair.
+    let mut out = vec![0u8; 64];
+    let n = fs.read_at_path(Path::new("/g/p/k").unwrap(), 0, &mut out, &mut a, &mut b).unwrap();
+    let expected_len = 16 + (199u32 % 24) as usize;
+    assert_eq!(n, expected_len);
+    assert!(out[..n].iter().all(|&v| v == b'q'));
+}
+
+/// Read the on-disk `DirStruct` pair for an arbitrary path.
+fn read_subdir_pair_from_root_path<S: Storage>(fs: &mut Fs<S>, path: &str) -> BlockPair {
+    let mut a = vec![0u8; S::BLOCK_SIZE];
+    let mut b = vec![0u8; S::BLOCK_SIZE];
+    let r = fs.resolve(Path::new(path).unwrap(), &mut a, &mut b).expect("path resolves");
+    let body = r.struct_body;
+    assert_eq!(body.len(), 8);
+    let pa = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    let pb = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    BlockPair::new(BlockAddress::new(pa), BlockAddress::new(pb))
+}
+
+/// Convenience: write to a path. Wraps `write_to_path` so the call
+/// sites in this file read cleanly regardless of which inline /
+/// CTZ path the kernel chooses. The body sizes stay below the
+/// inline / CTZ threshold (`Fs::INLINE_MAX = 128`).
+trait WritePathExt<S: Storage> {
+    fn write_inline_to_pair_for_test_or_path(
+        &mut self,
+        path: &[u8],
+        content: &[u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), littlefs2_pure::Error>;
+}
+
+impl<S: Storage> WritePathExt<S> for Fs<S> {
+    fn write_inline_to_pair_for_test_or_path(
+        &mut self,
+        path: &[u8],
+        content: &[u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), littlefs2_pure::Error> {
+        let s = core::str::from_utf8(path).unwrap();
+        self.write_to_path(Path::new(s).unwrap(), content, buf_a, buf_b)
+    }
+}
+
+/// Read-side cross-check: the pair the root's `DirStruct` points at
+/// must actually parse as a valid metadata pair. Useful in tests as
+/// a "the address is real" assertion.
+#[allow(dead_code)]
+fn assert_pair_parses<S: Storage>(fs: &mut Fs<S>, pair: BlockPair) {
+    let mut a = vec![0u8; S::BLOCK_SIZE];
+    let mut b = vec![0u8; S::BLOCK_SIZE];
+    fs.storage_mut().read(pair.a.as_u32(), 0, &mut a).expect("read a");
+    fs.storage_mut().read(pair.b.as_u32(), 0, &mut b).expect("read b");
+    MetadataPair::parse(pair.a, &a, pair.b, &b).expect("pair parses");
+}
