@@ -310,6 +310,20 @@ fn build_compact_commit(
                 continue;
             }
         }
+        // UpdateCtz overrides the entry's struct body with the new
+        // (head_block, total_size). Without this case, an UpdateCtz
+        // that triggers compaction copies the prior struct body and
+        // silently drops the update.
+        if let WriteOp::UpdateCtz { id: update_id, head_block, total_size } = *op {
+            if (i as u16) == update_id {
+                let mut body = [0u8; 8];
+                body[0..4].copy_from_slice(&head_block.to_le_bytes());
+                body[4..8].copy_from_slice(&total_size.to_le_bytes());
+                commit.tag(crate::tag::Tag::new(true, TagType::CtzStruct, emit_id, 8), &body)?;
+                emit_id += 1;
+                continue;
+            }
+        }
         // RenameInPlace overrides the NAME emitted above by emitting a
         // newer NAME after, but for compact we want to emit just one
         // NAME. Backtrack: re-emit the slot from scratch using the new
