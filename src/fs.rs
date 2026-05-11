@@ -199,6 +199,13 @@ enum WriteOp<'a> {
     /// entry's kind (`name_type`) is preserved; the STRUCT tag is
     /// untouched. Used by [`Fs::rename_in_dir`].
     RenameInPlace { id: u16, name_type: crate::tag::TagType, new_name: &'a [u8] },
+    /// Set / replace a user attribute on the entry at `id`. Latest
+    /// `UserAttr(attr_id)` tag wins at read time.
+    SetAttr { id: u16, attr_id: u8, value: &'a [u8] },
+    /// Remove a user attribute from the entry at `id` by emitting a
+    /// `UserAttr(attr_id)` tag with the delete-marker length sentinel
+    /// (`0x3FF`).
+    RemoveAttr { id: u16, attr_id: u8 },
 }
 
 /// Emit the tags for a [`WriteOp`] to an in-progress commit.
@@ -247,6 +254,15 @@ fn emit_op(commit: &mut crate::meta::Commit<'_>, op: &WriteOp<'_>) -> Result<(),
             // bytes. The reader's lookup picks the latest NAME for a
             // given id, so the entry surfaces under `new_name`.
             commit.tag(Tag::new(true, name_type, id, new_name.len() as u16), new_name)?;
+        }
+        WriteOp::SetAttr { id, attr_id, value } => {
+            commit
+                .tag(Tag::new(true, TagType::UserAttr(attr_id), id, value.len() as u16), value)?;
+        }
+        WriteOp::RemoveAttr { id, attr_id } => {
+            // Length-sentinel 0x3FF = no body, delete marker. The
+            // reader sees this and treats the attribute as removed.
+            commit.tag(Tag::new(true, TagType::UserAttr(attr_id), id, 0x3FF), &[])?;
         }
     }
     Ok(())
@@ -408,8 +424,9 @@ fn op_dsize_of(op: &WriteOp<'_>) -> usize {
         WriteOp::CreateCtz { name, .. } | WriteOp::CreateDir { name, .. } => {
             4 + (4 + name.len()) + (4 + 8) + 8
         }
-        WriteOp::Remove { .. } => 4 + 8,
+        WriteOp::Remove { .. } | WriteOp::RemoveAttr { .. } => 4 + 8,
         WriteOp::RenameInPlace { new_name, .. } => (4 + new_name.len()) + 8,
+        WriteOp::SetAttr { value, .. } => (4 + value.len()) + 8,
     }
 }
 
@@ -1430,6 +1447,121 @@ impl<S: Storage> Fs<S> {
         self.remove_from_pair(parent, leaf.as_bytes(), buf_a, buf_b)
     }
 
+    /// Set (or replace) a user attribute on the entry at `path`.
+    ///
+    /// LittleFS lets each entry carry a small set of arbitrary
+    /// key-value pairs (the keys are byte ids in `0..=255`, the
+    /// values are byte slices up to `0x3FE` bytes). Attributes are
+    /// stored as `UserAttr(attr_id)` tags at the entry's id inside
+    /// its directory pair; later tags supersede earlier ones, so a
+    /// repeated `set_attr` simply appends a new tag and the reader
+    /// returns the most recent value.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotFound`] if `path` does not exist.
+    /// - [`Error::InvalidPath`] for the root path (root has no
+    ///   directory entry to attach attributes to).
+    /// - [`Error::OutOfRange`] if `value.len() >= 0x3FF` (the length
+    ///   sentinel is reserved for the delete marker).
+    pub fn set_attr(
+        &mut self,
+        path: crate::path::Path<'_>,
+        attr_id: u8,
+        value: &[u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        if value.len() >= 0x3FF {
+            return Err(Error::OutOfRange);
+        }
+        let (parent, leaf) = self.resolve_parent(path, buf_a, buf_b)?;
+        self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let id = {
+            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
+            crate::dir::lookup(&p, leaf.as_bytes()).ok_or(Error::NotFound)?.entry.id
+        };
+        let op = WriteOp::SetAttr { id, attr_id, value };
+        self.apply_op_to_pair(parent, &op, buf_a, buf_b)
+    }
+
+    /// Remove a user attribute from the entry at `path`. Idempotent:
+    /// removing a non-existent attribute is not an error; the
+    /// delete-marker tag lands all the same and the reader treats the
+    /// attribute as absent.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotFound`] if `path` does not exist.
+    pub fn remove_attr(
+        &mut self,
+        path: crate::path::Path<'_>,
+        attr_id: u8,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        let (parent, leaf) = self.resolve_parent(path, buf_a, buf_b)?;
+        self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let id = {
+            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
+            crate::dir::lookup(&p, leaf.as_bytes()).ok_or(Error::NotFound)?.entry.id
+        };
+        let op = WriteOp::RemoveAttr { id, attr_id };
+        self.apply_op_to_pair(parent, &op, buf_a, buf_b)
+    }
+
+    /// Read the most recently committed value of user attribute
+    /// `attr_id` on the entry at `path` into `out`. Returns the
+    /// number of bytes copied (clamped at `out.len()`).
+    ///
+    /// Returns `Ok(0)` if the entry has no `UserAttr(attr_id)` tag,
+    /// or if the latest such tag is a delete marker.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotFound`] if `path` does not exist.
+    pub fn get_attr(
+        &mut self,
+        path: crate::path::Path<'_>,
+        attr_id: u8,
+        out: &mut [u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<usize, Error> {
+        let (parent, leaf) = self.resolve_parent(path, buf_a, buf_b)?;
+        self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let pair = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
+        let id = crate::dir::lookup(&pair, leaf.as_bytes()).ok_or(Error::NotFound)?.entry.id;
+        // Walk the committed tag stream; latest UserAttr(attr_id) at
+        // `id` wins. Delete-marker length means "removed."
+        let mut latest: Option<&[u8]> = None;
+        let mut removed = false;
+        for entry in pair.reader.iter_tags() {
+            if entry.tag.id() != id {
+                continue;
+            }
+            if entry.tag.tag_type() == crate::tag::TagType::UserAttr(attr_id) {
+                if entry.tag.is_special_length() {
+                    removed = true;
+                    latest = None;
+                } else {
+                    latest = Some(entry.body);
+                    removed = false;
+                }
+            }
+        }
+        if removed || latest.is_none() {
+            return Ok(0);
+        }
+        let body = latest.unwrap();
+        let n = body.len().min(out.len());
+        out[..n].copy_from_slice(&body[..n]);
+        Ok(n)
+    }
+
     /// Rename an entry in place within its current directory.
     ///
     /// Both paths must share the same parent directory. Appends a new
@@ -2179,19 +2311,7 @@ impl<S: Storage> Fs<S> {
             WriteOp::Create { id: new_id, name, content }
         };
 
-        // Commit size for each WriteOp shape, plus the trailing CCRC (8).
-        let op_dsize = match op {
-            WriteOp::Update { content, .. } => (4 + content.len()) + 8,
-            WriteOp::UpdateCtz { .. } => (4 + 8) + 8,
-            WriteOp::Create { name, content, .. } => 4 + (4 + name.len()) + (4 + content.len()) + 8,
-            // CreateCtz and CreateDir both have an 8-byte struct body
-            // (head_block + size for CTZ; pair_a + pair_b for Dir).
-            WriteOp::CreateCtz { name, .. } | WriteOp::CreateDir { name, .. } => {
-                4 + (4 + name.len()) + (4 + 8) + 8
-            }
-            WriteOp::Remove { .. } => 4 + 8,
-            WriteOp::RenameInPlace { new_name, .. } => (4 + new_name.len()) + 8,
-        };
+        let op_dsize = op_dsize_of(&op);
 
         if committed_end + op_dsize <= S::BLOCK_SIZE {
             // ---- APPEND PATH ----
@@ -2416,13 +2536,38 @@ impl<S: Storage> Fs<S> {
     }
 
     /// Consume the `Fs` and return the underlying storage device.
+    ///
+    /// Pending bytes in any wrapping cache (notably
+    /// [`crate::NorAlignedStorage`]'s program-window cache) are NOT
+    /// flushed here; every public mutation on `Fs` already calls
+    /// [`Storage::sync`] before returning, so callers who only mutate
+    /// through `Fs` have a durable image at every API boundary.
+    /// Callers that bypass `Fs` and program the underlying device
+    /// directly are responsible for their own sync sequencing.
     #[inline]
     #[must_use]
     pub fn into_storage(self) -> S {
         self.storage
     }
 
-    /// Read a CTZ backed file's content via [`ctz::read_ctz`].
+    /// Flush any pending bytes in the storage layer's caches to the
+    /// device. Equivalent to `self.storage_mut().sync()` but exposed
+    /// on `Fs` so callers do not have to reach through the storage
+    /// accessor for a routine durability gate.
+    ///
+    /// Every public mutation on `Fs` already syncs as its final step,
+    /// so explicit `sync()` calls are only needed when the caller
+    /// mixed direct storage programs with `Fs` calls, or when the
+    /// caller wants a fresh durability point between mutations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the underlying device's `sync` fails.
+    pub fn sync(&mut self) -> Result<(), Error> {
+        self.storage.sync().map_err(|_| Error::Io)
+    }
+
+    /// Read a CTZ backed file's content via [`crate::ctz::read_ctz`].
     ///
     /// Convenience wrapper that forwards the storage handle.
     pub fn read_ctz(

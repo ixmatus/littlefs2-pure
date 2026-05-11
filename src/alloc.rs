@@ -1,8 +1,8 @@
 //! Block allocator.
 //!
 //! Identifies in-use blocks by walking the filesystem from the root
-//! pair, then surfaces unused blocks to callers. Used by [`Fs`] for
-//! CTZ file writes and (Phase 2e) `mkdir`.
+//! pair, then surfaces unused blocks to callers. Used by [`crate::Fs`]
+//! for CTZ file writes and `mkdir`.
 //!
 //! # Algorithm
 //!
@@ -84,7 +84,7 @@ impl Bitmap {
 /// `used`. Visits each metadata pair once; follows DirStruct and Tail
 /// references into other pairs; walks each CTZ chain.
 ///
-/// `buf_a` and `buf_b` are scratch buffers of [`S::BLOCK_SIZE`] each;
+/// `buf_a` and `buf_b` are scratch buffers of `S::BLOCK_SIZE` each;
 /// they are reused for every pair read.
 pub fn scan_used_blocks<S: Storage>(
     storage: &mut S,

@@ -291,6 +291,71 @@ impl Storage for MemStorage {
     }
 }
 
+/// Storage adapter that simulates a power loss at a configurable
+/// program-call boundary. After the `trigger_at`-th `program` call,
+/// the device is "powered off": all subsequent `program` calls and
+/// `erase` calls are no-ops (the bytes already on disk are
+/// preserved). Reads pass through unchanged. Use
+/// [`TornWriteStorage::new`] to construct.
+///
+/// Construction note: the underlying NOR semantics are still
+/// enforced by the inner storage (typically [`MemStorage`] for
+/// these tests). The torn adapter sits OUTSIDE the NOR-aligned
+/// wrapper so the power loss can land mid-PROG_SIZE-window if the
+/// wrapper flushes; in practice the existing kernel does whole-
+/// `program_size` flushes, so the test mostly exercises program-
+/// call-boundary torns.
+pub struct TornWriteStorage {
+    pub inner: MemStorage,
+    /// Tripping point: after this many `program` calls, power is
+    /// lost. The first call is `1`. Set to `usize::MAX` to disable.
+    pub trigger_at: usize,
+    pub program_count: usize,
+}
+
+impl TornWriteStorage {
+    pub fn new(inner: MemStorage, trigger_at: usize) -> Self {
+        Self { inner, trigger_at, program_count: 0 }
+    }
+
+    pub fn powered(&self) -> bool {
+        self.program_count < self.trigger_at
+    }
+
+    pub fn into_inner(self) -> MemStorage {
+        self.inner
+    }
+}
+
+impl Storage for TornWriteStorage {
+    type Error = ();
+    const READ_SIZE: usize = MemStorage::READ_SIZE;
+    const PROG_SIZE: usize = MemStorage::PROG_SIZE;
+    const BLOCK_SIZE: usize = MemStorage::BLOCK_SIZE;
+    const BLOCK_COUNT: u32 = MemStorage::BLOCK_COUNT;
+    const CACHE_SIZE: usize = MemStorage::CACHE_SIZE;
+    const LOOKAHEAD_SIZE: usize = MemStorage::LOOKAHEAD_SIZE;
+
+    fn read(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), ()> {
+        self.inner.read(block, off, buf)
+    }
+
+    fn program(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), ()> {
+        self.program_count += 1;
+        if !self.powered() {
+            return Err(());
+        }
+        self.inner.program(block, off, data)
+    }
+
+    fn erase(&mut self, block: u32) -> Result<(), ()> {
+        if !self.powered() {
+            return Err(());
+        }
+        self.inner.erase(block)
+    }
+}
+
 /// One entry passed to [`build_directory_block`].
 pub struct DirEntrySpec<'a> {
     pub id: u16,

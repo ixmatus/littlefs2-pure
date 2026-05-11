@@ -283,8 +283,8 @@ fn scan_for_tail(block: &[u8], committed_end: usize) -> (Option<BlockPair>, bool
 /// Takes a caller-supplied byte slice of at least the block size, writes
 /// the revision header at offset 0, then appends tags via [`Commit::tag`].
 /// Each call to [`Commit::finish`] emits a CCRC and resets the running
-/// CRC; further [`Commit::tag`] calls start a new commit. [`Commit::done`]
-/// returns the number of bytes written.
+/// CRC; further [`Commit::tag`] calls start a new commit.
+/// [`Commit::bytes_written`] returns the number of bytes written.
 ///
 /// The builder does **not** touch the storage device. It produces the
 /// on-disk byte layout in the caller's buffer; the caller is responsible
