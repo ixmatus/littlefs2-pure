@@ -4,6 +4,34 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-05-11
+
+**API frozen.** Every public item ships with the v1.x semver contract. Future additive changes ship as 1.x minor releases; removing or renaming any public item requires a 2.0.
+
+### Added
+
+- `#[non_exhaustive]` on [`AbstractType`] and [`EntryKind`] (matching the existing annotation on [`Error`] and [`TagType`]) so a future LittleFS spec revision or fork can introduce a new variant in a 1.x minor release without forcing a major bump on every downstream pattern match.
+- Crate-level [`Status`](crate#status) section in `src/lib.rs` documenting the freeze and the `#[non_exhaustive]` posture.
+
+### Removed
+
+- Dead `storage::ReadOnlyStorage` trait. Defined but never used anywhere in the crate or tests; pruned before v1.0 lockdown so the public surface only commits to items with proven utility.
+
+### Documentation
+
+- [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md): the "outstanding before v1.0" section is now the v1.0 freeze record, archived inline. The preamble points new bug reports at the GitHub issue tracker rather than the file.
+- [`README.md`](README.md): status block rewritten to commit to v1.x. The dependency snippet upgraded from `"0.3"` to `"1"`.
+- [`src/error.rs`](src/error.rs): module preamble corrected (was contradicting the `#[non_exhaustive]` annotation by claiming variants stay exhaustive).
+
+### Breaking
+
+This is the first non-0.x release; nothing in this changelog entry breaks a 1.x consumer (there is no 1.x consumer yet). The single 0.x→1.0 break is the removal of `storage::ReadOnlyStorage`, which had zero in-tree or known external users.
+
+[`AbstractType`]: crate::AbstractType
+[`EntryKind`]: crate::EntryKind
+[`Error`]: crate::Error
+[`TagType`]: crate::TagType
+
 ## [0.3.1] - 2026-05-11
 
 ### Security
@@ -789,6 +817,8 @@ All entries below shipped in this initial release; future releases will appear a
 - Kani harnesses (the `kani` feature compiles but contains no harnesses yet).
 - Fuzz harnesses.
 
-## Notes on 0.x
+## Notes on versioning
 
-Every 0.x release is permitted to break the public API. Pin to an exact version (`= "0.1.0"`) if API stability matters during the read and write kernel implementation; switch to caret ranges (`"^1"`) once 1.0 ships.
+`littlefs2-pure` follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html) starting at v1.0.0. Caret ranges (`"^1"`) are safe: any 1.x release will read images written by any earlier 1.x release and accept any code that compiled against any earlier 1.x.
+
+Historical 0.x releases (0.1, 0.2, 0.3) were each permitted to break the public API; the 1.0 release froze the surface after the API-freeze audit recorded in [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).

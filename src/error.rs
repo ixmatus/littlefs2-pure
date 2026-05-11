@@ -1,8 +1,10 @@
 //! Error type for the crate.
 //!
-//! The variants stay flat and exhaustive on purpose: a caller pattern matching
-//! on `Error` should never need a wildcard for "future variants". When a new
-//! failure mode appears, add a variant and bump the minor version.
+//! [`Error`] is `#[non_exhaustive]` so a future minor release can add a new
+//! failure mode without breaking callers. Pattern matches must include a
+//! wildcard arm; in practice every consumer either bubbles the error up via
+//! `?` or maps a specific recoverable variant (e.g., [`Error::Unformatted`])
+//! and otherwise pages the on-call.
 
 use core::fmt;
 

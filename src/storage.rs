@@ -95,22 +95,3 @@ pub trait Storage {
         Ok(())
     }
 }
-
-/// A trait for storage that supports only reads. Useful for inspecting a
-/// committed image without the lifetime cost of `&mut self`.
-///
-/// All `Storage` impls implicitly satisfy the read surface; this trait exists
-/// for read only consumers that should not require a mutable reference.
-pub trait ReadOnlyStorage {
-    /// The error type for the underlying device.
-    type Error: Debug;
-
-    /// Block size in bytes (same semantics as [`Storage::BLOCK_SIZE`]).
-    const BLOCK_SIZE: usize;
-
-    /// Total number of blocks (same semantics as [`Storage::BLOCK_COUNT`]).
-    const BLOCK_COUNT: u32;
-
-    /// Read `buf.len()` bytes starting at `(block, off)` into `buf`.
-    fn read(&self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), Self::Error>;
-}

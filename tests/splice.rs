@@ -15,6 +15,7 @@ fn name_tag(builder: &mut BlockBuilder, id: u16, kind: EntryKind, name: &[u8]) {
     let ty = match kind {
         EntryKind::RegularFile => TagType::RegularFile,
         EntryKind::Directory => TagType::Directory,
+        _ => unreachable!("EntryKind has only two variants in v2"),
     };
     builder.tag(Tag::new(true, ty, id, name.len() as u16), name).unwrap();
 }

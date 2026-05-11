@@ -51,9 +51,13 @@ pub struct Tag(u32);
 ///
 /// Each variant subdivides further into a concrete [`TagType`] via the
 /// 8 bit chunk field. The values match the C reference's `LFS2_TYPE_*`
-/// macros at the abstract layer.
+/// macros at the abstract layer. The 3-bit field is fully populated
+/// today (every value in `0..8` maps to a variant); `#[non_exhaustive]`
+/// guards against a future spec revision adding semantics to a
+/// currently-unused encoding.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum AbstractType {
     /// Name records: superblock, regular file, directory.
     Name = 0x0,

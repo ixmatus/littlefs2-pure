@@ -41,8 +41,14 @@ pub struct DirEntry<'a> {
     pub kind: EntryKind,
 }
 
-/// The two kinds of entries a directory can hold.
+/// The kinds of entries a directory can hold.
+///
+/// The LittleFS v2 on-disk format defines two kinds today (regular file,
+/// directory); the enum is `#[non_exhaustive]` so a future spec revision
+/// or fork extension can grow this without a major version bump. Callers
+/// pattern matching on [`EntryKind`] must include a wildcard arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EntryKind {
     /// A regular file. Its content layout (inline or CTZ skip list) is
     /// described by a [`TagType::InlineStruct`] or

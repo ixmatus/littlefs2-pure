@@ -4,7 +4,7 @@ A pure Rust, `no_std`, no-allocator implementation of the [LittleFS v2 on-disk f
 
 ```toml
 [dependencies]
-littlefs2-pure = "0.3"
+littlefs2-pure = "1"
 ```
 
 License: MIT OR Apache-2.0. MSRV: Rust 1.84.
@@ -44,7 +44,7 @@ governing use.
 
 ## Status
 
-The kernel implements the complete v2 spec surface. The v1.0 / v1.1 / v1.2 / `File` / Kani-in-CI punch list is closed; every item in [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)'s "outstanding before v1.0" section is shipped. v1.0 is on deck pending an API-freeze pass and a soak interval. The Kani sweep landing in v0.3.1 caught a real panic-on-adversarial-input bug in `MetadataReader::new`; details in [`CHANGELOG.md`](CHANGELOG.md).
+**v1.0 — API frozen.** The kernel implements the complete LittleFS v2 surface and the public API is covered by the semver contract. `#[non_exhaustive]` is applied to every spec-tracking enum (`Error`, `EntryKind`, `AbstractType`, `TagType`) so future variants ship in 1.x minor releases without a major bump. The 0.x dead `ReadOnlyStorage` trait was pruned in the freeze pass; everything else in the public surface is committed. See [`CHANGELOG.md`](CHANGELOG.md) for the per-release record and [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for what stays out of scope by design.
 
 Verification posture (see [ADR-0003](docs/decisions/0003-verification-stacks.md)):
 

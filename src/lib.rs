@@ -8,14 +8,22 @@
 //!
 //! # Status
 //!
-//! The kernel implements the complete v2 surface: mount, format, full path
-//! resolution with HardTail chasing, inline and CTZ file read and write,
-//! streaming append, directory create / remove / rename, user attributes,
-//! atomic cross-directory rename with mount-time gstate recovery, and
-//! compact-time inter-pair wear levelling. Bit accuracy against the C
-//! reference is verified in both directions (Rust reads images written by
-//! C, C reads images written by Rust). Track `KNOWN_ISSUES.md` for the
-//! short list of items still pending v1.0.
+//! **v1.0 — API frozen.** The kernel implements the complete v2 surface:
+//! mount, format, full path resolution with HardTail chasing, inline and
+//! CTZ file read and write, streaming append via the stateful [`File`]
+//! handle, directory create / remove / rename, user attributes, atomic
+//! cross-directory rename with mount-time gstate recovery, and
+//! compact-time inter-pair wear levelling with mount-time orphan
+//! recovery. Bit accuracy against the C reference is verified in both
+//! directions (Rust reads images written by C, C reads images written
+//! by Rust); the round-trip and conformance harnesses gate every CI
+//! run.
+//!
+//! Every public item is covered by the semver contract starting at
+//! v1.0; future additive changes ship as 1.x minor releases, and
+//! `#[non_exhaustive]` is applied to [`Error`], [`EntryKind`],
+//! [`AbstractType`], and [`TagType`] so a new spec-driven variant
+//! does not require a major version bump.
 //!
 //! # Entry points
 //!
