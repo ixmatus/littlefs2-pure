@@ -107,6 +107,159 @@ fn rename_cross_parent_returns_invalid_path() {
 }
 
 #[test]
+fn cross_dir_rename_moves_file() {
+    let mut fs = make_fs();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    fs.mkdir(Path::new("/dst").unwrap(), &mut a, &mut b).unwrap();
+    fs.write_to_path(Path::new("/file").unwrap(), b"contents", &mut a, &mut b).unwrap();
+
+    fs.rename(Path::new("/file").unwrap(), Path::new("/dst/file").unwrap(), &mut a, &mut b)
+        .unwrap();
+
+    assert!(!fs.exists(Path::new("/file").unwrap(), &mut a, &mut b).unwrap());
+    assert!(fs.exists(Path::new("/dst/file").unwrap(), &mut a, &mut b).unwrap());
+
+    // Content travels with the entry.
+    let mut buf = [0u8; 32];
+    let n = fs.read_at_path(Path::new("/dst/file").unwrap(), 0, &mut buf, &mut a, &mut b).unwrap();
+    assert_eq!(&buf[..n], b"contents");
+}
+
+#[test]
+fn cross_dir_rename_with_new_name() {
+    let mut fs = make_fs();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    fs.mkdir(Path::new("/dst").unwrap(), &mut a, &mut b).unwrap();
+    fs.write_to_path(Path::new("/old").unwrap(), b"AAA", &mut a, &mut b).unwrap();
+
+    fs.rename(Path::new("/old").unwrap(), Path::new("/dst/new").unwrap(), &mut a, &mut b).unwrap();
+
+    assert!(!fs.exists(Path::new("/old").unwrap(), &mut a, &mut b).unwrap());
+    assert!(fs.exists(Path::new("/dst/new").unwrap(), &mut a, &mut b).unwrap());
+}
+
+#[test]
+fn cross_dir_rename_preserves_ctz_chain_in_place() {
+    // The CTZ chain blocks are shared; only the directory entry moves.
+    let mut fs = make_fs();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    fs.mkdir(Path::new("/archive").unwrap(), &mut a, &mut b).unwrap();
+    let payload: Vec<u8> = (0..300).map(|i| (i & 0xff) as u8).collect();
+    fs.write_to_path(Path::new("/log").unwrap(), &payload, &mut a, &mut b).unwrap();
+
+    fs.rename(Path::new("/log").unwrap(), Path::new("/archive/log").unwrap(), &mut a, &mut b)
+        .unwrap();
+
+    // Read full content back through the new path.
+    let mut out = vec![0u8; payload.len()];
+    let n =
+        fs.read_at_path(Path::new("/archive/log").unwrap(), 0, &mut out, &mut a, &mut b).unwrap();
+    assert_eq!(n, payload.len());
+    assert_eq!(out, payload);
+}
+
+#[test]
+fn cross_dir_rename_moves_directory() {
+    let mut fs = make_fs();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    fs.mkdir(Path::new("/src").unwrap(), &mut a, &mut b).unwrap();
+    fs.mkdir(Path::new("/src/inner").unwrap(), &mut a, &mut b).unwrap();
+    fs.write_to_path(Path::new("/src/inner/x").unwrap(), b"x", &mut a, &mut b).unwrap();
+    fs.mkdir(Path::new("/dst").unwrap(), &mut a, &mut b).unwrap();
+
+    fs.rename(Path::new("/src/inner").unwrap(), Path::new("/dst/inner").unwrap(), &mut a, &mut b)
+        .unwrap();
+
+    assert!(!fs.exists(Path::new("/src/inner").unwrap(), &mut a, &mut b).unwrap());
+    assert!(fs.exists(Path::new("/dst/inner").unwrap(), &mut a, &mut b).unwrap());
+    // Contents survive the move.
+    assert!(fs.exists(Path::new("/dst/inner/x").unwrap(), &mut a, &mut b).unwrap());
+}
+
+#[test]
+fn cross_dir_rename_rejects_existing_destination() {
+    let mut fs = make_fs();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    fs.mkdir(Path::new("/dst").unwrap(), &mut a, &mut b).unwrap();
+    fs.write_to_path(Path::new("/file").unwrap(), b"A", &mut a, &mut b).unwrap();
+    fs.write_to_path(Path::new("/dst/file").unwrap(), b"B", &mut a, &mut b).unwrap();
+
+    let err = fs
+        .rename(Path::new("/file").unwrap(), Path::new("/dst/file").unwrap(), &mut a, &mut b)
+        .unwrap_err();
+    assert_eq!(err, Error::AlreadyExists);
+
+    // Both entries remain intact.
+    let mut buf = [0u8; 4];
+    let n = fs.read_at_path(Path::new("/file").unwrap(), 0, &mut buf, &mut a, &mut b).unwrap();
+    assert_eq!(&buf[..n], b"A");
+    let n = fs.read_at_path(Path::new("/dst/file").unwrap(), 0, &mut buf, &mut a, &mut b).unwrap();
+    assert_eq!(&buf[..n], b"B");
+}
+
+#[test]
+fn cross_dir_rename_rejects_ancestor_cycle() {
+    let mut fs = make_fs();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    fs.mkdir(Path::new("/d").unwrap(), &mut a, &mut b).unwrap();
+
+    let err = fs
+        .rename(Path::new("/d").unwrap(), Path::new("/d/inside").unwrap(), &mut a, &mut b)
+        .unwrap_err();
+    assert_eq!(err, Error::InvalidPath);
+}
+
+#[test]
+fn cross_dir_rename_survives_remount() {
+    let mut storage = MemStorage::new();
+    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    Fs::format(&mut storage, &mut scratch).unwrap();
+    {
+        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+        let mut a = [0u8; MemStorage::BLOCK_SIZE];
+        let mut b = [0u8; MemStorage::BLOCK_SIZE];
+        fs.mkdir(Path::new("/archive").unwrap(), &mut a, &mut b).unwrap();
+        fs.write_to_path(Path::new("/log").unwrap(), b"persistent", &mut a, &mut b).unwrap();
+        fs.rename(Path::new("/log").unwrap(), Path::new("/archive/log").unwrap(), &mut a, &mut b)
+            .unwrap();
+        storage = fs.into_storage();
+    }
+    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    assert!(!fs.exists(Path::new("/log").unwrap(), &mut a, &mut b).unwrap());
+    assert!(fs.exists(Path::new("/archive/log").unwrap(), &mut a, &mut b).unwrap());
+    let mut buf = [0u8; 32];
+    let n =
+        fs.read_at_path(Path::new("/archive/log").unwrap(), 0, &mut buf, &mut a, &mut b).unwrap();
+    assert_eq!(&buf[..n], b"persistent");
+}
+
+#[test]
+fn rename_dispatches_to_in_dir_for_same_parent() {
+    // The dispatcher must hand same-parent renames to rename_in_dir;
+    // the cross-dir path's Create-then-Delete would change the entry's
+    // id within the same pair, which is observable.
+    let mut fs = make_fs();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    fs.write_to_path(Path::new("/a").unwrap(), b"AAA", &mut a, &mut b).unwrap();
+    fs.rename(Path::new("/a").unwrap(), Path::new("/b").unwrap(), &mut a, &mut b).unwrap();
+    assert!(!fs.exists(Path::new("/a").unwrap(), &mut a, &mut b).unwrap());
+    assert!(fs.exists(Path::new("/b").unwrap(), &mut a, &mut b).unwrap());
+}
+
+#[test]
 fn rename_in_subdirectory() {
     let mut fs = make_fs();
     let mut a = [0u8; MemStorage::BLOCK_SIZE];

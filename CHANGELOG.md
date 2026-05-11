@@ -4,6 +4,32 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Added
+
+- **`Fs::rename` (Phase 2g.5): cross-directory move.** Dispatches
+  same-parent paths to `rename_in_dir` (single in-place NAME tag).
+  Cross-parent paths emit a `Create` in the destination parent
+  followed by a `Delete` in the source parent; the source entry's
+  struct body is preserved verbatim, so CTZ chains and child
+  directory pairs stay in place. Rejects ancestor-cycle moves (`old`
+  is a strict ancestor of `new`) with `Error::InvalidPath`. Without
+  atomic-move-state recovery (Phase 3), an interrupt between the two
+  commits leaves the entry visible in both directories; re-running
+  `rename` converges. 8 new integration tests cover the file, dir,
+  collision, cycle, and remount cases.
+- **`Fs::list_dir` and `Fs::list_root` now chase HardTails.** A
+  directory whose entries span multiple metadata pairs (linked by
+  HardTail tags, per the LittleFS v2 spec) is enumerated end to end.
+  Capped at `MAX_DIR_CHAIN = 32` continuation pairs to bound
+  pathological chains. Tested against manually built two-pair root
+  and subdirectory chains.
+- **`apply_op_to_pair` (private helper).** Centralizes the
+  append-or-compact dispatch every write path duplicated. Used by
+  `Fs::rename`'s two commits; existing callers (write_inline_to_pair,
+  remove_from_pair, mkdir, rename_in_dir, commit_update_ctz) are
+  unchanged for now but can migrate to the helper later. Also adds a
+  free `op_dsize_of(&WriteOp)` for wire-size calculation.
+
 ### Changed
 
 - **`Fs::append_to_path` is now streaming for CTZ files (Phase 2f.2).**

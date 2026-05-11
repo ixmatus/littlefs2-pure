@@ -42,6 +42,13 @@ const MAX_LIVE_ENTRIES: usize = crate::dir::MAX_LIVE_ENTRIES;
 /// writer (Phase 2f).
 const MAX_CTZ_WRITE_BLOCKS: usize = 256;
 
+/// Maximum number of metadata pairs the directory-listing path will
+/// chase through HardTails. Bounds the chain length the reader is
+/// willing to follow, mirroring `MAX_QUEUED_PAIRS` in the allocator's
+/// BFS. A directory with more continuation pairs returns
+/// [`Error::OutOfRange`] on enumeration.
+const MAX_DIR_CHAIN: usize = 32;
+
 /// Offsets and lengths of a live entry's NAME and STRUCT tags within
 /// the source metadata block. Used by the compaction path to copy
 /// live entries to the alternate block without owning the source data.
@@ -385,6 +392,41 @@ fn build_compact_commit(
     }
     commit.finish(0)?;
     Ok(commit.bytes_written())
+}
+
+/// Wire-level commit size for a [`WriteOp`], including the trailing
+/// CCRC tag (8 bytes). Used by callers to decide whether to append in
+/// place or compact onto the alternate.
+fn op_dsize_of(op: &WriteOp<'_>) -> usize {
+    match *op {
+        WriteOp::Update { content, .. } => (4 + content.len()) + 8,
+        WriteOp::UpdateCtz { .. } => (4 + 8) + 8,
+        WriteOp::Create { name, content, .. } => 4 + (4 + name.len()) + (4 + content.len()) + 8,
+        WriteOp::CreateCtz { name, .. } | WriteOp::CreateDir { name, .. } => {
+            4 + (4 + name.len()) + (4 + 8) + 8
+        }
+        WriteOp::Remove { .. } => 4 + 8,
+        WriteOp::RenameInPlace { new_name, .. } => (4 + new_name.len()) + 8,
+    }
+}
+
+/// `true` if `ancestor` is a *strict* ancestor of `descendant`: every
+/// component of `ancestor` appears as a prefix of `descendant`'s
+/// component sequence, and `descendant` has at least one further
+/// component. `path_is_strict_ancestor(p, p)` is `false`.
+fn path_is_strict_ancestor(
+    ancestor: crate::path::Path<'_>,
+    descendant: crate::path::Path<'_>,
+) -> bool {
+    let mut a = ancestor.components();
+    let mut d = descendant.components();
+    loop {
+        match (a.next(), d.next()) {
+            (Some(ac), Some(dc)) if ac == dc => {}
+            (None, Some(_)) => return true,
+            _ => return false,
+        }
+    }
 }
 
 /// A path resolution result.
@@ -1382,6 +1424,216 @@ impl<S: Storage> Fs<S> {
         Ok(())
     }
 
+    /// Rename an entry across directories (or in place).
+    ///
+    /// Same-parent paths dispatch to [`Self::rename_in_dir`] (a single
+    /// in-place NAME tag). Different-parent paths apply a two-commit
+    /// sequence: a `Create` (with the entry's existing struct body) in
+    /// the destination parent, followed by a `Delete` (at the source
+    /// id) in the source parent. The struct body is preserved exactly,
+    /// so CTZ files keep their existing chain and directories keep
+    /// their existing metadata pair; cross-directory rename does not
+    /// move file content or rehash anything.
+    ///
+    /// # Cycle prevention
+    ///
+    /// Rejects with [`Error::InvalidPath`] if `old_path` is a strict
+    /// ancestor of `new_path` (would move a directory inside itself).
+    ///
+    /// # Atomicity gap
+    ///
+    /// Without atomic-move-state recovery (Phase 3+), an interrupt
+    /// between the two commits leaves the entry visible in *both*
+    /// directories. On remount the entry resolves under either name;
+    /// re-running `rename` converges to the correct state. The C
+    /// reference recovers via a `MoveState` tag emitted alongside the
+    /// destination Create; that recovery is on the v1.0 punch list.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotFound`] if the source path does not exist.
+    /// - [`Error::AlreadyExists`] if the destination already exists.
+    /// - [`Error::InvalidPath`] for empty/oversize names, for the root
+    ///   on either side, or for the ancestor-cycle case above.
+    /// - [`Error::OutOfRange`] if the destination commit would push
+    ///   the live entry count past [`crate::dir::MAX_LIVE_ENTRIES`].
+    /// - [`Error::Corrupt`] if the source entry's struct body is
+    ///   ill-formed (wrong length for its tag type).
+    pub fn rename(
+        &mut self,
+        old_path: crate::path::Path<'_>,
+        new_path: crate::path::Path<'_>,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        let (old_parent, old_leaf) = self.resolve_parent(old_path, buf_a, buf_b)?;
+        let (new_parent, new_leaf) = self.resolve_parent(new_path, buf_a, buf_b)?;
+
+        if old_parent == new_parent {
+            return self.rename_in_dir(old_path, new_path, buf_a, buf_b);
+        }
+
+        let old_leaf_bytes = old_leaf.as_bytes();
+        let new_leaf_bytes = new_leaf.as_bytes();
+        if new_leaf_bytes.is_empty() || new_leaf_bytes.len() > 0x3FF {
+            return Err(Error::InvalidPath);
+        }
+        if path_is_strict_ancestor(old_path, new_path) {
+            return Err(Error::InvalidPath);
+        }
+
+        // Look up the source entry; copy its struct body to a stack
+        // buffer so the destination commit can borrow it after we
+        // release the source pair's parse.
+        self.storage.read(old_parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(old_parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let mut src_body = [0u8; 1024];
+        let src_id;
+        let src_struct_type;
+        let src_body_len;
+        {
+            let p = MetadataPair::parse(old_parent.a, &*buf_a, old_parent.b, &*buf_b)?;
+            let r = crate::dir::lookup(&p, old_leaf_bytes).ok_or(Error::NotFound)?;
+            let n = r.struct_body.len();
+            if n > src_body.len() {
+                return Err(Error::OutOfRange);
+            }
+            src_body[..n].copy_from_slice(r.struct_body);
+            src_id = r.entry.id;
+            src_struct_type = r.struct_type;
+            src_body_len = n;
+        }
+
+        // Reject if the destination already exists; compute the new
+        // entry id from the destination pair's live count.
+        self.storage.read(new_parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(new_parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let new_id: u16;
+        {
+            let p = MetadataPair::parse(new_parent.a, &*buf_a, new_parent.b, &*buf_b)?;
+            if crate::dir::lookup(&p, new_leaf_bytes).is_some() {
+                return Err(Error::AlreadyExists);
+            }
+            let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+            let active_is_a = p.active_block == new_parent.a;
+            let count = gather_live_slots(&p, active_is_a, buf_a, buf_b, &mut slots)?;
+            let id = u16::try_from(count).map_err(|_| Error::OutOfRange)?;
+            if id == crate::tag::ID_NONE {
+                return Err(Error::OutOfRange);
+            }
+            new_id = id;
+        }
+
+        // Build the Create op for the destination, preserving the
+        // source's struct shape.
+        let create_op = match src_struct_type {
+            crate::tag::TagType::InlineStruct => WriteOp::Create {
+                id: new_id,
+                name: new_leaf_bytes,
+                content: &src_body[..src_body_len],
+            },
+            crate::tag::TagType::CtzStruct => {
+                if src_body_len != 8 {
+                    return Err(Error::Corrupt);
+                }
+                let head_block =
+                    u32::from_le_bytes([src_body[0], src_body[1], src_body[2], src_body[3]]);
+                let total_size =
+                    u32::from_le_bytes([src_body[4], src_body[5], src_body[6], src_body[7]]);
+                WriteOp::CreateCtz { id: new_id, name: new_leaf_bytes, head_block, total_size }
+            }
+            crate::tag::TagType::DirStruct => {
+                if src_body_len != 8 {
+                    return Err(Error::Corrupt);
+                }
+                let a = u32::from_le_bytes([src_body[0], src_body[1], src_body[2], src_body[3]]);
+                let b = u32::from_le_bytes([src_body[4], src_body[5], src_body[6], src_body[7]]);
+                WriteOp::CreateDir {
+                    id: new_id,
+                    name: new_leaf_bytes,
+                    dir_pair: BlockPair::new(BlockAddress::new(a), BlockAddress::new(b)),
+                }
+            }
+            _ => return Err(Error::Corrupt),
+        };
+
+        // Step 1: Create in destination. Step 2: Delete from source.
+        // Doing Create first keeps the entry reachable through the
+        // failure window (duplicate, not loss); doing Delete first
+        // would risk a true vanish if Create then failed.
+        self.apply_op_to_pair(new_parent, &create_op, buf_a, buf_b)?;
+        self.apply_op_to_pair(old_parent, &WriteOp::Remove { id: src_id }, buf_a, buf_b)
+    }
+
+    /// Apply a `WriteOp` to a metadata pair through the standard
+    /// append-or-compact dispatch (append if there's room in the
+    /// active block, otherwise compact onto the alternate and bump
+    /// the revision). Reads both blocks of the pair before parsing,
+    /// gathers live slots in case a compaction is needed, and syncs
+    /// before returning.
+    fn apply_op_to_pair(
+        &mut self,
+        pair_addr: BlockPair,
+        op: &WriteOp<'_>,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        self.storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+
+        let active_addr;
+        let alternate_addr;
+        let active_is_a;
+        let committed_end;
+        let next_ptag;
+        let old_revision;
+        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+        let count: usize;
+        {
+            let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
+            active_addr = pair.active_block;
+            alternate_addr = pair.alternate_block;
+            active_is_a = active_addr == pair_addr.a;
+            committed_end = pair.reader.committed_end();
+            next_ptag = pair.reader.next_ptag();
+            old_revision = pair.reader.revision();
+            count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
+        }
+
+        let dsize = op_dsize_of(op);
+        if committed_end + dsize <= S::BLOCK_SIZE {
+            let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
+            let new_end = {
+                let mut commit =
+                    crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
+                emit_op(&mut commit, op)?;
+                commit.finish(0)?;
+                commit.bytes_written()
+            };
+            self.storage
+                .program(
+                    active_addr.as_u32(),
+                    committed_end as u32,
+                    &active_buf[committed_end..new_end],
+                )
+                .map_err(|_| Error::Io)?;
+        } else {
+            let new_revision = old_revision.wrapping_add(1);
+            let new_end = if active_is_a {
+                build_compact_commit(buf_b, buf_a, new_revision, &slots, count, op)?
+            } else {
+                build_compact_commit(buf_a, buf_b, new_revision, &slots, count, op)?
+            };
+            self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
+            let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+            self.storage
+                .program(alternate_addr.as_u32(), 0, &alt_buf[..new_end])
+                .map_err(|_| Error::Io)?;
+        }
+        self.storage.sync().map_err(|_| Error::Io)?;
+        Ok(())
+    }
+
     /// Remove an empty directory at `path`.
     ///
     /// Verifies the entry is a Directory and its metadata pair has no
@@ -1450,7 +1702,7 @@ impl<S: Storage> Fs<S> {
     pub fn list_dir<F>(
         &mut self,
         path: crate::path::Path<'_>,
-        mut f: F,
+        f: F,
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<usize, Error>
@@ -1489,16 +1741,44 @@ impl<S: Storage> Fs<S> {
             BlockPair::new(BlockAddress::new(a), BlockAddress::new(b))
         };
 
-        self.storage.read(target_pair.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(target_pair.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        let pair = MetadataPair::parse(target_pair.a, buf_a, target_pair.b, buf_b)?;
+        self.list_pair_chain(target_pair, f, buf_a, buf_b)
+    }
+
+    /// Enumerate the directory pair chain starting at `start`, chasing
+    /// HardTails through up to [`MAX_DIR_CHAIN`] pairs. Per-pair splice
+    /// renumbering is applied; ids are pair-local and reset to 0 at
+    /// each pair boundary.
+    fn list_pair_chain<F>(
+        &mut self,
+        start: BlockPair,
+        mut f: F,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(&crate::dir::DirEntry<'_>),
+    {
+        let mut current = start;
         let mut emitted = 0usize;
-        crate::dir::live_entries(&pair, |e| {
-            f(&e);
-            emitted += 1;
-            Ok::<(), Error>(())
-        })?;
-        Ok(emitted)
+        for _ in 0..MAX_DIR_CHAIN {
+            self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+            self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            let next = {
+                let pair = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
+                let next = if pair.reader.is_hard_tail() { pair.reader.tail() } else { None };
+                crate::dir::live_entries(&pair, |e| {
+                    f(&e);
+                    emitted += 1;
+                    Ok::<(), Error>(())
+                })?;
+                next
+            };
+            match next {
+                Some(p) => current = p,
+                None => return Ok(emitted),
+            }
+        }
+        Err(Error::OutOfRange)
     }
 
     /// Check whether an entry exists at the given absolute path.
@@ -1634,33 +1914,14 @@ impl<S: Storage> Fs<S> {
     /// callers that need a `str` should validate.
     ///
     /// Returns the live entry count.
-    pub fn list_root<F>(
-        &mut self,
-        mut f: F,
-        buf_a: &mut [u8],
-        buf_b: &mut [u8],
-    ) -> Result<usize, Error>
+    pub fn list_root<F>(&mut self, f: F, buf_a: &mut [u8], buf_b: &mut [u8]) -> Result<usize, Error>
     where
         F: FnMut(&crate::dir::DirEntry<'_>),
     {
         if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
             return Err(Error::GeometryMismatch);
         }
-        self.storage.read(0, 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(1, 0, buf_b).map_err(|_| Error::Io)?;
-        let pair = MetadataPair::parse(BlockAddress::new(0), buf_a, BlockAddress::new(1), buf_b)?;
-        let mut emitted = 0usize;
-        crate::dir::live_entries(&pair, |e| {
-            // Skip the superblock entry by kind. The superblock NAME
-            // appears as TagType::Superblock but live_entries only
-            // emits DirEntry { kind: RegularFile | Directory }, so it
-            // never appears here. Defensive though: if a future
-            // refactor surfaces it, we still skip on kind.
-            f(&e);
-            emitted += 1;
-            Ok::<(), Error>(())
-        })?;
-        Ok(emitted)
+        self.list_pair_chain(self.root, f, buf_a, buf_b)
     }
 
     /// Write or update a small inline file at the filesystem root
