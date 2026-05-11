@@ -55,11 +55,27 @@ pub trait Storage {
     /// Working cache size in bytes, used by both metadata and file
     /// operations. Must be a multiple of `PROG_SIZE` and a factor of
     /// `BLOCK_SIZE`.
+    ///
+    /// **Advisory in this release.** The kernel currently passes a
+    /// caller-provided pair of `BLOCK_SIZE`-byte buffers to every
+    /// metadata operation (`buf_a`, `buf_b`); there is no internal
+    /// `CACHE_SIZE`-sized scratch. The constant is exposed so storage
+    /// adapters mirror the LittleFS spec, and so a future internal
+    /// cache (Phase 3+) can honor caller-provided sizing without a
+    /// breaking change.
     const CACHE_SIZE: usize;
 
     /// Lookahead buffer size in bytes for the block allocator. Each bit
     /// tracks one block; the buffer is rotated as the filesystem walks for
     /// free blocks. Must be a multiple of 8.
+    ///
+    /// **Advisory in this release.** The kernel's allocator
+    /// ([`crate::alloc::alloc_blocks`]) currently does a full BFS scan
+    /// of the filesystem on every call, with a stack-allocated 4096-bit
+    /// (512-byte) bitmap internal to the function. There is no
+    /// caller-visible lookahead buffer. The constant is exposed so a
+    /// streaming-lookahead allocator (Phase 3+) can honor caller
+    /// sizing without a breaking change.
     const LOOKAHEAD_SIZE: usize;
 
     /// Read `buf.len()` bytes starting at `(block, off)` into `buf`.

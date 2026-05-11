@@ -117,13 +117,34 @@ fn mount_rejects_wrong_buffer_size() {
 }
 
 #[test]
-fn mount_rejects_unformatted_device() {
-    let storage = MemStorage::new(); // all 0xFF, no superblock
+fn mount_returns_unformatted_for_pristine_chip() {
+    // Fresh MemStorage is all 0xFF — the erased state of every NOR or
+    // NAND chip on the planet. This is the boot-time "no filesystem
+    // here yet" state, distinct from `Corrupt` which means the chip
+    // has been programmed but the metadata cannot be parsed.
+    let storage = MemStorage::new();
 
     let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
     let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
     let err = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap_err();
-    // Both blocks have no commits -> Corrupt from MetadataPair::parse.
+    assert_eq!(err, Error::Unformatted);
+}
+
+#[test]
+fn mount_returns_corrupt_for_programmed_but_invalid_pair() {
+    // A device that has been programmed (some bytes are non-0xFF) but
+    // whose root pair has no successfully verified CCRC commit is
+    // genuinely corrupt: bit rot, torn erase, or someone else's data
+    // accidentally written here. Caller's recovery story must
+    // distinguish this from the `Unformatted` case.
+    let mut storage = MemStorage::new();
+    // Plant a non-0xFF byte at offset 0 of block 0; everything else
+    // stays 0xFF. No valid commit, but the chip is "not pristine".
+    storage.write_block(0, &[0x42u8; 4]);
+
+    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let err = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap_err();
     assert_eq!(err, Error::Corrupt);
 }
 

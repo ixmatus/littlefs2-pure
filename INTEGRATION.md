@@ -21,6 +21,7 @@ This file points downstream consumers (SMIL firmware, etc.) at the relevant entr
 | Append to a file (streaming for CTZ) | `Fs::append_to_path(path, additional, content_scratch, ...)` | Creates if missing; fills the tail in place + allocates only overflow blocks for CTZ files; `content_scratch` only consulted for inline / inline-to-CTZ transitions |
 | Read at offset (inline + CTZ) | `Fs::read_at_path(path, offset, &mut out, ...)` | Returns bytes copied; works on any layout |
 | File size | `Fs::size_of(path, ...)` | Returns byte length (inline or CTZ) |
+| Tail-block free room | `Fs::tail_room(path, ...)` | For CTZ files: bytes that can be appended without allocating a new block. Lets a log writer pack appends to fill block boundaries. Returns `0` for inline. |
 | Truncate / extend | `Fs::truncate_path(path, new_size, content_scratch, ...)` | Shrink drops trailing bytes; extend zero-pads |
 | Remove a file at path | `Fs::remove_at_path(path, ...)` | Rejects directories; use `rmdir` instead |
 | Remove empty directory | `Fs::rmdir(path, ...)` | Errors with `NotEmpty` if the dir has contents |
@@ -45,7 +46,7 @@ For the SMIL audit logger specifically: `create_dir`, `File::write` with append/
 
 1. **Smoke test the embedded build path.** Add `littlefs2-pure` as an optional dep of your firmware behind a feature flag. Verify it cross-compiles for your target (the CI matrix already covers `thumbv6m-none-eabi`, `thumbv8m.main-none-eabi`, and `thumbv8m.main-none-eabihf`). A `format` + `mount` round-trip against a RAM-backed `Storage` impl is one screenful and confirms the no_std story.
 
-2. **Wrap your flash chip.** Implement the `Storage` trait against your device. If your flash needs aligned programs (most NOR does), wrap in `NorAlignedStorage`. The trait is sync; no async surface yet.
+2. **Wrap your flash chip.** Implement the `Storage` trait against your device. If your flash needs aligned programs (most NOR does), wrap in `NorAlignedStorage`. The trait is sync; no async surface yet. See "Worked example" below for a typical SPI-NOR adapter and "Where the buffers live" for RAM placement.
 
 3. **Migrate read-only paths first.** Anywhere your code calls into the C-FFI `littlefs2` for `resolve`, `read`, or `exists`, it can swap to `littlefs2-pure` today without losing functionality.
 
@@ -74,6 +75,99 @@ pub trait Storage {
 ```
 
 All offsets and sizes are bytes. `block * BLOCK_SIZE + off` is the device-absolute byte position. The kernel does no bounds checking; misaligned or out-of-bounds calls are precondition violations.
+
+### Where the buffers live
+
+The kernel does not own any large in-RAM scratch. Every operation that needs a block-sized working area takes two `&mut [u8]` buffers (`buf_a`, `buf_b`), each exactly `S::BLOCK_SIZE` bytes. The caller decides where those bytes live: stack frames, a static, or a heap allocation if you have one. Pattern:
+
+```rust
+let mut buf_a = [0u8; <YourStorage as Storage>::BLOCK_SIZE];
+let mut buf_b = [0u8; <YourStorage as Storage>::BLOCK_SIZE];
+let mut fs = Fs::mount(your_storage, &mut buf_a, &mut buf_b)?;
+fs.write_to_path(Path::new("/cfg")?, b"v1", &mut buf_a, &mut buf_b)?;
+```
+
+The same pair can be reused across every call; the kernel re-reads from storage as needed and treats the previous contents as scratch. For a 4 KiB block geometry that is 8 KiB of working RAM total; for the 256-byte test geometry it is 512 bytes.
+
+`CACHE_SIZE` and `LOOKAHEAD_SIZE` in the trait are **advisory** in this release: there is no internal cache and the allocator does a full BFS scan with its own 512-byte bitmap on every `alloc_blocks` call. Declare values that mirror your chip's spec; they are exposed for forward compatibility with a streaming-lookahead allocator (Phase 3+). The current kernel ignores them.
+
+### Worked example: wiring a SPI NOR flash (W25Q-style, 4 KiB sectors, 16-byte page program)
+
+```rust
+use littlefs2_pure::storage::Storage;
+
+pub struct W25qFlash<SPI, CS> { /* SPI handle, chip-select pin */ }
+
+impl<SPI, CS> Storage for W25qFlash<SPI, CS>
+where SPI: /* embedded-hal SPI */, CS: /* OutputPin */
+{
+    type Error = W25qError;
+    const READ_SIZE:  usize = 1;      // SPI read is byte-granular
+    const PROG_SIZE:  usize = 16;     // page-program window (small, lets you append into a partially-erased page)
+    const BLOCK_SIZE: usize = 4096;   // 4 KiB sector
+    const BLOCK_COUNT: u32  = 4096;   // 16 MiB part (4096 sectors * 4 KiB)
+    const CACHE_SIZE:    usize = 256; // advisory; not consumed by the kernel today
+    const LOOKAHEAD_SIZE: usize = 16; // advisory; not consumed by the kernel today
+
+    fn read   (&mut self, b: u32, off: u32, buf: &mut [u8]) -> Result<(), Self::Error> { /* 0x03 cmd */ }
+    fn program(&mut self, b: u32, off: u32, data: &[u8])    -> Result<(), Self::Error> { /* 0x02 cmd */ }
+    fn erase  (&mut self, b: u32)                            -> Result<(), Self::Error> { /* 0x20 sector-erase */ }
+    fn sync   (&mut self)                                    -> Result<(), Self::Error> { /* WIP poll, then Ok */ }
+}
+
+// Wrap in NorAlignedStorage so the kernel's byte-granular programs go
+// through PROG_SIZE-aligned windows. The wrapper holds a 16-byte
+// (= PROG_SIZE) cache; reuse the same NorAlignedStorage across mounts.
+let device = W25qFlash::new(spi, cs);
+let mut storage = NorAlignedStorage::new(device).expect("PROG_SIZE divides BLOCK_SIZE");
+
+// Mount-time RAM: two scratch buffers, one BLOCK_SIZE each. Static in
+// embedded code so the linker reports the footprint at build time.
+static mut BUF_A: [u8; 4096] = [0; 4096];
+static mut BUF_B: [u8; 4096] = [0; 4096];
+
+let mut fs = match Fs::mount(storage, unsafe { &mut BUF_A }, unsafe { &mut BUF_B }) {
+    Ok(fs) => fs,
+    Err(Error::Unformatted) => {
+        // Fresh chip; format and retry.
+        let mut scratch = [0u8; 4096];
+        Fs::format(/* re-acquire storage */, &mut scratch)?;
+        Fs::mount(/* ... */)?
+    }
+    Err(Error::Corrupt) => panic!("flash bit rot; trigger recovery path"),
+    Err(other) => return Err(other.into()),
+};
+```
+
+The total RAM cost on this part is `2 * 4096 + 16 (PROG_SIZE cache) ≈ 8.2 KiB`. The 512-byte allocator bitmap is on the stack of `alloc_blocks` only when a CTZ write or `mkdir` runs, then freed. Nothing in the kernel `static`-allocates; everything is per-call.
+
+### Mount error matrix
+
+`Fs::mount` returns distinct variants for each failure category so a boot path can branch by reason:
+
+| Variant | Meaning | Suggested action |
+|---|---|---|
+| `Error::Io` | `storage.read` faulted. | Retry on transient (loose flex cable); escalate otherwise. |
+| `Error::GeometryMismatch` | Buffers are the wrong size, **or** the on-disk superblock advertises a different `block_size`/`block_count` than `S` declares. | Programmer bug, or wrong-chip-for-image. Do **not** auto-format. |
+| `Error::Unformatted` | Both root-pair blocks read as `0xFF` end-to-end. Fresh fab / post-full-erase. | `Fs::format` then `Fs::mount` again, *if* the boot owner is the formatter. |
+| `Error::Corrupt` | At least one root-pair block has been programmed, but no successfully verified commit can be read. | Escalate to recovery; do **not** auto-format (that would wipe potentially-recoverable data). |
+| `Error::NotLittleFs` | Root pair parses cleanly (valid CCRC commits present) but the LittleFS magic NAME tag is absent. | Wrong filesystem on this chip; escalate. |
+| `Error::UnsupportedVersion(v)` | Magic + body present, but version word is newer than this crate. | Escalate; cannot read forward-version data. |
+
+The `Unformatted` versus `Corrupt` distinction is the load-bearing one for production boot: pristine flash is the expected first-boot state, programmed-but-unparseable is a "page the on-call" state.
+
+### Power-loss recovery envelope
+
+What an interrupt at each stage leaves on disk and what survives a remount, given how the kernel sequences writes:
+
+- **Single-page tear during `program`** — *recoverable*. The kernel programs the new commit bytes only after the previous commit's CCRC is durable. A torn page in the middle of a new commit fails its CCRC on the next mount; the reader falls back to the previous CCRC boundary, and the active-block selector picks whichever block has the most recently *verified* commit. The torn region reads back as some mix of new and erased bytes; the CCRC catches it and the reader rejects the partial commit.
+- **Erase abort mid-`erase`** — *recoverable*. The metadata-pair design assumes one block at a time can be in flux. The kernel only erases the **alternate** block during compaction; the **active** block stays intact and remains mountable. After power return, the alternate reads as a mix of old and erased bytes (no valid commits), the active still has its previous commits, and the reader picks the active.
+- **Power loss between cross-directory rename's two commits** — *visible mid-state*. `Fs::rename` lands the destination Create before the source Delete. An interrupt between them leaves the entry visible in both directories until atomic-move-state recovery ships (Phase 3 hardening). Re-running `rename` converges the state; reads from either path return the same struct body. This is the only documented "two-step transition" in the current write surface.
+- **Power loss during streaming `append_to_path`** — *recoverable to pre-append state*. The new tail-block bytes are programmed first (still erased, so legal NOR programs), then any new chain blocks, then a single `UpdateCtz` commit. The `UpdateCtz` is the only step that becomes visible to a remount; an interrupt before it lands leaves the file at its pre-append size and the new blocks unreferenced (reclaimed by the next allocator scan).
+- **Both blocks of a metadata pair erased concurrently** — *unrecoverable*. The kernel never does this; it always preserves the active while the alternate is in flux. The only way to reach this state is an out-of-band wipe (the firmware or a test harness erasing both blocks). The remount sees `Error::Unformatted` if both blocks are pristine, `Error::Corrupt` otherwise; no path back to the previous data.
+- **Erase + program of a metadata pair without proper write ordering** — *out of scope*. The kernel issues `erase`, then `program`, then `sync` in that order; the `Storage` adapter is required to honor those as separate steps. An adapter that buffers across them (e.g., a NOR controller with deep write-cache that holds the erase until the next sync) breaks the recovery model. `NorAlignedStorage` is the reference wrapper; custom adapters must preserve the same ordering guarantees.
+
+Phase 3 hardening (power-loss fuzzing + Kani harnesses on the commit dispatch) will let this section move from "by construction" to "verified". Until then, treat the table as the design contract.
 
 ## Verification matrix
 
