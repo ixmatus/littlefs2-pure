@@ -32,6 +32,7 @@ This file points downstream consumers (SMIL firmware, etc.) at the relevant entr
 | Read user attribute | `Fs::get_attr(path, attr_id, &mut out, ...)` | Returns latest committed value; `0` on absent or delete-marker |
 | Write user attribute | `Fs::set_attr(path, attr_id, value, ...)` | Values capped at `0x3FE` bytes |
 | Remove user attribute | `Fs::remove_attr(path, attr_id, ...)` | Emits a delete-marker tag |
+| Stateful file handle | `Fs::open(path, OpenOptions, ...) -> File<'fs, S>` | Batches many writes into one metadata-pair commit at `File::sync` / `close`. CTZ-backed files only (opening an inline file without `truncate` is rejected with a typed error). `read`, `write`, `seek`, `set_len` mirror `std::fs::File` shape over `u32` offsets. |
 | Sync the storage layer | `Fs::sync()` | Equivalent to `storage_mut().sync()`. Every mutation already syncs as its final step. |
 | NOR-aligned program wrapper | `NorAlignedStorage::new(your_storage)` | Caches programs to `PROG_SIZE` windows |
 
@@ -41,10 +42,10 @@ The kernel uses the `Storage::BLOCK_CYCLES` constant for inter-pair wear distrib
 
 | Capability | Tracking |
 |---|---|
-| Stateful `File<'fs, S>` handle with `open / read / write / seek / set_len / sync` | Ergonomic only — `append_to_path` already streams; a stateful handle would batch multiple writes into a single metadata commit. |
 | Mount-time orphan recovery for half-completed wear-levelling relocations | Benign miss only — user data is durable as soon as the alternate is programmed (before the fresh block); a crash leaves the relocation half-done but the FS state is consistent and the next predicate firing resumes wear levelling. |
 | HardTail-chain pair relocation | Structurally unreachable through this writer (we don't emit `HardTail` tags). |
 | Kani-in-CI integration | Harnesses are ready under `src/verify/`; CI integration awaits hosted-runner Kani availability. |
+| Random in-place writes through `File::write` (writes at cursor `!=` size) | Out of scope for the streaming handle. Rewrite the file via `Fs::write_to_path` or shrink with `File::set_len` first. |
 
 ## Suggested integration steps
 

@@ -252,8 +252,35 @@ pub fn alloc_blocks<S: Storage>(
     buf_a: &mut [u8],
     buf_b: &mut [u8],
 ) -> Result<(), Error> {
+    alloc_blocks_excluding(storage, root, &[], out, buf_a, buf_b)
+}
+
+/// Like [`alloc_blocks`], but treats every address in `excluded` as
+/// already in use, even when the BFS scan from `root` would not see
+/// it as reachable.
+///
+/// Used by the stateful [`crate::file::File`] write path: between
+/// [`crate::file::File::write`] calls, the new chain blocks live
+/// only in the open handle's memory; the metadata-pair entry does
+/// not reference them until [`crate::file::File::sync`]. Passing the
+/// in-flight chain via `excluded` prevents the allocator from
+/// handing the same physical block back on the next write call,
+/// which would corrupt the chain.
+pub fn alloc_blocks_excluding<S: Storage>(
+    storage: &mut S,
+    root: BlockPair,
+    excluded: &[BlockAddress],
+    out: &mut [BlockAddress],
+    buf_a: &mut [u8],
+    buf_b: &mut [u8],
+) -> Result<(), Error> {
     let mut used = Bitmap::EMPTY;
     scan_used_blocks(storage, root, &mut used, buf_a, buf_b)?;
+    for &ex in excluded {
+        if !ex.is_none() {
+            used.set(ex.as_u32())?;
+        }
+    }
 
     let mut filled = 0usize;
     for b in 0..S::BLOCK_COUNT {
@@ -263,7 +290,6 @@ pub fn alloc_blocks<S: Storage>(
         if !used.is_set(b) {
             out[filled] = BlockAddress::new(b);
             filled += 1;
-            // Mark to prevent re-allocation within this call.
             used.set(b)?;
         }
     }

@@ -11,7 +11,7 @@ License: MIT OR Apache-2.0. MSRV: Rust 1.84.
 
 ## Status
 
-The kernel implements the complete v2 spec surface. The v1.0 / v1.1 / v1.2 punch list against the spec is closed; what remains is a stateful `File<'fs, S>` handle (ergonomic, not correctness) and a Kani-in-CI integration. Track [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the short list still pending v1.0; [`CHANGELOG.md`](CHANGELOG.md) for the per-release record.
+The kernel implements the complete v2 spec surface. The original v1.0 / v1.1 / v1.2 / `File` punch list against the spec is closed. Two infrastructure items remain before a stable v1.0: mount-time orphan recovery for half-completed wear-levelling relocations (benign miss; the alternate write is the durability boundary) and a `cargo kani --features kani` job in CI (harnesses are ready; needs Kani on hosted runners). Track [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the short list still pending v1.0; [`CHANGELOG.md`](CHANGELOG.md) for the per-release record.
 
 Verification posture (see [ADR-0003](docs/decisions/0003-verification-stacks.md)):
 
@@ -25,7 +25,7 @@ Verification posture (see [ADR-0003](docs/decisions/0003-verification-stacks.md)
 | Kani harnesses | `Tag::from_bits` totality, `crc::update` vs bitwise reference, `rev_scmp` wrap-aware compare, `MetadataReader::new` panic-freedom. |
 | libFuzzer (`fuzz/`) | Parser totality on adversarial bytes for tag, path, superblock, CTZ struct, metadata reader. |
 
-233 tests pass, clippy `-D warnings` clean, `cargo doc` warning-free under `RUSTDOCFLAGS=-D warnings`, three ARM cross-compile targets clean.
+246 tests pass, clippy `-D warnings` clean, `cargo doc` warning-free under `RUSTDOCFLAGS=-D warnings`, three ARM cross-compile targets clean.
 
 ## Quick start
 
@@ -57,6 +57,24 @@ let mut out = [0u8; 32];
 let n = fs.read_at_path(Path::new("/log/v1")?, 0, &mut out, &mut buf_a, &mut buf_b)?;
 assert_eq!(&out[..n], b"hello");
 ```
+
+For a session of many small writes against the same file, the stateful [`File`] handle batches the metadata-pair commit:
+
+```rust
+use littlefs2_pure::OpenOptions;
+
+let mut file = fs.open(
+    Path::new("/log/audit")?,
+    OpenOptions::new().write(true).create(true).append(true),
+    &mut buf_a, &mut buf_b,
+)?;
+for entry in audit_log_entries() {
+    file.write(entry.as_bytes(), &mut buf_a, &mut buf_b)?;
+}
+file.close(&mut buf_a, &mut buf_b)?;
+```
+
+Each `write` streams onto flash through the same NOR-friendly tail-fill + overflow-alloc path as `Fs::append_to_path`, but the metadata-pair entry is held back until `close` (or an explicit `sync`) so the whole session lands as a single revision bump on the parent pair.
 
 [`INTEGRATION.md`](INTEGRATION.md) walks through a full SPI-NOR adapter, the mount-error matrix, the power-loss recovery envelope, and the verification matrix in detail.
 
