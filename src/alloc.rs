@@ -23,8 +23,9 @@
 //! # Bounds
 //!
 //! - `MAX_TRACKED_BLOCKS = 4096`: the bitmap caps device size at
-//!   roughly 16 MiB at 4 KiB blocks, or 1 MiB at 256 byte blocks.
-//!   Devices beyond that need a streaming allocator (Phase 3+).
+//!   roughly 16 MiB at 4 KiB blocks, or 1 MiB at 256-byte blocks.
+//!   Devices beyond that need a streaming allocator (forward-looking
+//!   enhancement; not currently exercised).
 //! - `MAX_QUEUED_PAIRS = 32`: caps directory tree depth and HardTail
 //!   chain length the scan can traverse in one pass. A directory tree
 //!   with more than 32 leaves visited concurrently returns

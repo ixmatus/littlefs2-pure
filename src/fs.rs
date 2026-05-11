@@ -1,10 +1,12 @@
 //! Mounted filesystem handle.
 //!
 //! [`Fs::mount`] is the entry point. It reads the root metadata pair
-//! (blocks `0` and `1`) through the provided [`Storage`] backed device,
+//! (blocks `0` and `1`) through the provided [`Storage`]-backed device,
 //! picks the active block via [`MetadataPair::parse`], parses the
-//! superblock via [`Superblock::from_pair`], and validates the geometry
-//! against the storage trait's advertised constants.
+//! superblock via [`Superblock::from_pair`], validates the geometry
+//! against the storage trait's advertised constants, and finishes any
+//! in-flight cross-directory rename via the gstate recovery walk (see
+//! [`crate::gstate`]).
 //!
 //! After mount, the returned [`Fs`] holds:
 //!
@@ -13,11 +15,27 @@
 //! - the address of the root metadata pair (always
 //!   [`crate::ROOT_BLOCK_PAIR`] for v2).
 //!
-//! Buffers for the mount probe are passed in by the caller. After mount
-//! returns, the buffers can be reused; the `Fs` does not retain a borrow
-//! of them. Future directory and file operations (Phases 1e and 1f) take
-//! their own scratch buffer per call, so users on `no_std` targets can
-//! size a single buffer and reuse it.
+//! Every public mutation re-reads the affected metadata pair through
+//! two caller-supplied scratch buffers (each exactly
+//! [`S::BLOCK_SIZE`](Storage::BLOCK_SIZE) bytes) and syncs the storage
+//! before returning. The buffers are reusable across calls; the `Fs`
+//! does not retain a borrow of them, so a `no_std` consumer can
+//! size one pair of buffers and reuse them for the life of the mount.
+//!
+//! # Compaction and wear levelling
+//!
+//! Every commit dispatch checks whether the active block has room for
+//! the new tags. If yes, the tags are appended in place (one program
+//! call, no erase). If not, the live state is GC'd and rewritten to
+//! the alternate block in a fresh commit with an incremented revision
+//! counter (the standard LittleFS rotate). When `S::BLOCK_CYCLES` is
+//! positive and the rewritten pair is not the root, the compact-time
+//! wear-levelling predicate (matching the C reference's
+//! `(rev + 1) % ((BLOCK_CYCLES + 1) | 1) == 0`) may further redirect
+//! the new commit onto a freshly allocated block, with the parent's
+//! `DirStruct` entry flipped to the new pair address through a single
+//! follow-up commit. See `docs/decisions/0005-wear-leveling-pair-relocation.md`
+//! for the atomicity model.
 
 use crate::block::BlockPair;
 use crate::error::Error;
@@ -35,11 +53,13 @@ const MAX_LIVE_ENTRIES: usize = crate::dir::MAX_LIVE_ENTRIES;
 
 /// Maximum chain length a single CTZ write can produce.
 ///
-/// At 4 KiB blocks this caps a single CTZ file at ~1 MiB; at 256 byte
-/// blocks (the test geometry) it caps at 64 KiB. The chain address
-/// table is stack-allocated as `[BlockAddress; MAX_CTZ_WRITE_BLOCKS]`
-/// (1 KiB at the current cap), so larger files need a streaming CTZ
-/// writer (Phase 2f).
+/// At 4 KiB blocks this caps a single full-rewrite CTZ write at ~1 MiB;
+/// at 256 byte blocks (the test geometry) it caps at 64 KiB. The chain
+/// address table is stack-allocated as
+/// `[BlockAddress; MAX_CTZ_WRITE_BLOCKS]` (1 KiB at the current cap).
+/// The streaming [`Fs::append_to_path`] is not bounded by this cap; it
+/// only allocates the blocks needed for the appended overflow and
+/// reuses the existing chain blocks in place.
 const MAX_CTZ_WRITE_BLOCKS: usize = 256;
 
 /// Maximum number of metadata pairs the directory-listing path will
@@ -752,7 +772,7 @@ pub struct ResolvedPath<'b> {
 /// A mounted LittleFS filesystem.
 ///
 /// Constructed by [`Fs::mount`]. Owns the underlying [`Storage`] and the
-/// decoded superblock state. Directory and file APIs land in Phase 1e/1f.
+/// decoded superblock state.
 #[derive(Debug)]
 pub struct Fs<S: Storage> {
     storage: S,
@@ -782,11 +802,11 @@ impl<S: Storage> Fs<S> {
     /// `CtzStruct` whose body parses into a `(head_block, size)` pair
     /// that [`Self::read_ctz`] reassembles.
     ///
-    /// **Update semantics are inline-only.** Re-writing an existing
-    /// name with a content size above `INLINE_MAX` returns
-    /// [`Error::OutOfRange`] for now. The general case requires
-    /// freeing the old CTZ chain plus allocating a new one, which is
-    /// safe but unimplemented (Phase 2f follow-up).
+    /// Updates flip layouts transparently: an existing inline entry
+    /// promoted past `INLINE_MAX` is rewritten as CTZ (the old inline
+    /// body is replaced); an existing CTZ entry shrunk below
+    /// `INLINE_MAX` is rewritten inline (the old chain becomes
+    /// unreachable and is reclaimed by the next allocator scan).
     pub fn write_to_root(
         &mut self,
         name: &[u8],
@@ -807,9 +827,12 @@ impl<S: Storage> Fs<S> {
     /// a metadata commit with `Create` + `RegularFile` NAME +
     /// `CtzStruct` referencing the head block.
     ///
-    /// **Scope.** Root-only, create-only (not update). The name must
-    /// not already exist. CTZ-on-CTZ updates (freeing the old chain
-    /// and allocating a new one) are a Phase 2f follow-up.
+    /// If an entry of the same name already exists as a regular file,
+    /// this emits an `UpdateCtz` against the existing id; the old
+    /// chain (inline body or prior CTZ chain) becomes unreachable and
+    /// is reclaimed by the next allocator scan. Rejects with
+    /// [`Error::AlreadyExists`] if the existing entry is a directory
+    /// (use `rmdir` first).
     pub fn write_ctz_to_root(
         &mut self,
         name: &[u8],
@@ -1932,14 +1955,16 @@ impl<S: Storage> Fs<S> {
     /// Rejects with [`Error::InvalidPath`] if `old_path` is a strict
     /// ancestor of `new_path` (would move a directory inside itself).
     ///
-    /// # Atomicity gap
+    /// # Atomicity
     ///
-    /// Without atomic-move-state recovery (Phase 3+), an interrupt
-    /// between the two commits leaves the entry visible in *both*
-    /// directories. On remount the entry resolves under either name;
-    /// re-running `rename` converges to the correct state. The C
-    /// reference recovers via a `MoveState` tag emitted alongside the
-    /// destination Create; that recovery is on the v1.0 punch list.
+    /// Both commits carry a balanced `MoveState` tag whose 12-byte body
+    /// XORs to zero once both land. A crash between them leaves the
+    /// filesystem-global gstate non-zero; [`Self::mount`] BFS-walks
+    /// every reachable metadata pair, XOR-accumulates every committed
+    /// `MoveState` body, and if the result is non-zero decodes the
+    /// in-flight `(src_pair, src_id)` and emits the missing source
+    /// Delete + balancing MoveState before returning the `Fs` handle.
+    /// Callers never observe the duplicate-entry state.
     ///
     /// # Errors
     ///
@@ -2395,8 +2420,9 @@ impl<S: Storage> Fs<S> {
 
     /// List the entries in the directory at `path`, calling `f` for
     /// each. Skips the superblock (root only). Applies splice
-    /// renumbering. Does **not** chase HardTails (single-pair listing
-    /// only — Phase 2g follow-up).
+    /// renumbering. Chases HardTail-threaded continuation pairs through
+    /// up to 32 pairs; directories with deeper chains return
+    /// [`Error::OutOfRange`].
     pub fn list_dir<F>(
         &mut self,
         path: crate::path::Path<'_>,
@@ -2508,10 +2534,11 @@ impl<S: Storage> Fs<S> {
     ///
     /// Returns [`Error::NotFound`] if the name does not exist.
     ///
-    /// **Scope.** Root-only. Removing non-empty directories is not
-    /// validated yet (the API will happily Delete a directory entry
-    /// without checking its contents — Phase 2f follow-up). Files are
-    /// the safe case and the SMIL calculator's primary need.
+    /// **Scope.** Root-only and does not enforce a "directory must be
+    /// empty" check before issuing the Delete tag. Use [`Self::rmdir`]
+    /// for directories so the emptiness check fires; this method is
+    /// intended for regular file removal at the root and is the path
+    /// SMIL audit-style consumers exercise.
     pub fn remove_from_root(
         &mut self,
         name: &[u8],
@@ -2645,9 +2672,9 @@ impl<S: Storage> Fs<S> {
     /// the same commit. The alternate becomes the new active via the
     /// standard revision-based pair selection on the next mount.
     ///
-    /// **Remaining limits.** Inline-only (content must fit alongside
-    /// the live state in one block); root-only. CTZ writes (Phase 2d)
-    /// and nested paths (Phase 2b.2) lift those.
+    /// This method is the inline-only, root-only fast path. For arbitrary
+    /// paths or content past `INLINE_MAX` use [`Self::write_to_path`],
+    /// which auto-dispatches inline vs CTZ.
     pub fn write_inline_to_root(
         &mut self,
         name: &[u8],

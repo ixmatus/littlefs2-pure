@@ -1,12 +1,11 @@
-//! A fixed capacity, validated path type.
+//! A fixed-capacity, validated path type.
 //!
-//! LittleFS limits path components to [`crate::NAME_MAX`] = 255
-//! bytes. This module exposes:
-//!
-//! - [`Path`]: a borrowed slice of bytes that has been validated to contain
-//!   only legal LittleFS path characters and to fit within `NAME_MAX`.
-//! - (Phase 1) a `PathBuf` owned variant gated on the `alloc` feature, for
-//!   constructing paths at runtime.
+//! LittleFS caps individual path components at [`crate::NAME_MAX`] = 255
+//! bytes. This module exposes [`Path`]: a borrowed slice of bytes that
+//! has been validated to be a legal LittleFS path. The crate does not
+//! ship an owned `PathBuf` variant; callers that build paths at runtime
+//! can carry a `[u8; MAX_PATH]` buffer plus a length, and re-validate
+//! via [`Path::new`] at the boundary.
 //!
 //! # Validation rules
 //!

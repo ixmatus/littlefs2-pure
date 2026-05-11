@@ -8,25 +8,54 @@
 //!
 //! # Status
 //!
-//! `0.1.0` is the foundation layer. It contains the bit accurate primitives
-//! (CRC, tag, block address, path, storage trait) and the verification
-//! scaffolding. It does not yet mount, read, or write a filesystem. Track
-//! `KNOWN_ISSUES.md` for the path to v1.0.
+//! The kernel implements the complete v2 surface: mount, format, full path
+//! resolution with HardTail chasing, inline and CTZ file read and write,
+//! streaming append, directory create / remove / rename, user attributes,
+//! atomic cross-directory rename with mount-time gstate recovery, and
+//! compact-time inter-pair wear levelling. Bit accuracy against the C
+//! reference is verified in both directions (Rust reads images written by
+//! C, C reads images written by Rust). Track `KNOWN_ISSUES.md` for the
+//! short list of items still pending v1.0.
+//!
+//! # Entry points
+//!
+//! - [`Fs::format`] writes a fresh superblock onto a [`Storage`].
+//! - [`Fs::mount`] returns a handle to an existing image.
+//! - [`Fs::resolve`] walks an absolute path to its [`ResolvedPath`].
+//! - [`Fs::read_at_path`] reads from any file (inline or CTZ) at an offset.
+//! - [`Fs::write_to_path`] writes or updates a file, auto-dispatching
+//!   inline vs CTZ on size.
+//! - [`Fs::append_to_path`] streams new bytes onto the end of a file.
+//! - [`Fs::mkdir`], [`Fs::rmdir`], [`Fs::rename`], [`Fs::remove_at_path`]
+//!   complete the directory surface.
+//!
+//! The `INTEGRATION.md` file at the repository root walks through a full
+//! mount + write + remount example against a SPI NOR adapter, plus the
+//! mount-error matrix and the power-loss recovery envelope.
 //!
 //! # Crate features
 //!
-//! - `alloc` enables `Vec` based read buffers and owned path types.
+//! - `alloc` enables `Vec`-backed read buffers on richer hosts.
 //! - `std` enables `std::error::Error` for the [`Error`] type and `std::io`
 //!   adapters around the [`Storage`] trait.
 //! - `kani` compiles the formal verification harnesses under
 //!   `src/verify/`; off in normal builds.
 //!
+//! The default feature set is empty, so a downstream `no_std` no-`alloc`
+//! consumer pulls in nothing beyond `core`.
+//!
 //! # The verification posture
 //!
-//! See `docs/decisions/0003-verification-stacks.md`. Five stacks: unit tests,
-//! proptest property tests, golden conformance vectors from the C reference,
-//! Kani harnesses, and libFuzzer corpora. Each catches a class of failure the
-//! others miss.
+//! See `docs/decisions/0003-verification-stacks.md`. Five stacks: unit
+//! tests, proptest property tests, golden conformance vectors from the C
+//! reference, Kani harnesses, and libFuzzer corpora. Each catches a class
+//! of failure the others miss. The conformance vectors are committed
+//! binaries produced by the vendored C reference under `tools/gen_vectors/`;
+//! the round-trip vectors run our writer through a small C verifier under
+//! `tools/verify_image/`. Property tests cover CRC, tag layout, CTZ
+//! geometry, and metadata commit round-trip. Kani harnesses cover the
+//! load-bearing primitives (tag totality, CRC equivalence, revision
+//! comparison wrap, commit-reader panic-freedom).
 
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]

@@ -42,16 +42,33 @@ jobs:
       - run: cargo test
 
   doc:
-    name: cargo doc
+    name: cargo doc (-D warnings)
     runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps
 
+  msrv:
+    # Lock the library MSRV declared in Cargo.toml (rust-version = "1.84").
+    # This gates the published surface: a downstream consumer pinned at
+    # 1.84 must be able to depend on the crate. Dev-dependencies
+    # (proptest et al.) can require a newer toolchain; that's why this
+    # job builds the library only, not --all-targets.
+    name: MSRV (1.84) lib build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.84
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build
+      - run: cargo build --no-default-features
+
   no_default_features:
-    name: cargo test --no-default-features (no_std floor)
+    name: cargo build --no-default-features (no_std no_alloc floor)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

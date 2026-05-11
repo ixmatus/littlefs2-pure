@@ -28,9 +28,8 @@
 //! - `major_version` exactly matches [`crate::DISK_VERSION`]'s major; and
 //! - `minor_version` is `<=` [`crate::DISK_VERSION`]'s minor.
 //!
-//! Older minor versions parse successfully; on a write the kernel will
-//! rewrite the superblock to the current minor (Phase 2). Newer minors are
-//! rejected with [`Error::UnsupportedVersion`].
+//! Older minor versions parse successfully. Newer minors are rejected
+//! with [`Error::UnsupportedVersion`].
 
 use crate::error::Error;
 use crate::meta::MetadataPair;
