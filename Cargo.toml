@@ -44,6 +44,16 @@ readme = "README.md"
 description = "Pure Rust no_std implementation of the LittleFS v2 on-disk format. Bit-accurate against the C reference in both directions; no FFI; no global allocator inside the kernel."
 keywords = ["littlefs", "filesystem", "embedded", "no-std", "flash"]
 categories = ["embedded", "filesystem", "no-std", "no-std::no-alloc"]
+# Keep the published crate to the runtime surface + tests + docs.
+# Host-side test infrastructure (vendored C reference, C verifier),
+# the CI configuration, the fuzz crate, and Claude's working notes
+# are development-only and should not bloat downstream consumers.
+exclude = [
+    "tools/",
+    ".github/",
+    "fuzz/",
+    "CLAUDE.md",
+]
 
 [features]
 # Default to a pure no_std no_alloc surface. Embedded users get the
