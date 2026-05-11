@@ -367,6 +367,11 @@ impl<'a> Commit<'a> {
     /// The running CRC is included as the 4-byte LE body and is
     /// reset for any subsequent commits. The XOR base is updated
     /// for the next commit per the parity-flip rule.
+    ///
+    /// Emits a plain CCRC: no FCRC, no prog-alignment padding. Use
+    /// [`Self::finish_padded`] for the C-reference-compatible variant
+    /// that adds FCRC for torn-write detection and pads the CCRC body
+    /// so the next commit starts on a prog-aligned boundary.
     pub fn finish(&mut self, chunk: u8) -> Result<(), Error> {
         let ccrc_tag = Tag::new(true, crate::tag::TagType::CommitCrc(chunk), 0x3FF, 4);
         if self.offset + 8 > self.buf.len() {
@@ -379,6 +384,108 @@ impl<'a> Commit<'a> {
         self.ptag = ccrc_tag.into_bits() ^ ((u32::from(chunk) & 1) << 31);
         self.crc = crc::INIT;
         self.offset += 8;
+        Ok(())
+    }
+
+    /// Finalize the commit with a forward CRC (FCRC) tag and a
+    /// prog-aligned CCRC body, matching `lfs_dir_commitcrc` in the C
+    /// reference (`lfs.c:1641`).
+    ///
+    /// `prog_size` is the device's program-unit size; `block_size` is
+    /// the metadata block size. Both are typically pulled from the
+    /// [`crate::Storage`] trait's associated constants.
+    ///
+    /// # Behavior
+    ///
+    /// Computes `end = align_up(min(off + 20, block_size), prog_size)`
+    /// where `off` is the current commit cursor. The CCRC's body
+    /// length is set to `end - ccrc_off - 4`, padding out to `end`
+    /// with bytes that are not included in the CRC (the reader
+    /// ignores them). The bytes from CCRC body's first 4 bytes hold
+    /// the actual CRC value; the rest is padding the caller's pre-fill
+    /// is expected to leave as `0xFF`.
+    ///
+    /// If `end + prog_size <= block_size` and there is room for the
+    /// FCRC tag (12 bytes) ahead of the CCRC, an FCRC tag is emitted
+    /// before the CCRC. The FCRC body advertises the expected CRC of
+    /// the next `prog_size` bytes after `end`, assuming they remain in
+    /// the post-erase state (`0xFF`). A reader (the C reference, or a
+    /// future enhanced version of this crate's reader) uses the FCRC
+    /// to detect torn writes that landed past this commit's CCRC.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::OutOfRange`] if `end` exceeds the buffer or the
+    ///   computed CCRC padding would overflow the 10-bit tag length
+    ///   field (`0x3FE` max). The latter is unreachable for any
+    ///   sane `prog_size` (≤ 1018 bytes).
+    pub fn finish_padded(
+        &mut self,
+        chunk: u8,
+        prog_size: usize,
+        block_size: usize,
+    ) -> Result<(), Error> {
+        let off = self.offset;
+        if prog_size == 0 {
+            return self.finish(chunk);
+        }
+        let target = (off + 20).min(block_size);
+        let end = target.div_ceil(prog_size) * prog_size;
+        if end > block_size {
+            return Err(Error::OutOfRange);
+        }
+        if end < off + 8 {
+            // Not enough room for even a minimal CCRC. Caller bug.
+            return Err(Error::OutOfRange);
+        }
+
+        // Will we emit an FCRC? Need (a) room for the FCRC tag + body
+        // (12 bytes) ahead of the CCRC, i.e. `end >= off + 20`, and
+        // (b) a prog window past `end` that the FCRC can describe,
+        // i.e. `end + prog_size <= block_size`.
+        let emit_fcrc = end >= off + 20 && end + prog_size <= block_size;
+
+        if emit_fcrc {
+            // FCRC body: (size_LE: u32, crc_LE: u32). The CRC is the
+            // CRC32 of `prog_size` 0xFF bytes from `crc::INIT` (the
+            // post-erase state of the next prog window).
+            let mut fcrc_value = crc::INIT;
+            // Run the bytes one at a time; small (prog_size ≤ 512 in
+            // practice) so the loop cost is irrelevant.
+            for _ in 0..prog_size {
+                fcrc_value = crc::update(fcrc_value, &[0xFF]);
+            }
+            let mut fcrc_body = [0u8; 8];
+            fcrc_body[0..4].copy_from_slice(&(prog_size as u32).to_le_bytes());
+            fcrc_body[4..8].copy_from_slice(&fcrc_value.to_le_bytes());
+            let fcrc_tag = Tag::new(true, crate::tag::TagType::ForwardCrc, 0x3FF, 8);
+            self.tag(fcrc_tag, &fcrc_body)?;
+        }
+
+        // Emit padded CCRC: body length = end - ccrc_off - 4. First
+        // 4 bytes of body are the running CRC; the rest is padding
+        // (not CRCed, ignored by the reader).
+        let ccrc_off = self.offset;
+        let body_len = end - ccrc_off - 4;
+        if body_len > 0x3FE {
+            return Err(Error::OutOfRange);
+        }
+        if ccrc_off + 4 + body_len > self.buf.len() {
+            return Err(Error::OutOfRange);
+        }
+        let ccrc_tag =
+            Tag::new(true, crate::tag::TagType::CommitCrc(chunk), 0x3FF, body_len as u16);
+        let raw = ccrc_tag.into_bits() ^ self.ptag;
+        self.buf[ccrc_off..ccrc_off + 4].copy_from_slice(&raw.to_be_bytes());
+        // Only the tag word feeds the CRC; the body (CRC + padding)
+        // does not, per the C reference's `lfs_dir_commitcrc`.
+        self.crc = crc::update(self.crc, &raw.to_be_bytes());
+        self.buf[ccrc_off + 4..ccrc_off + 8].copy_from_slice(&self.crc.to_le_bytes());
+        // Padding bytes (body_len - 4): leave as whatever the buffer
+        // pre-fill held. Callers pre-fill with 0xFF before construction.
+        self.ptag = ccrc_tag.into_bits() ^ ((u32::from(chunk) & 1) << 31);
+        self.crc = crc::INIT;
+        self.offset = end;
         Ok(())
     }
 
@@ -776,5 +883,106 @@ mod tests {
         // invalidate the commit.
         let r = MetadataReader::new(&block).unwrap();
         assert!(!r.has_commits());
+    }
+
+    /// Build a commit using `finish_padded`, then read it back: the
+    /// reader must verify the CCRC, see the FCRC tag in the
+    /// committed region, and report the committed end at the
+    /// prog-aligned `end`.
+    #[test]
+    fn finish_padded_roundtrips_through_reader() {
+        let mut buf = [0xFFu8; 256];
+        {
+            let mut c = Commit::new(&mut buf, 7).unwrap();
+            c.tag(Tag::new(true, TagType::InlineStruct, 0, 5), b"hello").unwrap();
+            c.finish_padded(0, 16, 256).unwrap();
+        }
+        let r = MetadataReader::new(&buf).unwrap();
+        assert!(r.has_commits());
+        assert_eq!(r.revision(), 7);
+        // FCRC should appear in the committed tag stream.
+        let mut saw_fcrc = false;
+        let mut saw_inline = false;
+        for entry in r.iter_tags() {
+            match entry.tag.tag_type() {
+                TagType::InlineStruct => {
+                    saw_inline = true;
+                    assert_eq!(entry.body, b"hello");
+                }
+                TagType::ForwardCrc => {
+                    saw_fcrc = true;
+                    assert_eq!(entry.body.len(), 8);
+                    // FCRC body: (size LE, crc LE).
+                    let size = u32::from_le_bytes([
+                        entry.body[0],
+                        entry.body[1],
+                        entry.body[2],
+                        entry.body[3],
+                    ]);
+                    assert_eq!(size, 16);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_inline);
+        assert!(saw_fcrc);
+        // committed_end must be prog-aligned (multiple of 16).
+        assert_eq!(r.committed_end() % 16, 0);
+    }
+
+    /// When the commit fills the block to where no FCRC window
+    /// remains, finish_padded must still emit a valid CCRC (just
+    /// without FCRC).
+    #[test]
+    fn finish_padded_omits_fcrc_when_no_room_for_next_prog() {
+        // Tiny block: just enough for revision + one tag + CCRC, no
+        // FCRC space afterwards. block_size = 32, prog_size = 16.
+        let mut buf = [0xFFu8; 32];
+        {
+            let mut c = Commit::new(&mut buf, 1).unwrap();
+            c.tag(Tag::new(true, TagType::InlineStruct, 0, 4), &[1, 2, 3, 4]).unwrap();
+            c.finish_padded(0, 16, 32).unwrap();
+        }
+        let r = MetadataReader::new(&buf).unwrap();
+        assert!(r.has_commits());
+        // No FCRC because end + prog_size > block_size.
+        for entry in r.iter_tags() {
+            assert_ne!(
+                entry.tag.tag_type(),
+                TagType::ForwardCrc,
+                "FCRC should not be emitted when there is no next-prog window"
+            );
+        }
+    }
+
+    /// Two successive finish_padded calls in the same block: the
+    /// second commit starts at the prog-aligned offset the first
+    /// padded out to. Both commits round-trip.
+    #[test]
+    fn two_padded_commits_chain_correctly() {
+        let mut buf = [0xFFu8; 256];
+        let first_end;
+        {
+            let mut c = Commit::new(&mut buf, 1).unwrap();
+            c.tag(Tag::new(true, TagType::InlineStruct, 0, 2), b"AA").unwrap();
+            c.finish_padded(0, 16, 256).unwrap();
+            first_end = c.bytes_written();
+        }
+        // Read state needed to extend.
+        let next_ptag = MetadataReader::new(&buf).unwrap().next_ptag();
+        {
+            let mut c = Commit::new_appending(&mut buf, first_end, next_ptag).unwrap();
+            c.tag(Tag::new(true, TagType::InlineStruct, 1, 2), b"BB").unwrap();
+            c.finish_padded(0, 16, 256).unwrap();
+        }
+        let r = MetadataReader::new(&buf).unwrap();
+        assert!(r.has_commits());
+        let mut inline_bodies: Vec<Vec<u8>> = Vec::new();
+        for entry in r.iter_tags() {
+            if entry.tag.tag_type() == TagType::InlineStruct {
+                inline_bodies.push(entry.body.to_vec());
+            }
+        }
+        assert_eq!(inline_bodies, vec![b"AA".to_vec(), b"BB".to_vec()]);
     }
 }

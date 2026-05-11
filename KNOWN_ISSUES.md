@@ -22,7 +22,7 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 ## Write path (Phase 2)
 
 - [x] Slice-based commit builder (`meta::Commit`): tag stream encoding + CCRC tail. (Phase 2a)
-- [ ] Commit construction with FCRC redundancy. The current builder emits CCRC only; FCRC for next-prog erase detection is not yet integrated. (Phase 2 follow-up)
+- [x] Commit construction with FCRC redundancy. `meta::Commit::finish_padded(chunk, prog_size, block_size)` emits an FCRC tag describing the next prog window's post-erase CRC and pads the CCRC body so the next commit starts at a prog-aligned offset. All `Fs` write paths use it. (Phase 2g.7)
 - [ ] Block allocator with the lookahead buffer.
 - [ ] Compaction on full metadata pair.
 - [x] File write (inline, root-only) with upsert semantics: `Fs::write_inline_to_root` appends a Create+NAME+InlineStruct or just an InlineStruct (if updating). (Phase 2b)
@@ -62,10 +62,10 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 
 ## Conformance (Phase 3, parallel)
 
-- [ ] `tools/gen_vectors.sh`: pinned C reference, fixed scenario set, emit images + metadata sidecars.
-- [ ] `tests/vectors/`: committed golden images for every scenario.
-- [ ] `tests/conformance.rs`: per file expected `(passes, skips)` table, aggregate `FAIL_CEILING = 0`.
-- [ ] Round trip vectors: a Rust written image mounts in C and reads what we wrote, byte for byte.
+- [x] `tools/gen_vectors/`: vendored C reference + Makefile + main.c producing baseline images. (Phase 2g.7)
+- [x] `tests/vectors/`: four committed golden images (empty format, single inline, single CTZ, nested dir). Scenario set grows as new edge cases surface. (Phase 2g.7)
+- [x] `tests/conformance.rs`: per-vector test, mount + assert expected `(name, kind, content)` tuples. (Phase 2g.7)
+- [ ] Round trip vectors: a Rust written image mounts in C and reads what we wrote, byte for byte. (Phase 3 follow-up; C-to-Rust direction is in place.)
 
 ## Infrastructure
 

@@ -257,6 +257,7 @@ fn emit_op(commit: &mut crate::meta::Commit<'_>, op: &WriteOp<'_>) -> Result<(),
 /// `op` (either creating a new entry at the end or replacing an
 /// existing entry's struct body). Returns the total bytes written.
 /// `alt_buf` is pre-filled with `0xFF` (erased state).
+#[allow(clippy::too_many_arguments)]
 fn build_compact_commit(
     alt_buf: &mut [u8],
     source_buf: &[u8],
@@ -264,6 +265,8 @@ fn build_compact_commit(
     slots: &[SlotOffsets; MAX_LIVE_ENTRIES],
     count: usize,
     op: &WriteOp<'_>,
+    prog_size: usize,
+    block_size: usize,
 ) -> Result<usize, Error> {
     use crate::tag::TagType;
 
@@ -390,7 +393,7 @@ fn build_compact_commit(
         }
         _ => {}
     }
-    commit.finish(0)?;
+    commit.finish_padded(0, prog_size, block_size)?;
     Ok(commit.bytes_written())
 }
 
@@ -668,7 +671,7 @@ impl<S: Storage> Fs<S> {
                 let mut commit =
                     crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
                 emit_op(&mut commit, &op)?;
-                commit.finish(0)?;
+                commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
                 commit.bytes_written()
             };
             self.storage
@@ -681,9 +684,27 @@ impl<S: Storage> Fs<S> {
         } else {
             let new_revision = old_revision.wrapping_add(1);
             let new_end = if active_is_a {
-                build_compact_commit(buf_b, buf_a, new_revision, &slots, count, &op)?
+                build_compact_commit(
+                    buf_b,
+                    buf_a,
+                    new_revision,
+                    &slots,
+                    count,
+                    &op,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                )?
             } else {
-                build_compact_commit(buf_a, buf_b, new_revision, &slots, count, &op)?
+                build_compact_commit(
+                    buf_a,
+                    buf_b,
+                    new_revision,
+                    &slots,
+                    count,
+                    &op,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                )?
             };
             self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
             let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
@@ -1147,7 +1168,7 @@ impl<S: Storage> Fs<S> {
                 let mut commit =
                     crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
                 emit_op(&mut commit, &op)?;
-                commit.finish(0)?;
+                commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
                 commit.bytes_written()
             };
             self.storage
@@ -1160,9 +1181,27 @@ impl<S: Storage> Fs<S> {
         } else {
             let new_revision = old_revision.wrapping_add(1);
             let new_end = if active_is_a {
-                build_compact_commit(buf_b, buf_a, new_revision, &slots, count, &op)?
+                build_compact_commit(
+                    buf_b,
+                    buf_a,
+                    new_revision,
+                    &slots,
+                    count,
+                    &op,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                )?
             } else {
-                build_compact_commit(buf_a, buf_b, new_revision, &slots, count, &op)?
+                build_compact_commit(
+                    buf_a,
+                    buf_b,
+                    new_revision,
+                    &slots,
+                    count,
+                    &op,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                )?
             };
             self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
             let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
@@ -1259,7 +1298,7 @@ impl<S: Storage> Fs<S> {
         }
         let new_end = {
             let mut commit = crate::meta::Commit::new(&mut buf_a[..S::BLOCK_SIZE], 1)?;
-            commit.finish(0)?;
+            commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
             commit.bytes_written()
         };
         self.storage.program(new_dir.a.as_u32(), 0, &buf_a[..new_end]).map_err(|_| Error::Io)?;
@@ -1300,7 +1339,7 @@ impl<S: Storage> Fs<S> {
                 let mut commit =
                     crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
                 emit_op(&mut commit, &op)?;
-                commit.finish(0)?;
+                commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
                 commit.bytes_written()
             };
             self.storage
@@ -1313,9 +1352,27 @@ impl<S: Storage> Fs<S> {
         } else {
             let new_revision = old_revision.wrapping_add(1);
             let new_end = if active_is_a {
-                build_compact_commit(buf_b, buf_a, new_revision, &slots, count, &op)?
+                build_compact_commit(
+                    buf_b,
+                    buf_a,
+                    new_revision,
+                    &slots,
+                    count,
+                    &op,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                )?
             } else {
-                build_compact_commit(buf_a, buf_b, new_revision, &slots, count, &op)?
+                build_compact_commit(
+                    buf_a,
+                    buf_b,
+                    new_revision,
+                    &slots,
+                    count,
+                    &op,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                )?
             };
             self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
             let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
@@ -1458,7 +1515,7 @@ impl<S: Storage> Fs<S> {
                 let mut commit =
                     crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
                 emit_op(&mut commit, &op)?;
-                commit.finish(0)?;
+                commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
                 commit.bytes_written()
             };
             self.storage
@@ -1471,9 +1528,27 @@ impl<S: Storage> Fs<S> {
         } else {
             let new_revision = old_revision.wrapping_add(1);
             let new_end = if active_is_a {
-                build_compact_commit(buf_b, buf_a, new_revision, &slots, count, &op)?
+                build_compact_commit(
+                    buf_b,
+                    buf_a,
+                    new_revision,
+                    &slots,
+                    count,
+                    &op,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                )?
             } else {
-                build_compact_commit(buf_a, buf_b, new_revision, &slots, count, &op)?
+                build_compact_commit(
+                    buf_a,
+                    buf_b,
+                    new_revision,
+                    &slots,
+                    count,
+                    &op,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                )?
             };
             self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
             let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
@@ -1668,7 +1743,7 @@ impl<S: Storage> Fs<S> {
                 let mut commit =
                     crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
                 emit_op(&mut commit, op)?;
-                commit.finish(0)?;
+                commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
                 commit.bytes_written()
             };
             self.storage
@@ -1681,9 +1756,27 @@ impl<S: Storage> Fs<S> {
         } else {
             let new_revision = old_revision.wrapping_add(1);
             let new_end = if active_is_a {
-                build_compact_commit(buf_b, buf_a, new_revision, &slots, count, op)?
+                build_compact_commit(
+                    buf_b,
+                    buf_a,
+                    new_revision,
+                    &slots,
+                    count,
+                    op,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                )?
             } else {
-                build_compact_commit(buf_a, buf_b, new_revision, &slots, count, op)?
+                build_compact_commit(
+                    buf_a,
+                    buf_b,
+                    new_revision,
+                    &slots,
+                    count,
+                    op,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                )?
             };
             self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
             let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
@@ -1937,7 +2030,7 @@ impl<S: Storage> Fs<S> {
                 let mut commit =
                     crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
                 emit_op(&mut commit, &op)?;
-                commit.finish(0)?;
+                commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
                 commit.bytes_written()
             };
             self.storage
@@ -1951,9 +2044,27 @@ impl<S: Storage> Fs<S> {
             // ---- COMPACT PATH ----
             let new_revision = old_revision.wrapping_add(1);
             let new_end = if active_is_a {
-                build_compact_commit(buf_b, buf_a, new_revision, &slots, count, &op)?
+                build_compact_commit(
+                    buf_b,
+                    buf_a,
+                    new_revision,
+                    &slots,
+                    count,
+                    &op,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                )?
             } else {
-                build_compact_commit(buf_a, buf_b, new_revision, &slots, count, &op)?
+                build_compact_commit(
+                    buf_a,
+                    buf_b,
+                    new_revision,
+                    &slots,
+                    count,
+                    &op,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                )?
             };
             self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
             let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
@@ -2089,7 +2200,7 @@ impl<S: Storage> Fs<S> {
                 let mut commit =
                     crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
                 emit_op(&mut commit, &op)?;
-                commit.finish(0)?;
+                commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
                 commit.bytes_written()
             };
             self.storage
@@ -2103,9 +2214,27 @@ impl<S: Storage> Fs<S> {
             // ---- COMPACT PATH ----
             let new_revision = old_revision.wrapping_add(1);
             let new_end = if active_is_a {
-                build_compact_commit(buf_b, buf_a, new_revision, &slots, count, &op)?
+                build_compact_commit(
+                    buf_b,
+                    buf_a,
+                    new_revision,
+                    &slots,
+                    count,
+                    &op,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                )?
             } else {
-                build_compact_commit(buf_a, buf_b, new_revision, &slots, count, &op)?
+                build_compact_commit(
+                    buf_a,
+                    buf_b,
+                    new_revision,
+                    &slots,
+                    count,
+                    &op,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                )?
             };
             self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
             let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
@@ -2172,7 +2301,7 @@ impl<S: Storage> Fs<S> {
             ),
             &sb_body,
         )?;
-        commit.finish(0)?;
+        commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
 
         // Erase + program block 0 with the committed superblock pair.
         storage.erase(0).map_err(|_| Error::Io)?;
