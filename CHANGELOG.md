@@ -6,6 +6,38 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **Kani proof harnesses (Phase 3).** New `src/verify/` module, gated
+  by `cfg(kani)`, dischargeable via
+  `cargo kani --features=kani`. Four submodules cover the
+  load-bearing primitives:
+  - `tag_proofs`: `Tag::from_bits` / `into_bits` total over `u32`;
+    `TagType::from_bits` / `into_bits` round-trip for every 11-bit
+    type field; `AbstractType::from_bits` accepts `0..8` and
+    rejects everything else; `dsize() == 4 + body_len()` always;
+    `is_ccrc` and `ccrc_chunk` agree.
+  - `crc_proofs`: table-based `crc::update` agrees with the bitwise
+    reference `crc::update_bitwise` exhaustively over single-byte
+    and two-byte inputs at every seed; streaming and one-shot
+    agree; empty input is the identity.
+  - `meta_proofs`: `rev_scmp` is total, zero iff equal,
+    antisymmetric, and an increment-by-one is always "newer" under
+    wrap. Matches `lfs_scmp` in the C reference.
+  - `commit_proofs`: `MetadataReader::new` does not panic on
+    arbitrary 32-byte or 3-byte inputs; rejects short blocks
+    cleanly; `committed_end` never exceeds the input length.
+  The module is excluded from `cargo build` / `cargo test` /
+  cross-compile builds. Running the proofs requires `cargo kani`
+  installed locally.
+- **`cargo-fuzz` crate (Phase 3).** New `fuzz/` workspace-external
+  crate (libFuzzer + nightly only) with five targets:
+  `meta_reader_parse`, `tag_decode`, `path_validate`,
+  `superblock_parse`, `ctz_struct_decode`. Each target asserts the
+  parser's totality and post-conditions on arbitrary bytes. The
+  fuzz crate has its own `[workspace]` declaration so it does not
+  participate in the main workspace; CI does not run it (unbounded
+  runtime by design). Intended for ad-hoc panic-hunting and
+  pre-release verification gates. `fuzz/README.md` documents how
+  to run.
 - **FCRC commit redundancy (Phase 2g.7).** Every metadata commit
   emitted by `Fs` now carries a Forward CRC tag describing the
   expected post-erase content of the next program window, plus a
