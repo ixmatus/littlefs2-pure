@@ -4,6 +4,44 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Added (v1.2 hardening)
+
+- **Inter-pair wear levelling via compact-time pair relocation.**
+  When a metadata pair's about-to-be programmed revision lands on
+  the configured `BLOCK_CYCLES` boundary, the compactor now
+  programs the compacted bytes to both the existing in-pair
+  alternate (for durability) and a freshly allocated block, then
+  rewrites the parent's `DirStruct` entry to point at the new
+  pair address. The modulus matches the C reference exactly
+  (`(rev + 1) % ((BLOCK_CYCLES + 1) | 1) == 0`), avoiding the
+  documented `block_cycles = 1` non-termination and the
+  `block_cycles = 2n` aliasing corner cases. The root pair never
+  relocates (its parent is the spec-pinned `(0, 1)` superblock
+  location). Parent updates flow through the same
+  compact-or-relocate dispatch, so a relocation can cascade up the
+  tree until some ancestor commits inline. `BLOCK_CYCLES <= 0`
+  disables the predicate cleanly. New `WriteOp::UpdateDirStruct
+  { id, new_pair }` carries the parent's rewritten reference; new
+  `find_parent_in_tree` BFS-walks from root through `DirStruct`
+  references to locate the parent; new
+  `alloc::scan_used_with_single_buf` /
+  `alloc::alloc_one_block_with_single_buf` let the relocation
+  path scan for a fresh block using only the source buffer
+  (because the alternate buffer holds the compacted bytes). All
+  seven existing compact sites (`write_inline_to_pair`,
+  `write_ctz_to_pair`, `commit_update_ctz`, `mkdir`,
+  `rename_in_dir`, `remove_from_pair`,
+  `apply_op_to_pair_with_movestate`) now dispatch through a
+  single `compact_and_program` helper that handles relocation
+  uniformly. Six integration tests in `tests/wear_leveling.rs`:
+  root pair stays at `(0, 1)` under 200 compactions; subdir pair
+  relocates after BLOCK_CYCLES boundary; first relocation
+  replaces exactly one block (the alternate); data survives a
+  remount after several relocations; nested relocation propagates
+  through a grandparent; `BLOCK_CYCLES = -1` disables wear
+  levelling. This closes the last documented v1.0 / v1.1 punch
+  list item.
+
 ### Added (v1.1 hardening)
 
 - **Atomic move state recovery for cross-directory rename.** A
