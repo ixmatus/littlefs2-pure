@@ -1,8 +1,8 @@
 # Known issues
 
-What's missing for v1.0. v1.0 ships when every entry below is either checked or moved to "explicitly out of scope."
+**v1.0 — the punch list is closed.** Every spec-driven and infrastructure item that gated v1.0 shipped before the freeze; the checklist below is the archival record of how we got there. The "Out of scope" section at the bottom enumerates the deliberate v1.x non-goals — items we will not add without a major version bump.
 
-The v1.0 / v1.1 / v1.2 punch list against the LittleFS v2 spec is complete. What remains is ergonomic polish and CI plumbing; see "Outstanding before v1.0" at the bottom.
+Open issues against the v1.x line (regressions, ergonomic gaps that surface in real use) belong in the GitHub issue tracker, not in this file.
 
 ## Read path
 
@@ -66,12 +66,16 @@ The v1.0 / v1.1 / v1.2 punch list against the LittleFS v2 spec is complete. What
 - [x] LICENSE-MIT and LICENSE-APACHE text files ship at the repo root.
 - [x] `README.md` with quick-start, status, and pointers into `INTEGRATION.md`.
 
-## Outstanding before v1.0
+## v1.0 freeze record
 
-None of these are correctness blockers.
+Every item that gated v1.0 shipped before the freeze. The list is preserved here for archaeology.
 
-- [x] **Stateful `File<'fs, S>` handle** with `open / read / write / seek / sync / set_len`. Batches many writes into a single `UpdateCtz` commit at sync time. CTZ-backed regular files (and missing-with-`create` and truncated-to-empty files); inline files are rejected with a typed error so the path-based API stays the right tool for small upserts. Random in-place writes (cursor `!=` size) are out of scope and return [`Error::OutOfRange`]. Drop discards uncommitted writes (the chain blocks become orphan and are reclaimed by the next allocator scan; no corruption).
-- [x] **`cargo kani --features kani` job in CI** (v0.3.1). All 17 `#[kani::proof]` harnesses under `src/verify/` discharge through the `model-checking/kani-github-action@v1` action. The two `commit_proofs::metadata_reader_*` harnesses stub `crc::update` to keep CBMC tractable (CRC correctness is verified separately in `crc_proofs`) and use explicit `#[kani::unwind]` bounds. The harness sweep caught a real panic-on-adversarial-input bug in `MetadataReader::new` (CCRC with `body_len < 4`); fixed in v0.3.1 with a regression test pinned in `src/meta.rs`.
+- [x] **Stateful `File<'fs, S>` handle** (v0.2.0).
+- [x] **Atomic move state recovery for cross-directory rename** (v1.1, shipped in v0.1.0).
+- [x] **Inter-pair wear levelling via pair relocation** (v1.2, shipped in v0.1.0).
+- [x] **Mount-time orphan recovery for half-completed wear-levelling relocations** (v0.3.0). XOR-balanced `RelocateState` gstate tag rides every relocation; mount-time BFS decodes non-zero aggregates and emits a balancing commit on the source pair.
+- [x] **`cargo kani --features kani` in CI** (v0.3.1). 17 of 17 harnesses discharge via `model-checking/kani-github-action@v1`; the sweep caught a real panic-on-adversarial-input bug in `MetadataReader::new` (CCRC with `body_len < 4`), fixed and regression-pinned in the same release.
+- [x] **API freeze pass** (v1.0.0). `#[non_exhaustive]` applied to `Error`, `EntryKind`, `AbstractType`, `TagType`; dead `ReadOnlyStorage` trait pruned; lib preamble and README rewritten to commit to the v1.x semver contract.
 
 ## Out of scope
 
