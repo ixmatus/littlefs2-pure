@@ -60,8 +60,12 @@
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+// Rename the std `alloc` extern crate so it doesn't collide with our
+// `crate::alloc` module (the block allocator). Internal lib code that
+// needs the heap path uses `core_alloc::*`; downstream consumers see
+// our `crate::alloc::*` block-allocator API.
 #[cfg(feature = "alloc")]
-extern crate alloc;
+extern crate alloc as core_alloc;
 
 #[cfg(feature = "std")]
 extern crate std;

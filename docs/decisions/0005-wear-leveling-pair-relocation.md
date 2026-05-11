@@ -154,20 +154,33 @@ practice and not exercised.
   practice. If a future caller needs tail-threaded mutation, the
   fix is to widen `find_parent_in_tree` to also return the
   predecessor's tail tag and add a `WriteOp::UpdateTail` variant.
-- **Mount-time orphan recovery for half-completed relocations.**
-  The C reference tracks pending relocations in gstate (the same
-  XOR-accumulated 12-byte field used for cross-directory rename
-  recovery) so an interrupted relocation completes on next mount.
-  We accept the missed-cycle behaviour instead: the user's commit
-  is durable through the alternate write, only the wear-levelling
-  benefit is deferred to the next predicate firing. Adding orphan
-  recovery would mirror the cross-dir-rename pattern in
-  `gstate.rs`; if a workload turns out to need stricter
-  guarantees, the path is open.
 - **Tuning `BLOCK_CYCLES` per workload.** We expose the constant
   on the `Storage` trait and ship the C reference default of
   `500`. Choosing a value (or the disable sentinel `-1`) is a
   storage-provider concern; the kernel does not impose a policy.
+
+**Mount-time orphan recovery (now shipped in v0.3.0).** The
+original draft of this ADR deferred orphan recovery on the
+grounds that a torn relocation is a benign missed cycle (the
+alternate write is the durability boundary, so user data is
+safe; the wear-levelling benefit is forfeited until the next
+predicate firing). v0.3.0 took the stricter path. Each
+relocation now embeds a balanced `RelocateState` tag (16-byte
+body: `old_pair` LE pair + `new_pair` LE pair) on the alternate
+program, on the freshly allocated block, and on the parent's
+`UpdateDirStruct` commit. The three contributions XOR to zero
+once all three land. A crash that lands fewer than three leaves
+a non-zero filesystem-global RelocateState aggregate;
+`Fs::mount` walks every reachable pair via the splice-correct
+live-entries view, XOR-accumulates every committed
+`RelocateState` body, and emits a balancing commit on `old_pair`
+that cancels the cycle. The forfeited fresh block becomes
+orphan and is reclaimed by the next allocator scan. The pattern
+mirrors the cross-dir rename pattern in `gstate.rs`; the
+`Gstate` struct now carries both the 12-byte `MoveState` triple
+and the 16-byte `RelocateState` quadruple side by side. Covered
+by `relocation_atomic_across_every_power_loss` in
+`tests/wear_leveling.rs`.
 
 ## Related
 
@@ -180,6 +193,7 @@ practice and not exercised.
 - ADR-0003 (verification stacks): wear levelling is covered by the
   unit-test and property-test stacks; Kani harnesses for the
   predicate's totality are an open follow-up.
-- `tests/wear_leveling.rs` for the six integration tests.
+- `tests/wear_leveling.rs` for the seven integration tests (six
+  behavioural plus one power-loss sweep).
 - `KNOWN_ISSUES.md` entry "Wear leveling via pair relocation"
   now marked complete.

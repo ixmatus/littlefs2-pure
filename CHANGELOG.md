@@ -4,6 +4,76 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-11
+
+### Added
+
+- **Mount-time orphan recovery for half-completed wear-levelling
+  relocations.** Closes the last v1.2 follow-up item documented in
+  ADR-0005. Every compact-time relocation now embeds a balanced
+  [`gstate::RelocateState`] tag (16-byte body: `old_pair` LE pair +
+  `new_pair` LE pair) on the alternate, on the freshly allocated
+  block, and on the parent's `UpdateDirStruct` commit. The three
+  contributions XOR to zero once all three land. A crash that lands
+  the alternate but not the fresh-block program leaves a non-zero
+  filesystem-global RelocateState aggregate; [`Fs::mount`] walks
+  every reachable metadata pair via the splice-correct live-entries
+  view, XOR-accumulates every committed `RelocateState` body, and if
+  the result is non-zero decodes `(old_pair, new_pair)` and emits a
+  balancing commit on `old_pair` that cancels the cycle. The
+  forfeited fresh block becomes orphan and is reclaimed by the next
+  allocator scan. New `TagType::RelocateState` (chunk `0xfe` under
+  the Globals abstract type, sharing the slot with `MoveState`); new
+  `WriteOp::Noop` (gstate-only commits with no data tag); new
+  `Gstate` fields `relocate_old_a/b` and `relocate_new_a/b` plus
+  `xor_relocate_body`, `pending_relocation`, `build_relocate_body`.
+- **`std` feature for the host-side library.** Renames the internal
+  alias of `std`'s `alloc` extern crate to `core_alloc` so it no
+  longer collides with this crate's [`crate::alloc`] block-allocator
+  module when `std` is enabled. Existing downstream code using
+  `littlefs2_pure::alloc::*` is unchanged. Enables `std::eprintln!`
+  diagnostics in tests and integration code, and `std::error::Error`
+  for [`Error`].
+
+### Changed
+
+- **All compact sites now route through `apply_op_to_pair_inner`.**
+  Five previously-duplicated append-or-compact dispatches
+  (`write_ctz_to_pair`, `commit_update_ctz`, `mkdir`, `rename_in_dir`,
+  and the `remove`/`set_attr` paths) now compose with the new
+  RelocateState-aware path, so the existing pair's
+  XOR-accumulated `MoveState` and `RelocateState` contributions are
+  preserved across every compact regardless of which surface
+  triggered it. Eliminates a class of XOR-balance bugs where a
+  compaction landing during the recovery window would drop one of
+  the three RelocateState contributions and leave a phantom
+  pending relocation visible at the next mount.
+- **`accumulate_gstate` uses the splice-correct live-entries
+  view** to enqueue child pairs during the BFS, not the raw
+  `DirStruct` tag stream. Without this, a metadata pair whose
+  `UpdateDirStruct` commits have superseded earlier `DirStruct`
+  entries would enqueue the stale orphan pair address — visiting a
+  block reused for unrelated content — polluting the gstate
+  aggregate.
+
+### Tests
+
+- New torn-write atomicity test
+  `relocation_atomic_across_every_power_loss` in
+  `tests/wear_leveling.rs`: seeds an FS with `/sub/k = "PRE"`, runs
+  a relocation-triggering write at every program-call boundary
+  through a new `TornWearStorage` adapter, then asserts the
+  remounted FS reads back as either pre-state ("PRE") or post-state
+  ("POST"). Never corrupt, never a phantom intermediate value.
+- Existing 246-test suite passes including the six wear-leveling
+  tests from v1.2 (which now exercise the recovery path implicitly
+  via repeated mount + remount cycles).
+
+[`gstate::RelocateState`]: crate::gstate
+[`Fs::mount`]: crate::Fs::mount
+[`Error`]: crate::Error
+[`crate::alloc`]: crate::alloc
+
 ## [0.2.0] - 2026-05-11
 
 ### Added
