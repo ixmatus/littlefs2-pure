@@ -50,7 +50,7 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 - [x] `rename` within the same directory. (`src/fs.rs::rename_in_dir`, Phase 2g.2)
 - [x] Cross-directory rename (`Fs::rename`). Issues a `Create` in the destination parent followed by a `Delete` in the source parent; preserves the entry's struct body so CTZ chains and child directory pairs stay in place. Rejects ancestor-cycle moves (`old` is a strict ancestor of `new`). (Phase 2g.5)
 - [x] User attribute write. `Fs::set_attr(path, attr_id, value, ...)` and `Fs::remove_attr(path, attr_id, ...)`. Values capped at `0x3FE` bytes (the LittleFS length-field non-sentinel max).
-- [ ] Atomic move state recovery (v1.1). The C reference XOR-accumulates `MoveState` tags across every metadata pair; mount-time recovery walks the BFS, decodes the gstate, and completes (or rolls back) any in-flight cross-directory move. Without it, an interrupt between `Fs::rename`'s destination Create and source Delete leaves the entry visible in both directories; re-running `rename` converges. SMIL has no cross-dir rename use case so the current behavior is acceptable for v1.0; durable cross-dir transactions land in v1.1.
+- [x] Atomic move state recovery. Cross-directory rename emits balanced `MoveState` tags in both commits; `Fs::mount` BFS-walks every reachable metadata pair, XOR-accumulates every `MoveState` body, and if the result is non-zero decodes the in-flight `(src_pair, src_id)` and emits the missing source-side Delete before returning the `Fs` handle. Compaction preserves a pair's net gstate contribution. Verified by `tests/atomic_move.rs` across every program-call boundary in the rename. (v1.1)
 
 ## Hardening (Phase 3)
 
