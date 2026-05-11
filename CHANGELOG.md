@@ -4,6 +4,96 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-11
+
+### Added
+
+- **Stateful [`File<'fs, S>`] handle**, opened via
+  [`Fs::open`]`(path, OpenOptions, ...)`. Batches a session of many
+  small writes into a single `UpdateCtz` commit at
+  [`File::sync`] / [`File::close`] time, while each individual
+  [`File::write`] still streams bytes onto flash through the same
+  NOR-friendly tail-fill + overflow-alloc path as
+  [`Fs::append_to_path`]. The headline use case is log-style writers
+  (the SMIL audit logger): 16 successive 32-byte writes through
+  `File` produce one metadata-pair revision bump instead of 16,
+  amortizing the parent-pair touch across the whole session.
+- [`OpenOptions`] builder mirroring `std::fs::OpenOptions` shape:
+  `read`, `write`, `append`, `truncate`, `create`. Append mode
+  forces every write to land at end-of-file regardless of cursor
+  position, matching `std::fs::OpenOptions::append`.
+- [`SeekFrom`] enum (`Start(u32)` / `Current(i64)` / `End(i64)`) for
+  [`File::seek`].
+- [`File::set_len`] for shrink (drops trailing blocks; orphaned
+  bytes reclaimed by the next allocator scan after sync) and
+  extend-with-zero-fill (zero bytes flow through the streaming
+  write path).
+- [`alloc::alloc_blocks_excluding`]: variant of
+  [`alloc::alloc_blocks`] that treats a caller-supplied address
+  list as already in use. The [`File`] write path needs it because
+  in-flight chain blocks live only in the open handle's memory
+  between writes — the metadata-pair entry does not reference them
+  until [`File::sync`], so a naive `alloc_blocks` would hand back
+  the same physical block on the next write and corrupt the chain.
+
+### Changed
+
+- `Fs::append_to_path`'s internal streaming primitive is now exposed
+  as `pub(crate) Fs::stream_ctz_extend`, returning
+  `(new_head, new_size)` without committing the metadata-pair
+  entry. The path-based `append_to_path` composes
+  `stream_ctz_extend` with `commit_update_ctz`; the stateful
+  [`File`] composes `stream_ctz_extend` across many writes followed
+  by a single `commit_update_ctz` at sync.
+- `commit_update_ctz`, `resolve_parent`, `write_inline_to_pair`,
+  `apply_op_to_pair`, and the internal `WriteOp` enum are now
+  `pub(crate)` so the new `file` module can reach them without
+  widening the public surface.
+
+### Scope
+
+- The handle operates on CTZ-backed regular files. Opening an
+  existing inline file (content ≤ `Fs::INLINE_MAX`) without
+  `truncate(true)` returns [`Error::OutOfRange`]. Inline-style
+  upserts of small configuration data stay on the path-based API
+  ([`Fs::write_inline_to_root`], [`Fs::write_to_path`]).
+- Random in-place writes (cursor `!=` size) return
+  [`Error::OutOfRange`]; the streaming primitive does not support
+  rewriting bytes in the middle of a chain. Truncate the file and
+  rewrite, or use [`Fs::write_to_path`].
+- Drop does **not** sync. Uncommitted writes are silently dropped
+  on flash; the orphaned chain blocks are reclaimed by the next
+  allocator scan, so no corruption results. Always call
+  [`File::sync`] or [`File::close`] explicitly.
+
+### Tests
+
+13 new integration tests in `tests/file.rs` covering: write-then-sync
+persists; many writes amortize to one metadata-pair revision bump;
+drop without sync leaves the pre-open state intact; reads via the
+handle match `read_at_path`; seek + read returns offset content;
+shrink and extend via `set_len`; truncate-open then rewrite;
+missing-without-create returns `NotFound`; inline file rejected;
+random in-place write rejected; append mode forces writes to EOF;
+the whole session survives remount.
+
+[`File`]: crate::File
+[`File<'fs, S>`]: crate::File
+[`Fs::open`]: crate::Fs::open
+[`File::sync`]: crate::File::sync
+[`File::close`]: crate::File::close
+[`File::write`]: crate::File::write
+[`File::seek`]: crate::File::seek
+[`File::set_len`]: crate::File::set_len
+[`Fs::append_to_path`]: crate::Fs::append_to_path
+[`Fs::write_to_path`]: crate::Fs::write_to_path
+[`Fs::write_inline_to_root`]: crate::Fs::write_inline_to_root
+[`OpenOptions`]: crate::OpenOptions
+[`SeekFrom`]: crate::SeekFrom
+[`alloc::alloc_blocks`]: crate::alloc::alloc_blocks
+[`alloc::alloc_blocks_excluding`]: crate::alloc::alloc_blocks_excluding
+[`Error::OutOfRange`]: crate::Error::OutOfRange
+
 ## [0.1.0] - 2026-05-11
 
 First crates.io release. The kernel implements the complete LittleFS v2 surface (mount, format, full path resolution, inline and CTZ read/write, streaming append, mkdir / rmdir / rename, user attributes, atomic cross-directory rename with mount-time gstate recovery, and compact-time inter-pair wear levelling). Bit accuracy against the C reference is verified in both directions.

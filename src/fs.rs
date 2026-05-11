@@ -190,7 +190,7 @@ fn gather_live_slots(
 /// [`Fs::remove_from_root`], and the CTZ write path to dispatch
 /// through the same append-vs-compact machinery.
 #[derive(Clone, Copy)]
-enum WriteOp<'a> {
+pub(crate) enum WriteOp<'a> {
     /// Create a new entry at `id` (the next free id) with NAME `name`
     /// and InlineStruct `content`.
     Create { id: u16, name: &'a [u8], content: &'a [u8] },
@@ -1318,6 +1318,28 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
+        let (head_phys, new_size) = self.stream_ctz_extend(ctz, data, buf_a, buf_b)?;
+        self.commit_update_ctz(pair_addr, entry_id, head_phys, new_size, buf_a, buf_b)
+    }
+
+    /// Program `data` to the end of an existing CTZ chain, returning
+    /// the new `(head_block, total_size)` WITHOUT committing the
+    /// metadata-pair entry update. Used by both [`Self::append_to_path`]
+    /// (which immediately follows up with `commit_update_ctz`) and the
+    /// stateful [`crate::file::File`] handle (which defers the commit
+    /// until [`crate::file::File::sync`] / `close`, amortizing the
+    /// metadata-pair touch over a session of writes).
+    ///
+    /// Existing chain blocks are never re-erased. The bytes packed
+    /// into the existing tail block go through NOR sub-window programs;
+    /// overflow allocates only the blocks needed for the remainder.
+    pub(crate) fn stream_ctz_extend(
+        &mut self,
+        ctz: crate::ctz::CtzStruct,
+        data: &[u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(u32, u32), Error> {
         use crate::ctz::{
             block_count, block_index_at_offset, collect_chain_blocks, content_bytes_in_block,
             skip_pointers_in_block,
@@ -1381,10 +1403,20 @@ impl<S: Storage> Fs<S> {
             let new_start = n_old as usize;
             let new_count = (new_n - n_old) as usize;
 
-            crate::alloc::alloc_blocks(
+            // Pass the in-flight chain as "excluded" so the allocator
+            // does not hand back a block that already belongs to this
+            // chain. For `append_to_path` the chain is also reachable
+            // from root through the prior commit, so the exclusion is
+            // redundant; for the stateful `File` write path, where
+            // the metadata-pair entry is not updated between writes,
+            // the exclusion is the correctness fix that keeps the
+            // chain blocks from being reallocated under us.
+            let (existing, rest) = chain.split_at_mut(new_start);
+            crate::alloc::alloc_blocks_excluding(
                 &mut self.storage,
                 self.root,
-                &mut chain[new_start..new_start + new_count],
+                existing,
+                &mut rest[..new_count],
                 buf_a,
                 buf_b,
             )?;
@@ -1418,17 +1450,14 @@ impl<S: Storage> Fs<S> {
 
         self.storage.sync().map_err(|_| Error::Io)?;
 
-        // Commit the directory-entry update. This is the atomic step:
-        // anything before the commit lands leaves the file at its
-        // pre-append state.
         let new_size = old_size + data.len() as u32;
-        self.commit_update_ctz(pair_addr, entry_id, head_phys, new_size, buf_a, buf_b)
+        Ok((head_phys, new_size))
     }
 
     /// Emit an `UpdateCtz` commit on `pair_addr` pointing entry `id` at
     /// `(head_block, total_size)`. Dispatches through the standard
     /// append-or-compact machinery used by every other write op.
-    fn commit_update_ctz(
+    pub(crate) fn commit_update_ctz(
         &mut self,
         pair_addr: BlockPair,
         id: u16,
@@ -1509,7 +1538,7 @@ impl<S: Storage> Fs<S> {
     /// Returns [`Error::InvalidPath`] for the root path (no parent).
     /// Returns [`Error::NotFound`] if any intermediate component does
     /// not resolve to a Directory.
-    fn resolve_parent<'p>(
+    pub(crate) fn resolve_parent<'p>(
         &mut self,
         path: crate::path::Path<'p>,
         buf_a: &mut [u8],
@@ -2103,7 +2132,7 @@ impl<S: Storage> Fs<S> {
     /// append-or-compact dispatch. Convenience wrapper around
     /// [`Self::apply_op_to_pair_with_movestate`] with no MoveState
     /// piggyback (the common case).
-    fn apply_op_to_pair(
+    pub(crate) fn apply_op_to_pair(
         &mut self,
         pair_addr: BlockPair,
         op: &WriteOp<'_>,
@@ -2111,6 +2140,23 @@ impl<S: Storage> Fs<S> {
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
         self.apply_op_to_pair_with_movestate(pair_addr, op, None, buf_a, buf_b)
+    }
+
+    /// Replace the STRUCT body of entry `id` in `parent` with an
+    /// inline body equal to `content`. Used by [`crate::file::File::sync`]
+    /// to commit a truncated-to-empty file (the prior `CtzStruct`
+    /// chain becomes orphan and is reclaimed by the next allocator
+    /// scan).
+    pub(crate) fn update_inline_at_id(
+        &mut self,
+        parent: BlockPair,
+        id: u16,
+        content: &[u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        let op = WriteOp::Update { id, content };
+        self.apply_op_to_pair(parent, &op, buf_a, buf_b)
     }
 
     /// Apply a `WriteOp` to a metadata pair, optionally piggybacking
@@ -2687,7 +2733,7 @@ impl<S: Storage> Fs<S> {
 
     /// Internal: write/update an inline file in the given metadata pair.
     /// Used by both `write_inline_to_root` and `write_inline_to_path`.
-    fn write_inline_to_pair(
+    pub(crate) fn write_inline_to_pair(
         &mut self,
         pair_addr: BlockPair,
         name: &[u8],
