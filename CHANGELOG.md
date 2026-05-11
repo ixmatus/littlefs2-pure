@@ -6,6 +6,25 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **`Error::Unformatted`.** New variant distinguishing a pristine
+  (every byte `0xFF`) root pair from a programmed-but-unparseable
+  one. `Fs::mount` now returns `Unformatted` for a fresh chip and
+  reserves `Corrupt` for true bit-rot / torn-erase damage. Lets a
+  firmware boot path branch on "format and continue" versus "page
+  the on-call". Documented in the [`Fs::mount`] rustdoc and the new
+  "Mount error matrix" section of `INTEGRATION.md`.
+- **`Fs::tail_room(path)`.** Returns the number of bytes that fit in
+  a CTZ file's current tail block without allocating a new one (0
+  for inline files). Lets a log writer pack appends so overflow
+  arrives on a block boundary; combined with the streaming
+  `append_to_path`, this lets a batching log writer (the SMIL audit
+  logger) minimize new-block allocations without internal tracking.
+- **`INTEGRATION.md` expansions.** New sections: "Where the buffers
+  live" (caller-supplied `BLOCK_SIZE` pair, total RAM cost), "Worked
+  example: wiring a SPI NOR flash" (full Storage impl + mount with
+  error branching), "Mount error matrix" (variant -> action table),
+  "Power-loss recovery envelope" (per-stage interrupt behavior, the
+  cross-dir-rename two-step transition, what's out of scope).
 - **`Fs::rename` (Phase 2g.5): cross-directory move.** Dispatches
   same-parent paths to `rename_in_dir` (single in-place NAME tag).
   Cross-parent paths emit a `Create` in the destination parent

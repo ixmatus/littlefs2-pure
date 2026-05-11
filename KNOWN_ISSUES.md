@@ -17,7 +17,7 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 - [x] CTZ struct codec and geometry math: 8 byte body decode/encode, skip pointer count per block, content bytes per block, file offset -> (block, abs_offset) translation. (`src/ctz.rs`, Phase 1g foundations)
 - [x] CTZ storage-backed read: walk the chain backward from head, fetch each block's content portion, reassemble. (`src/ctz.rs::read_ctz`, Phase 1g full)
 - [ ] User attribute read.
-- [ ] Mount level error reporting: distinguish "not a LittleFS v2 image" from "geometry mismatch" from "corrupt metadata".
+- [x] Mount level error reporting: `Fs::mount` returns distinct variants for `Io`, `GeometryMismatch`, `Unformatted` (new), `Corrupt`, `NotLittleFs`, and `UnsupportedVersion(v)`. Matrix and recommended actions documented in `INTEGRATION.md`.
 
 ## Write path (Phase 2)
 

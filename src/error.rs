@@ -63,7 +63,28 @@ pub enum Error {
     /// The filesystem is corrupt in a way the reader can detect but cannot
     /// repair. Logged with as much context as possible; users should treat
     /// this as a fatal mount error.
+    ///
+    /// **Distinguished from [`Error::Unformatted`]:** `Corrupt` means at
+    /// least one root-pair block has been programmed past the erased
+    /// state but no successfully verified commit can be read. The caller
+    /// should escalate to a recovery path (re-format with backup,
+    /// engineer triage) rather than transparently re-format.
     Corrupt,
+
+    /// The root metadata pair is in its pristine erased state on both
+    /// blocks: every byte reads as `0xFF`. This is exactly how a
+    /// freshly fabricated or recently full-chip-erased NOR flash
+    /// presents. Distinct from [`Error::Corrupt`] (which means the
+    /// blocks have been written but cannot be parsed), and from
+    /// [`Error::NotLittleFs`] (which means the blocks parse cleanly
+    /// but do not advertise the LittleFS magic).
+    ///
+    /// Callers that own the formatting decision (firmware boot path,
+    /// host-side imaging tool) should treat this as a soft signal to
+    /// call [`crate::Fs::format`] before retrying [`crate::Fs::mount`].
+    /// Callers that should never see a fresh chip (recovery code,
+    /// audit-log readers) should escalate.
+    Unformatted,
 
     /// Attempted to remove a directory that still has live entries.
     /// Caller must remove the contents first (or use a recursive
@@ -87,6 +108,7 @@ impl fmt::Display for Error {
             Self::AlreadyExists => "name already exists",
             Self::GeometryMismatch => "storage geometry does not match the superblock",
             Self::Corrupt => "filesystem is corrupt",
+            Self::Unformatted => "root metadata pair is in erased state (device not formatted)",
             Self::NotEmpty => "directory is not empty",
         };
         f.write_str(s)

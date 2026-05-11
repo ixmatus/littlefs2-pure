@@ -410,6 +410,15 @@ fn op_dsize_of(op: &WriteOp<'_>) -> usize {
     }
 }
 
+/// `true` if every byte of `buf` is `0xFF`. This is the erased state
+/// for NOR / NAND flash; both blocks of the root metadata pair in
+/// this condition means the device has never been formatted (versus
+/// "formatted but corrupted", where at least one bit has been
+/// programmed somewhere).
+fn is_all_erased(buf: &[u8]) -> bool {
+    buf.iter().all(|&b| b == 0xFF)
+}
+
 /// `true` if `ancestor` is a *strict* ancestor of `descendant`: every
 /// component of `ancestor` appears as a prefix of `descendant`'s
 /// component sequence, and `descendant` has at least one further
@@ -765,6 +774,58 @@ impl<S: Storage> Fs<S> {
             crate::tag::TagType::InlineStruct => Ok(r.struct_body.len() as u32),
             crate::tag::TagType::CtzStruct => {
                 Ok(crate::ctz::CtzStruct::from_bytes(r.struct_body)?.size)
+            }
+            _ => Err(Error::Corrupt),
+        }
+    }
+
+    /// For a CTZ-backed file, return the number of bytes that can be
+    /// appended to the existing tail block without allocating a new
+    /// one. Lets a write-heavy caller (a log writer batching entries
+    /// at fixed cadence) pack appends so that overflow always arrives
+    /// on a block boundary, minimizing the number of new-block
+    /// allocations.
+    ///
+    /// Returns `0` for inline files (no tail block yet); the next
+    /// append either grows the inline body or triggers the
+    /// inline-to-CTZ transition.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotFound`] if `path` does not exist.
+    /// - [`Error::AlreadyExists`] if `path` resolves to a directory
+    ///   (no tail block concept).
+    /// - [`Error::Corrupt`] for a malformed entry.
+    pub fn tail_room(
+        &mut self,
+        path: crate::path::Path<'_>,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<u32, Error> {
+        use crate::ctz::{
+            block_count, block_index_at_offset, content_bytes_in_block, skip_pointers_in_block,
+            CtzStruct,
+        };
+        let r = self.resolve(path, buf_a, buf_b)?;
+        if r.entry.kind != crate::dir::EntryKind::RegularFile {
+            return Err(Error::AlreadyExists);
+        }
+        match r.struct_type {
+            crate::tag::TagType::InlineStruct => Ok(0),
+            crate::tag::TagType::CtzStruct => {
+                let ctz = CtzStruct::from_bytes(r.struct_body)?;
+                if ctz.size == 0 {
+                    return Ok(0);
+                }
+                let bs = S::BLOCK_SIZE as u32;
+                let n = block_count(ctz.size, bs);
+                let tail_idx = n - 1;
+                let header = 4 * skip_pointers_in_block(tail_idx);
+                let tail_cap = content_bytes_in_block(tail_idx, bs);
+                let (idx_check, abs_off) = block_index_at_offset(ctz.size - 1, bs);
+                debug_assert_eq!(idx_check, tail_idx);
+                let bytes_used = abs_off + 1 - header;
+                Ok(tail_cap - bytes_used)
             }
             _ => Err(Error::Corrupt),
         }
@@ -2130,15 +2191,30 @@ impl<S: Storage> Fs<S> {
     /// [`S::BLOCK_SIZE`](Storage::BLOCK_SIZE) bytes; their previous
     /// contents are overwritten.
     ///
-    /// Returns:
+    /// # Error matrix
     ///
-    /// - [`Error::GeometryMismatch`] if the buffers are the wrong size, or
-    ///   if the on disk superblock's `block_size` or `block_count` does
-    ///   not match the storage trait's advertised values.
-    /// - [`Error::Io`] if the underlying device read failed.
-    /// - The errors documented on [`MetadataPair::parse`] and
-    ///   [`Superblock::from_pair`] when the on disk structures are
-    ///   missing or malformed.
+    /// Mount failures are split into distinct variants so a firmware
+    /// boot path can branch by category. The mapping is intended to be
+    /// strict enough that callers can match exhaustively without a
+    /// catch-all (the [`Error`] type itself is `#[non_exhaustive]`,
+    /// but the variants below are the complete mount-time set as of
+    /// this release):
+    ///
+    /// | Variant | Meaning | Suggested action |
+    /// |---|---|---|
+    /// | [`Error::Io`] | The `storage.read` call failed. | Retry on a transient device fault, or escalate. |
+    /// | [`Error::GeometryMismatch`] | Buffers are the wrong size, **or** the on-disk superblock's `block_size` / `block_count` differs from the [`Storage`] trait's advertised values. | Caller bug (wrong buffer length) or wrong-chip-for-image. Do not auto-format. |
+    /// | [`Error::Unformatted`] | Both blocks of the root pair are pristine `0xFF`. The device has never been programmed (fresh chip, post-full-erase). | Call [`Fs::format`] and retry, *if* the caller owns the formatting decision. |
+    /// | [`Error::Corrupt`] | At least one block has been programmed, but neither block has a successfully verified CCRC commit. Bit rot, torn erase, or third-party-tool damage. | Escalate to a recovery path; do not auto-format. |
+    /// | [`Error::NotLittleFs`] | Both blocks parse cleanly (valid CCRC commits) but the [`crate::MAGIC`] NAME tag is absent. The blocks hold someone else's metadata format. | Escalate; this is the "wrong filesystem on this chip" case. |
+    /// | [`Error::UnsupportedVersion`] | Magic + superblock present, but the version word is newer than this crate. The contained value is the encoded version. | Escalate; cannot read forward-version data safely. |
+    ///
+    /// `Error::Unformatted` versus `Error::Corrupt` is the key
+    /// distinction for production boot logic: an `Unformatted` device
+    /// is the expected first-boot state; a `Corrupt` device is a
+    /// "page the on-call engineer" state. The implementation
+    /// distinguishes them by checking the literal byte content of
+    /// both blocks before parsing.
     pub fn mount(
         mut storage: S,
         block_a_buf: &mut [u8],
@@ -2149,6 +2225,15 @@ impl<S: Storage> Fs<S> {
         }
         storage.read(0, 0, block_a_buf).map_err(|_| Error::Io)?;
         storage.read(1, 0, block_b_buf).map_err(|_| Error::Io)?;
+
+        // Distinguish a fresh / wiped chip from corruption before we
+        // even attempt to parse: both blocks of the root pair sit in
+        // the erased state (every byte `0xFF`) iff nothing has ever
+        // been programmed to them. A real corruption (bit rot, torn
+        // erase, mis-formatted image) flips at least one bit somewhere.
+        if is_all_erased(block_a_buf) && is_all_erased(block_b_buf) {
+            return Err(Error::Unformatted);
+        }
 
         let pair = MetadataPair::parse(
             BlockAddress::new(0),

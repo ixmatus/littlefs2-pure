@@ -158,6 +158,45 @@ fn truncate_path_extends_with_zeros() {
 }
 
 #[test]
+fn tail_room_zero_for_inline_file() {
+    let mut fs = make_fs();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    fs.write_to_path(Path::new("/cfg").unwrap(), b"hello", &mut a, &mut b).unwrap();
+    assert_eq!(fs.tail_room(Path::new("/cfg").unwrap(), &mut a, &mut b).unwrap(), 0);
+}
+
+#[test]
+fn tail_room_reports_remaining_space_in_ctz_tail() {
+    // 200 bytes -> CTZ with one block (block 0, capacity = BLOCK_SIZE = 256).
+    let mut fs = make_fs();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let initial: Vec<u8> = (0..200).map(|i| (i & 0xff) as u8).collect();
+    fs.write_to_path(Path::new("/log").unwrap(), &initial, &mut a, &mut b).unwrap();
+    // Tail (block 0) holds 200 of 256 content bytes; 56 free.
+    assert_eq!(fs.tail_room(Path::new("/log").unwrap(), &mut a, &mut b).unwrap(), 56);
+}
+
+#[test]
+fn tail_room_shrinks_after_streaming_append() {
+    // Confirm tail_room and append_to_path agree on bookkeeping: after
+    // an append, tail_room decreases by exactly the bytes that fit in
+    // the previous tail.
+    let mut fs = make_fs();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let initial: Vec<u8> = (0..200).map(|i| (i & 0xff) as u8).collect();
+    fs.write_to_path(Path::new("/log").unwrap(), &initial, &mut a, &mut b).unwrap();
+    let room_before = fs.tail_room(Path::new("/log").unwrap(), &mut a, &mut b).unwrap();
+    // Append 16 bytes that fit entirely in the tail.
+    fs.append_to_path(Path::new("/log").unwrap(), b"0123456789ABCDEF", &mut [], &mut a, &mut b)
+        .unwrap();
+    let room_after = fs.tail_room(Path::new("/log").unwrap(), &mut a, &mut b).unwrap();
+    assert_eq!(room_after, room_before - 16);
+}
+
+#[test]
 fn truncate_path_to_zero() {
     // truncate(0) effectively clears the file. Useful for "open with
     // truncate" semantics.
