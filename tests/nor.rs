@@ -84,3 +84,56 @@ fn updates_and_compaction_through_nor_wrapper() {
     let r = fs.resolve(Path::new("/cfg").unwrap(), &mut a, &mut b).unwrap();
     assert_eq!(r.struct_body, &final_content[..]);
 }
+
+#[test]
+fn ctz_streaming_append_through_nor_wrapper() {
+    // The SMIL audit-logger workload: many small appends to a CTZ
+    // file. The streaming path programs sub-block windows of the
+    // tail; strict NOR semantics (PROG_SIZE-aligned, 1->0 only) must
+    // hold for every program, otherwise StrictNorStorage panics.
+    let mut storage = make_wrapped();
+    let mut scratch = [0u8; StrictNorStorage::BLOCK_SIZE];
+    Fs::format(&mut storage, &mut scratch).unwrap();
+    storage.sync().unwrap();
+
+    let mut all_bytes: Vec<u8> = Vec::new();
+    {
+        let mut buf_a = [0u8; StrictNorStorage::BLOCK_SIZE];
+        let mut buf_b = [0u8; StrictNorStorage::BLOCK_SIZE];
+        let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+        let mut a = [0u8; StrictNorStorage::BLOCK_SIZE];
+        let mut b = [0u8; StrictNorStorage::BLOCK_SIZE];
+
+        // Seed with enough to be CTZ.
+        let seed: Vec<u8> = (0..160).map(|i| (i & 0xff) as u8).collect();
+        fs.write_to_path(Path::new("/log").unwrap(), &seed, &mut a, &mut b).unwrap();
+        all_bytes.extend_from_slice(&seed);
+
+        // 20 sub-block appends; each is a NOR sub-window program.
+        for i in 0..20u32 {
+            let entry = format!("e{i:03};");
+            fs.append_to_path(
+                Path::new("/log").unwrap(),
+                entry.as_bytes(),
+                &mut [],
+                &mut a,
+                &mut b,
+            )
+            .unwrap();
+            all_bytes.extend_from_slice(entry.as_bytes());
+        }
+        fs.storage_mut().sync().unwrap();
+        storage = fs.into_storage();
+    }
+
+    // Remount and read back.
+    let mut buf_a = [0u8; StrictNorStorage::BLOCK_SIZE];
+    let mut buf_b = [0u8; StrictNorStorage::BLOCK_SIZE];
+    let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+    let mut a = [0u8; StrictNorStorage::BLOCK_SIZE];
+    let mut b = [0u8; StrictNorStorage::BLOCK_SIZE];
+    let mut out = vec![0u8; all_bytes.len()];
+    let n = fs.read_at_path(Path::new("/log").unwrap(), 0, &mut out, &mut a, &mut b).unwrap();
+    assert_eq!(n, all_bytes.len());
+    assert_eq!(out, all_bytes);
+}
