@@ -9,6 +9,39 @@ littlefs2-pure = "0.3"
 
 License: MIT OR Apache-2.0. MSRV: Rust 1.84.
 
+## How littlefs2-pure is developed
+
+This is an open disclosure of the development process so users can judge for themselves whether the resulting code meets their bar.
+
+**Authorship and collaboration.** Parnell Springmeyer is the author of record. littlefs2-pure is developed in collaboration with Claude, an AI coding agent from Anthropic. Parnell owns
+architecture, acceptance criteria, test and verification strategy, and release boundaries. Claude drafts the implementation, writes and runs tests and verification harnesses, and produces
+analysis under that direction. **Parnell does not review the generated code line by line.** Human oversight operates at the level of design, strategy, and outcomes: does the architecture make
+sense, are the right invariants being checked, does the verification strategy cover the risk surface, do the tests and proofs pass. Merges to main are GPG signed by Parnell to attest to that
+level of review, not to an audit of every line.
+
+**Provenance.** Implementations derive from primary sources: the littlefs on disk format specification and the published design notes on power loss safety, dynamic wear leveling, and copy on
+write metadata. The agent is instructed to cite recalled sources rather than reproduce verbatim, to surface provenance uncertainty rather than hide it, and to choose surface forms (identifiers,
+helper decomposition, file layout) fresh for idiomatic Rust rather than copying from the upstream C reference (`BSD-3-Clause`), which serves as the oracle for on disk byte for byte compatibility.
+These are instructions to the agent, not guarantees about every line of output. A verbatim reproduction or an unflagged derivation could slip through. The project's defense against that is the
+instruction discipline above plus the human reviewer's ability to notice architectural smells that suggest a problem upstream, not a clean room audit. Where derivation from licensed source did
+occur, attribution and license text are preserved. If you spot a passage that reads like a copy from a source it should not be copied from, please open an issue.
+
+**Verification.** The verification posture places correctness in the type system where it can (typestate for mount and handle lifecycle, capability separation between read only and read write
+paths, newtypes that prevent address and offset confusion at the boundary), in property tests over the file operation algebra, in example tests for known on disk images and edge cases, and in
+crash simulation that cuts writes at block boundaries to check that the filesystem mounts and recovers. CI runs the usual lints and the full test suite; specific test counts and on disk
+compatibility coverage change as the project evolves. Significant decisions are recorded as ADRs in the repo. `unsafe` blocks carry a written justification at the call site.
+
+**Scope and threat model.** littlefs2-pure is a personal project. The intended use is flash backed storage on microcontrollers; durability and quality are goals, but this is not a funded library
+with a maintenance team behind it. The threat model assumes an honest block device but a hostile power supply: every write can be interrupted, every block can be partially programmed, and a mount
+after a crash is designed to converge on a consistent filesystem or report failure cleanly. The published versions on crates.io are yanked; the repository remains public for users who want to
+read or fork the work.
+
+**What this does not promise.** AI collaboration does not transfer responsibility. The author is accountable for what ships under his name. The disciplines above narrow the failure surface; they
+do not eliminate it. In particular, this process is most exposed to subtle bugs that a careful human reading of the code would catch but tests, types, and crash simulation would not. For a
+power-loss-safe filesystem that specifically includes crash sequences the simulation did not generate, or on-disk format drift from the upstream C reference that byte-level tests did not catch.
+Issues are welcome and will be triaged as time allows; no SLA is offered. This README describes the project's development process and is not a warranty; see the LICENSE file for the legal terms
+governing use.
+
 ## Status
 
 The kernel implements the complete v2 spec surface. The original v1.0 / v1.1 / v1.2 / `File` punch list against the spec is closed; mount-time orphan recovery for half-completed wear-levelling relocations landed in v0.3.0 with torn-write coverage across every program-call boundary. One infrastructure item remains before a stable v1.0: a `cargo kani --features kani` job in CI (harnesses are ready; needs Kani on hosted runners). Track [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the short list still pending v1.0; [`CHANGELOG.md`](CHANGELOG.md) for the per-release record.
