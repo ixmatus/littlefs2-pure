@@ -4,6 +4,77 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Added (v1.0 finalize)
+
+- **`Fs::sync`.** Routine durability gate; equivalent to
+  `self.storage_mut().sync()` but exposed on `Fs` for callers that
+  do not want to reach through the storage accessor. Every public
+  mutation already syncs as its final step, so `sync()` is only
+  needed when the caller mixed direct storage programs with `Fs`
+  calls or wants an explicit checkpoint between mutations.
+- **User attributes (`Fs::set_attr`, `Fs::get_attr`,
+  `Fs::remove_attr`).** LittleFS lets each entry carry up to 256
+  arbitrary key-value pairs (`UserAttr(attr_id)` tags). Latest tag
+  wins at read time; remove emits a delete-marker tag with the
+  length sentinel. Values capped at `0x3FE` bytes. Eight new
+  integration tests cover set, get-missing, replace, remove,
+  distinct-ids-independent, missing-file rejection, oversize
+  rejection, remount survival.
+- **Power-loss safety scenarios
+  (`tests/power_loss.rs`, `TornWriteStorage`).** New storage
+  adapter that simulates power-off at a configurable program-call
+  boundary. Two scenarios — inline write and CTZ streaming append
+  — assert the v1.0 invariant: a torn write at any program-call
+  boundary leaves the FS mountable as either the pre-state or the
+  post-state, never a corrupt mid-state. Verified across every
+  program-call boundary in each scenario (small bounded sweep).
+  Companions the Kani `commit_proofs` and the `fuzz/` parser
+  totality work: those cover the spec; this covers the kernel's
+  write-ordering contract.
+- **Round-trip conformance against the C reference
+  (`tests/roundtrip.rs`, `tools/verify_image/`).** New verifier
+  binary that mounts an image produced by this crate's writer
+  through C littlefs and asserts expected file contents. Three
+  scenarios — inline, CTZ, nested dir — pass cleanly. Combined
+  with the existing C-to-Rust direction in `tests/conformance.rs`,
+  the bit-accuracy claim is now bidirectional: byte for byte, what
+  we write the C reference can read, and what the C reference
+  writes we can read. The verifier binary is built via
+  `make -C tools/verify_image`; tests skip gracefully if the
+  binary is missing.
+- **GitHub Actions CI (`.github/workflows/ci.yml`).** Workflow
+  matrix: rustfmt check, clippy `-D warnings`, host `cargo test`,
+  `cargo doc --no-deps`, `--no-default-features` build, three ARM
+  cross-compile targets (thumbv6m, thumbv8m, thumbv8m-hf), the
+  C-to-Rust conformance suite, and the C-from-Rust round-trip
+  suite (which builds the verifier binary before testing). Mirrors
+  the local pre-commit gate.
+- **LICENSE-MIT and LICENSE-APACHE text files.** The workspace
+  already declared `MIT OR Apache-2.0`; this commit ships the
+  actual license text so a published crate or downstream
+  distribution can include the canonical files.
+- **Public API doc-comment pass.** `cargo doc --no-deps` is now
+  warning-free: stale intra-doc links (`Fs`, `S::BLOCK_SIZE`,
+  `ctz::read_ctz`, `Commit::done`, redundant explicit targets in
+  `path` module) all repaired.
+
+### Documented but deferred
+
+- **Wear leveling via pair relocation** stays on the v1.1 punch
+  list. Within-pair wear distribution already happens naturally
+  via compaction-on-fill (which alternates active and alternate);
+  pair-level relocation to fresh blocks requires tracking parent
+  references back to the DirStruct/HardTail that points at a pair,
+  which is substantial infrastructure. Documented in
+  `KNOWN_ISSUES.md`.
+- **Atomic move state recovery** stays on the v1.1 punch list.
+  Cross-directory rename remains "re-run to converge" after a
+  power-loss between the destination Create and the source Delete.
+  The proper fix (XOR-accumulated gstate tag across every metadata
+  pair, mount-time BFS to recover) is a multi-hour effort; SMIL
+  has no cross-dir use case so the current behavior is acceptable
+  for v1.0. Documented in `KNOWN_ISSUES.md`.
+
 ### Added
 
 - **Kani proof harnesses (Phase 3).** New `src/verify/` module, gated

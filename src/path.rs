@@ -1,6 +1,6 @@
 //! A fixed capacity, validated path type.
 //!
-//! LittleFS limits path components to [`NAME_MAX`](crate::NAME_MAX) = 255
+//! LittleFS limits path components to [`crate::NAME_MAX`] = 255
 //! bytes. This module exposes:
 //!
 //! - [`Path`]: a borrowed slice of bytes that has been validated to contain
@@ -14,7 +14,7 @@
 //! - The path must not be empty.
 //! - The path must not exceed [`MAX_PATH`].
 //! - Individual components (between `/` separators) must not exceed
-//!   [`NAME_MAX`](crate::NAME_MAX) bytes.
+//!   [`crate::NAME_MAX`] bytes.
 //! - Components must not be `.` or `..`. LittleFS does not interpret these
 //!   specially and would create literal entries with those names; the crate
 //!   rejects them at the boundary to prevent confusion.
