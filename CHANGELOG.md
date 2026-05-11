@@ -4,6 +4,14 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-05-11
+
+First crates.io release. The kernel implements the complete LittleFS v2 surface (mount, format, full path resolution, inline and CTZ read/write, streaming append, mkdir / rmdir / rename, user attributes, atomic cross-directory rename with mount-time gstate recovery, and compact-time inter-pair wear levelling). Bit accuracy against the C reference is verified in both directions.
+
+The version stays in `0.x` because the surface is not yet frozen: a stateful `File<'fs, S>` handle is the one remaining user-visible item before v1.0, plus the API-freeze pass. See `KNOWN_ISSUES.md` for the short list still pending v1.0.
+
+All entries below shipped in this initial release; future releases will appear above this section.
+
 ### Added (v1.2 hardening)
 
 - **Inter-pair wear levelling via compact-time pair relocation.**
