@@ -134,6 +134,18 @@ impl<'a> MetadataReader<'a> {
             ptag = decoded;
 
             if tag.is_ccrc() {
+                // A CCRC body MUST be exactly 4 bytes (the LE-encoded
+                // running CRC). Wire-legal tag encodings allow any
+                // body_len (including 0 via the special-length
+                // sentinel, or > 4 for padded commits via FCRC), so
+                // an adversarial / torn block could land a CCRC type
+                // tag with a shorter body. Reject before indexing —
+                // the line-130 `dsize` bounds check only guarantees
+                // the declared body fits, not that there are 4 bytes
+                // available for our CRC read.
+                if tag.body_len() < 4 {
+                    break;
+                }
                 // Stored CRC value is the 4 byte body, little endian.
                 let body_start = off + 4;
                 let stored = u32::from_le_bytes([
@@ -958,6 +970,34 @@ mod tests {
     /// Two successive finish_padded calls in the same block: the
     /// second commit starts at the prog-aligned offset the first
     /// padded out to. Both commits round-trip.
+    /// Regression: a wire-legal CCRC tag with `body_len < 4` (e.g.,
+    /// the special-length sentinel that decodes to body_len = 0, or
+    /// a malformed body_len = 1..=3 from a torn or adversarial
+    /// write) must not panic the reader. The walker now rejects
+    /// such a tag at the commit boundary before indexing past the
+    /// declared body. Caught by `commit_proofs::metadata_reader_
+    /// does_not_panic_on_arbitrary_input` (Kani).
+    #[test]
+    fn ccrc_with_short_body_does_not_panic_and_rejects_commit() {
+        // Forge a CCRC at the very end of an 8-byte block claiming
+        // body_len = 0 via the special-length sentinel (0x3FF). The
+        // tag's dsize is 4, so the line-130 outer-bounds check
+        // passes, but indexing body_start..body_start+4 would read
+        // past the block without the line-136 length check.
+        let mut block = [0xFFu8; 8];
+        block[0..4].copy_from_slice(&7u32.to_le_bytes());
+        // CCRC chunk=0, id=ID_NONE, length=LEN_SPECIAL=0x3FF =>
+        // body_len = 0. Tag's raw bits are XORed with the initial
+        // ptag (0xFFFF_FFFF) to mirror the on-disk encoding.
+        let ccrc = Tag::new(true, TagType::CommitCrc(0), ID_NONE, 0x3FF);
+        let raw = ccrc.into_bits() ^ 0xFFFF_FFFFu32;
+        block[4..8].copy_from_slice(&raw.to_be_bytes());
+
+        // Must not panic; must not advance committed_end.
+        let r = MetadataReader::new(&block).unwrap();
+        assert_eq!(r.committed_end(), 0, "malformed CCRC must be rejected before commit");
+    }
+
     #[test]
     fn two_padded_commits_chain_correctly() {
         let mut buf = [0xFFu8; 256];

@@ -44,7 +44,7 @@ governing use.
 
 ## Status
 
-The kernel implements the complete v2 spec surface. The original v1.0 / v1.1 / v1.2 / `File` punch list against the spec is closed; mount-time orphan recovery for half-completed wear-levelling relocations landed in v0.3.0 with torn-write coverage across every program-call boundary. One infrastructure item remains before a stable v1.0: a `cargo kani --features kani` job in CI (harnesses are ready; needs Kani on hosted runners). Track [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the short list still pending v1.0; [`CHANGELOG.md`](CHANGELOG.md) for the per-release record.
+The kernel implements the complete v2 spec surface. The v1.0 / v1.1 / v1.2 / `File` / Kani-in-CI punch list is closed; every item in [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)'s "outstanding before v1.0" section is shipped. v1.0 is on deck pending an API-freeze pass and a soak interval. The Kani sweep landing in v0.3.1 caught a real panic-on-adversarial-input bug in `MetadataReader::new`; details in [`CHANGELOG.md`](CHANGELOG.md).
 
 Verification posture (see [ADR-0003](docs/decisions/0003-verification-stacks.md)):
 

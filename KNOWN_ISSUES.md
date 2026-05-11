@@ -71,7 +71,7 @@ The v1.0 / v1.1 / v1.2 punch list against the LittleFS v2 spec is complete. What
 None of these are correctness blockers.
 
 - [x] **Stateful `File<'fs, S>` handle** with `open / read / write / seek / sync / set_len`. Batches many writes into a single `UpdateCtz` commit at sync time. CTZ-backed regular files (and missing-with-`create` and truncated-to-empty files); inline files are rejected with a typed error so the path-based API stays the right tool for small upserts. Random in-place writes (cursor `!=` size) are out of scope and return [`Error::OutOfRange`]. Drop discards uncommitted writes (the chain blocks become orphan and are reclaimed by the next allocator scan; no corruption).
-- [ ] **`cargo kani --features kani` job in CI** (gated on Kani availability on GitHub Actions hosted runners). Harnesses are in place under `src/verify/`; CI integration is a future enhancement.
+- [x] **`cargo kani --features kani` job in CI** (v0.3.1). All 17 `#[kani::proof]` harnesses under `src/verify/` discharge through the `model-checking/kani-github-action@v1` action. The two `commit_proofs::metadata_reader_*` harnesses stub `crc::update` to keep CBMC tractable (CRC correctness is verified separately in `crc_proofs`) and use explicit `#[kani::unwind]` bounds. The harness sweep caught a real panic-on-adversarial-input bug in `MetadataReader::new` (CCRC with `body_len < 4`); fixed in v0.3.1 with a regression test pinned in `src/meta.rs`.
 
 ## Out of scope
 
