@@ -48,9 +48,9 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 - [x] `read_at_path` / `size_of` (offset-aware random read; works for inline + CTZ). (Phase 2g.3)
 - [x] `truncate_path` (shrink or zero-extend a file via atomic rewrite). (Phase 2g.4)
 - [x] `rename` within the same directory. (`src/fs.rs::rename_in_dir`, Phase 2g.2)
-- [ ] Cross-directory rename (move an entry from one directory to another). Needs Delete-from-source + Create-in-destination with proper splice handling. (Phase 2g.5)
+- [x] Cross-directory rename (`Fs::rename`). Issues a `Create` in the destination parent followed by a `Delete` in the source parent; preserves the entry's struct body so CTZ chains and child directory pairs stay in place. Rejects ancestor-cycle moves (`old` is a strict ancestor of `new`). (Phase 2g.5)
 - [ ] User attribute write.
-- [ ] Atomic move state recovery.
+- [ ] Atomic move state recovery. The C reference emits a `MoveState` tag alongside the destination Create so an interrupt between the two cross-directory commits can be completed (or rolled back) on the next mount. Without it, an interrupt leaves the entry visible in both directories; re-running `rename` converges. (Phase 3 hardening)
 
 ## Hardening (Phase 3)
 

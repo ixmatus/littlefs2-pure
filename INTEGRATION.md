@@ -24,9 +24,10 @@ This file points downstream consumers (SMIL firmware, etc.) at the relevant entr
 | Truncate / extend | `Fs::truncate_path(path, new_size, content_scratch, ...)` | Shrink drops trailing bytes; extend zero-pads |
 | Remove a file at path | `Fs::remove_at_path(path, ...)` | Rejects directories; use `rmdir` instead |
 | Remove empty directory | `Fs::rmdir(path, ...)` | Errors with `NotEmpty` if the dir has contents |
-| Rename within same directory | `Fs::rename_in_dir(old_path, new_path, ...)` | Same parent required; cross-dir is a future enhancement |
-| List a directory | `Fs::list_dir(path, callback, ...)` | Splice-correct, skips superblock; single-pair only (no HardTail chasing yet) |
-| List root directory | `Fs::list_root(callback, ...)` | Skips the superblock; renumbers across splice |
+| Rename within same directory | `Fs::rename_in_dir(old_path, new_path, ...)` | Same-parent only; appends a NAME tag at the existing id |
+| Rename across directories | `Fs::rename(old_path, new_path, ...)` | Same-parent fast path delegates to `rename_in_dir`; cross-parent is Create-in-dst then Delete-in-src |
+| List a directory | `Fs::list_dir(path, callback, ...)` | Splice-correct; chases HardTails through up to 32 continuation pairs |
+| List root directory | `Fs::list_root(callback, ...)` | Splice-correct; chases HardTails through up to 32 continuation pairs |
 | NOR-aligned program wrapper | `NorAlignedStorage::new(your_storage)` | Caches programs to `PROG_SIZE` windows |
 
 ## What's not yet supported
@@ -34,8 +35,8 @@ This file points downstream consumers (SMIL firmware, etc.) at the relevant entr
 | Capability | Tracking |
 |---|---|
 | Stateful `File<'fs, S>` handle with `open / read / write / seek / set_len / sync` | Phase 2f.2 remaining (the existing `append_to_path` + `read_at_path` + `truncate_path` together cover the common cases atomically; a stateful handle would batch multiple writes into a single metadata commit) |
-| Cross-directory rename | Phase 2g.5 (same-directory rename is shipped) |
-| Multi-pair directory listing (HardTail chasing in `list_dir`) | Phase 2g.5 |
+| Atomic move state recovery (no in-flight move can become visible in two places after a power loss) | Phase 3 hardening |
+| User attributes (read + write) | Phase 2+ follow-up |
 | Power-loss fuzz / Kani harnesses | Phase 3 |
 
 For the SMIL audit logger specifically: `create_dir`, `File::write` with append/truncate, `File::seek`, and `set_len` all map to Phases 2c–2f. The current write surface is sufficient for the audit logger's log-style workload: `append_to_path` is streaming for CTZ files (the common case once the file outgrows `INLINE_MAX = 128`), so write amplification per append is bounded by `additional.len() + one block per ~block_size of overflow` rather than scaling with the file size.
