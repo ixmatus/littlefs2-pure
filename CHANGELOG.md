@@ -6,6 +6,31 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ### Added
 
+- **FCRC commit redundancy (Phase 2g.7).** Every metadata commit
+  emitted by `Fs` now carries a Forward CRC tag describing the
+  expected post-erase content of the next program window, plus a
+  prog-aligned CCRC body. Mirrors `lfs_dir_commitcrc` in the C
+  reference (`lfs.c:1641`). The combination lets a reader detect
+  torn writes that landed past the CCRC even when the partial
+  write's bits happened to satisfy a CRC check. Existing commits
+  remain readable; FCRC is purely additive on disk. New API:
+  `meta::Commit::finish_padded(chunk, prog_size, block_size)`;
+  legacy `Commit::finish(chunk)` retained for synthetic-block test
+  fixtures and unit tests.
+- **Conformance harness against the C reference (Phase 3
+  beachhead).** New `tools/gen_vectors/` directory containing a
+  vendored copy of the C littlefs source (BSD-3, pinned at
+  `LFS_DISK_VERSION = 0x00020001`, matching this crate) and a small
+  C driver that produces baseline disk images. The Makefile target
+  `make vectors` runs four scenarios (empty format, single inline
+  file, single CTZ file, nested directory) and writes the resulting
+  binary images to `tests/vectors/`. Five new integration tests in
+  `tests/conformance.rs` load each committed vector, mount with our
+  reader, and assert the expected `(name, kind, content)` tuples.
+  Bit-level cross check against the spec oracle rather than against
+  ourselves; previously the bit-accuracy claim was "round-trips
+  through our own reader." CI consumes the committed binaries, so
+  no host C toolchain is required on builders.
 - **`Error::Unformatted`.** New variant distinguishing a pristine
   (every byte `0xFF`) root pair from a programmed-but-unparseable
   one. `Fs::mount` now returns `Unformatted` for a fresh chip and
