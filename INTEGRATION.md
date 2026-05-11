@@ -43,7 +43,6 @@ The kernel uses the `Storage::BLOCK_CYCLES` constant for inter-pair wear distrib
 | Capability | Tracking |
 |---|---|
 | HardTail-chain pair relocation | Structurally unreachable through this writer (we don't emit `HardTail` tags). |
-| Kani-in-CI integration | Harnesses are ready under `src/verify/`; CI integration awaits hosted-runner Kani availability. |
 | Random in-place writes through `File::write` (writes at cursor `!=` size) | Out of scope for the streaming handle. Rewrite the file via `Fs::write_to_path` or shrink with `File::set_len` first. |
 
 ## Suggested integration steps
@@ -190,5 +189,6 @@ The torn-write scenarios in `tests/power_loss.rs` exercise every program-call bo
 | Atomic move state | `tests/atomic_move.rs` sweeps the same `TornWriteStorage` across every program-call boundary in cross-dir rename; mount-time recovery converges |
 | Wear levelling | `tests/wear_leveling.rs`: root never relocates; subdir pair relocates after `BLOCK_CYCLES` boundary; data survives remount; nested relocation propagates through grandparent; **torn-write atomicity across every program-call boundary** (orphan recovery cancels half-completed cycles) |
 | Parser totality | `fuzz/` crate (libFuzzer, nightly-only) covers `MetadataReader::new`, `Tag::from_bits`, `Path::new`, `Superblock::from_bytes`, `CtzStruct::from_bytes` |
+| Formal verification (`cargo kani`) | All 17 `#[kani::proof]` harnesses under `src/verify/` run as a CI job via `model-checking/kani-github-action@v1`. Coverage: tag classification dispatch totality, table-CRC vs bitwise-reference equivalence, revision-counter signed compare (wrap-aware), and `MetadataReader::new` panic-freedom on adversarial bytes (with `crc::update` stubbed in the reader harnesses for CBMC tractability; CRC correctness is proved separately) |
 
 The bit-accuracy claim against the C reference is now bidirectional: byte for byte, what we write the C reference can read (`tests/roundtrip.rs`), and what the C reference writes we can read (`tests/conformance.rs`).

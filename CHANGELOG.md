@@ -4,6 +4,58 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-11
+
+### Security
+
+- **Fix panic-on-adversarial-input in `MetadataReader::new`.** A
+  wire-legal CCRC tag with `body_len < 4` (e.g., the
+  special-length sentinel that decodes to `body_len = 0`, or a
+  malformed 1..=3 length from a torn or attacker-controlled
+  write) made the walker index past `block.len()` when reading
+  the 4-byte CCRC body. The line-130 outer-bounds check verified
+  `off + dsize() <= block.len()` but `dsize() = 4 + body_len`,
+  so a CCRC with declared body_len < 4 slipped through and
+  triggered an index-out-of-bounds panic in the LE-u32 decode.
+  The fix rejects the commit at the CCRC boundary before
+  indexing. Mount on a torn or adversarial pair now cleanly
+  returns the previous commit boundary (or `Error::Corrupt` if
+  no commit had verified) instead of panicking. Caught by the
+  new Kani harness sweep against arbitrary 16- and 32-byte
+  blocks; regression-pinned by
+  `meta::tests::ccrc_with_short_body_does_not_panic_and_rejects_commit`.
+
+### Added
+
+- **`cargo kani --features kani` job in CI.** All 17
+  [`#[kani::proof]`] harnesses under [`src/verify/`] discharge in
+  the `kani` workflow job via the official
+  `model-checking/kani-github-action@v1` action. Closes the last
+  infrastructure item on the v1.0 punch list. Per-harness
+  timeout 180s; the slowest harness
+  (`commit_proofs::metadata_reader_does_not_panic_on_arbitrary_input`)
+  runs ~90s. The kani job is not in the required-checks list
+  yet because Kani's toolchain pinning can lag stable Rust;
+  flagging regressions here is more useful than blocking
+  unrelated PRs on a Kani-toolchain mismatch.
+
+### Changed
+
+- **`commit_proofs::metadata_reader_*` harnesses stub `crc::update`.**
+  Without the stub, CBMC unwinds the CRC byte-loop combinatorially
+  across every reachable reader path, exhausting the solver
+  budget. The harnesses' property is panic-freedom on adversarial
+  bytes, not CRC correctness; CRC correctness is verified
+  separately in `crc_proofs` against the bit-by-bit reference.
+  Stubbing `crc::update` with `kani::any() -> u32` is sound for
+  this property because the reader must reject *every* path. The
+  three harnesses now also carry explicit `#[kani::unwind(N)]`
+  bounds (N = `block.len() + 1`) so CBMC's symbolic unwinding
+  terminates.
+
+[`#[kani::proof]`]: https://model-checking.github.io/kani/tutorial-first-steps.html
+[`src/verify/`]: src/verify/
+
 ## [0.3.0] - 2026-05-11
 
 ### Added
