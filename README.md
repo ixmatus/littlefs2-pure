@@ -4,14 +4,14 @@ A pure Rust, `no_std`, no-allocator implementation of the [LittleFS v2 on-disk f
 
 ```toml
 [dependencies]
-littlefs2-pure = "0.1"
+littlefs2-pure = "0.3"
 ```
 
 License: MIT OR Apache-2.0. MSRV: Rust 1.84.
 
 ## Status
 
-The kernel implements the complete v2 spec surface. The original v1.0 / v1.1 / v1.2 / `File` punch list against the spec is closed. Two infrastructure items remain before a stable v1.0: mount-time orphan recovery for half-completed wear-levelling relocations (benign miss; the alternate write is the durability boundary) and a `cargo kani --features kani` job in CI (harnesses are ready; needs Kani on hosted runners). Track [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the short list still pending v1.0; [`CHANGELOG.md`](CHANGELOG.md) for the per-release record.
+The kernel implements the complete v2 spec surface. The original v1.0 / v1.1 / v1.2 / `File` punch list against the spec is closed; mount-time orphan recovery for half-completed wear-levelling relocations landed in v0.3.0 with torn-write coverage across every program-call boundary. One infrastructure item remains before a stable v1.0: a `cargo kani --features kani` job in CI (harnesses are ready; needs Kani on hosted runners). Track [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the short list still pending v1.0; [`CHANGELOG.md`](CHANGELOG.md) for the per-release record.
 
 Verification posture (see [ADR-0003](docs/decisions/0003-verification-stacks.md)):
 
@@ -21,7 +21,7 @@ Verification posture (see [ADR-0003](docs/decisions/0003-verification-stacks.md)
 | Property tests (`proptest`) | CRC, tag bit layout, CTZ geometry, metadata commit round-trip. |
 | Conformance (C → Rust) | Mount C-littlefs-written images; assert expected entries. |
 | Conformance (Rust → C) | Mount Rust-written images through a C verifier; assert expected content. |
-| Power-loss sweep | `TornWriteStorage` across every program-call boundary in inline write, CTZ streaming append, cross-dir rename. |
+| Power-loss sweep | `TornWriteStorage` / `TornWearStorage` across every program-call boundary in inline write, CTZ streaming append, cross-dir rename, and wear-level pair relocation. |
 | Kani harnesses | `Tag::from_bits` totality, `crc::update` vs bitwise reference, `rev_scmp` wrap-aware compare, `MetadataReader::new` panic-freedom. |
 | libFuzzer (`fuzz/`) | Parser totality on adversarial bytes for tag, path, superblock, CTZ struct, metadata reader. |
 

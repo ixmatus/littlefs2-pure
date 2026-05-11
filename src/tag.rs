@@ -156,6 +156,13 @@ pub enum TagType {
     // ---- Globals (0x7xx) ----
     /// Global move state, `LFS2_TYPE_MOVESTATE = 0x7ff`.
     MoveState,
+    /// Global pair-relocation state (crate-specific extension at the
+    /// unused `0x7fe` slot in the Globals abstract type). Carries a
+    /// 16-byte body encoding `(old_pair, new_pair)` for mount-time
+    /// recovery of half-completed wear-levelling relocations.
+    /// C littlefs readers see this as an unknown tag and skip it per
+    /// the spec's forward-compat rule.
+    RelocateState,
 
     /// A tag whose 11 bit type field did not match any known variant. The
     /// raw type bits are preserved for inspection.
@@ -195,6 +202,7 @@ impl TagType {
             (0x6, 0x00) => Self::SoftTail,
             (0x6, 0x01) => Self::HardTail,
             (0x7, 0xff) => Self::MoveState,
+            (0x7, 0xfe) => Self::RelocateState,
             (a, c) => Self::Unknown { abstract_type: a, chunk: c },
         }
     }
@@ -223,6 +231,7 @@ impl TagType {
             Self::SoftTail => (0x6, 0x00),
             Self::HardTail => (0x6, 0x01),
             Self::MoveState => (0x7, 0xff),
+            Self::RelocateState => (0x7, 0xfe),
             Self::Unknown { abstract_type, chunk } => (abstract_type, chunk),
         };
         ((abstract_type as u16) << 8) | (chunk as u16)

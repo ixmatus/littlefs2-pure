@@ -232,6 +232,10 @@ pub(crate) enum WriteOp<'a> {
     /// `DirStruct` reference is flipped to the new address through
     /// this op so the swap is atomic at the parent's commit boundary.
     UpdateDirStruct { id: u16, new_pair: BlockPair },
+    /// No user-visible change. Used by mount-time recovery to emit a
+    /// commit carrying only gstate tags (a balancing `MoveState` or
+    /// `RelocateState`) plus the CCRC.
+    Noop,
 }
 
 /// Emit the tags for a [`WriteOp`] to an in-progress commit.
@@ -296,6 +300,7 @@ fn emit_op(commit: &mut crate::meta::Commit<'_>, op: &WriteOp<'_>) -> Result<(),
             body[4..8].copy_from_slice(&new_pair.b.as_u32().to_le_bytes());
             commit.tag(Tag::new(true, TagType::DirStruct, id, 8), &body)?;
         }
+        WriteOp::Noop => {}
     }
     Ok(())
 }
@@ -316,6 +321,7 @@ fn build_compact_commit(
     prog_size: usize,
     block_size: usize,
     move_state: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
+    relocate_state: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
 ) -> Result<usize, Error> {
     use crate::tag::TagType;
 
@@ -474,6 +480,19 @@ fn build_compact_commit(
             )?;
         }
     }
+    if let Some(body) = relocate_state {
+        if body != [0u8; crate::gstate::RELOCATE_STATE_BODY_SIZE] {
+            commit.tag(
+                crate::tag::Tag::new(
+                    true,
+                    TagType::RelocateState,
+                    crate::tag::ID_NONE,
+                    crate::gstate::RELOCATE_STATE_BODY_SIZE as u16,
+                ),
+                &body,
+            )?;
+        }
+    }
     commit.finish_padded(0, prog_size, block_size)?;
     Ok(commit.bytes_written())
 }
@@ -510,36 +529,46 @@ fn accumulate_gstate<S: Storage>(
         let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
 
         gstate.xor_body(&scan_pair_move_state(&pair));
+        gstate.xor_relocate_body(&scan_pair_relocate_state(&pair));
 
-        for entry in pair.reader.iter_tags() {
-            match entry.tag.tag_type() {
-                crate::tag::TagType::HardTail
-                | crate::tag::TagType::SoftTail
-                | crate::tag::TagType::DirStruct
-                    if entry.body.len() == 8 =>
-                {
-                    let a = u32::from_le_bytes([
-                        entry.body[0],
-                        entry.body[1],
-                        entry.body[2],
-                        entry.body[3],
-                    ]);
-                    let b = u32::from_le_bytes([
-                        entry.body[4],
-                        entry.body[5],
-                        entry.body[6],
-                        entry.body[7],
-                    ]);
-                    let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
-                    if !queue[..tail].contains(&child) {
-                        if tail >= crate::alloc::MAX_QUEUED_PAIRS {
-                            return Err(Error::OutOfRange);
-                        }
-                        queue[tail] = child;
-                        tail += 1;
-                    }
+        // Walk live entries (splice-correct, latest-tag-wins) so we
+        // only enqueue the AUTHORITATIVE child pair for each id, not
+        // every superseded `UpdateDirStruct` tag in the log. Visiting
+        // stale historical pairs would read garbage (their blocks
+        // have been reused for other purposes) and pollute the
+        // gstate accumulation.
+        let active_is_a = pair.active_block == pair_addr.a;
+        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+        let count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
+        let source_buf: &[u8] = if active_is_a { &*buf_a } else { &*buf_b };
+        // Tail tags (HardTail, SoftTail) follow the pair's own thread
+        // and don't multiplex into the live-entries view; enqueue the
+        // latest tail just like the read-side resolver does.
+        if let Some(tail_pair) = pair.reader.tail() {
+            if !queue[..tail].contains(&tail_pair) {
+                if tail >= crate::alloc::MAX_QUEUED_PAIRS {
+                    return Err(Error::OutOfRange);
                 }
-                _ => {}
+                queue[tail] = tail_pair;
+                tail += 1;
+            }
+        }
+        for slot in slots.iter().take(count) {
+            // struct_kind 2 == DirStruct (per gather_live_slots's
+            // encoding); body is 8 bytes encoding the child pair.
+            if slot.struct_kind == 2 && slot.struct_len == 8 {
+                let start = slot.struct_off as usize;
+                let body = &source_buf[start..start + 8];
+                let a = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let b = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
+                if !queue[..tail].contains(&child) {
+                    if tail >= crate::alloc::MAX_QUEUED_PAIRS {
+                        return Err(Error::OutOfRange);
+                    }
+                    queue[tail] = child;
+                    tail += 1;
+                }
             }
         }
     }
@@ -565,6 +594,26 @@ fn scan_pair_move_state(pair: &MetadataPair<'_>) -> [u8; crate::gstate::MOVE_STA
     acc
 }
 
+/// Scan a metadata pair's active block for `RelocateState` tags and
+/// XOR-accumulate their bodies. The pair's contribution to the
+/// filesystem-global relocate-gstate; compaction folds this into the
+/// new commit so the contribution survives.
+fn scan_pair_relocate_state(
+    pair: &MetadataPair<'_>,
+) -> [u8; crate::gstate::RELOCATE_STATE_BODY_SIZE] {
+    let mut acc = [0u8; crate::gstate::RELOCATE_STATE_BODY_SIZE];
+    for entry in pair.reader.iter_tags() {
+        if entry.tag.tag_type() == crate::tag::TagType::RelocateState
+            && entry.body.len() == crate::gstate::RELOCATE_STATE_BODY_SIZE
+        {
+            for (a, e) in acc.iter_mut().zip(entry.body.iter()) {
+                *a ^= *e;
+            }
+        }
+    }
+    acc
+}
+
 /// CCRC tag (8 bytes). Used by callers to decide whether to append in
 /// place or compact onto the alternate.
 fn op_dsize_of(op: &WriteOp<'_>) -> usize {
@@ -578,6 +627,7 @@ fn op_dsize_of(op: &WriteOp<'_>) -> usize {
         WriteOp::Remove { .. } | WriteOp::RemoveAttr { .. } => 4 + 8,
         WriteOp::RenameInPlace { new_name, .. } => (4 + new_name.len()) + 8,
         WriteOp::SetAttr { value, .. } => (4 + value.len()) + 8,
+        WriteOp::Noop => 8,
     }
 }
 
@@ -933,28 +983,16 @@ impl<S: Storage> Fs<S> {
         self.storage.sync().map_err(|_| Error::Io)?;
 
         // Append the metadata commit.
-        // buf_a was consumed for chain bytes; re-read the target pair.
+        // buf_a was consumed for chain bytes; re-read the target pair
+        // just to learn the live-entry count for the new id.
         self.storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
         self.storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-
-        let active_addr;
-        let alternate_addr;
-        let active_is_a;
-        let committed_end;
-        let next_ptag;
-        let old_revision;
-        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
-        let count: usize;
-        {
+        let count: usize = {
             let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
-            active_addr = pair.active_block;
-            alternate_addr = pair.alternate_block;
-            active_is_a = active_addr == pair_addr.a;
-            committed_end = pair.reader.committed_end();
-            next_ptag = pair.reader.next_ptag();
-            old_revision = pair.reader.revision();
-            count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
-        }
+            let active_is_a = pair.active_block == pair_addr.a;
+            let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+            gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?
+        };
 
         let head_block = chain[total_blocks - 1].as_u32();
         let total_size = content.len() as u32;
@@ -971,49 +1009,18 @@ impl<S: Storage> Fs<S> {
             }
             WriteOp::CreateCtz { id: new_id, name, head_block, total_size }
         };
-        let op_dsize = match op {
-            WriteOp::UpdateCtz { .. } => (4 + 8) + 8,
-            // Create: Create (4) + NAME (4+name.len) + CtzStruct (4+8) + CCRC (8).
-            _ => 4 + (4 + name.len()) + (4 + 8) + 8,
-        };
 
-        if committed_end + op_dsize <= S::BLOCK_SIZE {
-            let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
-            let new_end = {
-                let mut commit =
-                    crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
-                emit_op(&mut commit, &op)?;
-                commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
-                commit.bytes_written()
-            };
-            self.storage
-                .program(
-                    active_addr.as_u32(),
-                    committed_end as u32,
-                    &active_buf[committed_end..new_end],
-                )
-                .map_err(|_| Error::Io)?;
-        } else {
-            let new_revision = old_revision.wrapping_add(1);
-            let relocated = self.compact_and_program(
-                pair_addr,
-                active_addr,
-                alternate_addr,
-                active_is_a,
-                new_revision,
-                &slots,
-                count,
-                &op,
-                None,
-                buf_a,
-                buf_b,
-            )?;
-            if let Some(new_pair) = relocated {
-                self.propagate_relocation(pair_addr, new_pair, buf_a, buf_b)?;
-            }
-        }
-        self.storage.sync().map_err(|_| Error::Io)?;
-        Ok(())
+        // Pass the just-allocated chain as inflight so the wear-level
+        // relocation (if it fires) won't reallocate a chain block.
+        self.apply_op_to_pair_inner(
+            pair_addr,
+            &op,
+            None,
+            None,
+            &chain[..total_blocks],
+            buf_a,
+            buf_b,
+        )
     }
 
     /// Read up to `out.len()` bytes from the file at `path` starting
@@ -1466,68 +1473,8 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
-        self.storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-
-        let active_addr;
-        let alternate_addr;
-        let active_is_a;
-        let committed_end;
-        let next_ptag;
-        let old_revision;
-        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
-        let count: usize;
-        {
-            let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
-            active_addr = pair.active_block;
-            alternate_addr = pair.alternate_block;
-            active_is_a = active_addr == pair_addr.a;
-            committed_end = pair.reader.committed_end();
-            next_ptag = pair.reader.next_ptag();
-            old_revision = pair.reader.revision();
-            count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
-        }
-
         let op = WriteOp::UpdateCtz { id, head_block, total_size };
-        let op_dsize = (4 + 8) + 8;
-
-        if committed_end + op_dsize <= S::BLOCK_SIZE {
-            let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
-            let new_end = {
-                let mut commit =
-                    crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
-                emit_op(&mut commit, &op)?;
-                commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
-                commit.bytes_written()
-            };
-            self.storage
-                .program(
-                    active_addr.as_u32(),
-                    committed_end as u32,
-                    &active_buf[committed_end..new_end],
-                )
-                .map_err(|_| Error::Io)?;
-        } else {
-            let new_revision = old_revision.wrapping_add(1);
-            let relocated = self.compact_and_program(
-                pair_addr,
-                active_addr,
-                alternate_addr,
-                active_is_a,
-                new_revision,
-                &slots,
-                count,
-                &op,
-                None,
-                buf_a,
-                buf_b,
-            )?;
-            if let Some(new_pair) = relocated {
-                self.propagate_relocation(pair_addr, new_pair, buf_a, buf_b)?;
-            }
-        }
-        self.storage.sync().map_err(|_| Error::Io)?;
-        Ok(())
+        self.apply_op_to_pair(pair_addr, &op, buf_a, buf_b)
     }
 
     /// Resolve a path's parent directory. Returns `(parent_pair,
@@ -1621,72 +1568,24 @@ impl<S: Storage> Fs<S> {
         self.storage.program(new_dir.a.as_u32(), 0, &buf_a[..new_end]).map_err(|_| Error::Io)?;
         self.storage.sync().map_err(|_| Error::Io)?;
 
-        // Append a CreateDir commit to the parent pair.
+        // Re-read the parent to compute the new id from the live count,
+        // then append the CreateDir commit. Pass the just-allocated
+        // new_dir blocks as inflight so wear-level relocation (if it
+        // fires) won't reallocate them.
         self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
         self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        let active_addr;
-        let alternate_addr;
-        let active_is_a;
-        let committed_end;
-        let next_ptag;
-        let old_revision;
-        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
-        let count: usize;
-        {
+        let count: usize = {
             let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
-            active_addr = p.active_block;
-            alternate_addr = p.alternate_block;
-            active_is_a = active_addr == parent.a;
-            committed_end = p.reader.committed_end();
-            next_ptag = p.reader.next_ptag();
-            old_revision = p.reader.revision();
-            count = gather_live_slots(&p, active_is_a, buf_a, buf_b, &mut slots)?;
-        }
-
+            let active_is_a = p.active_block == parent.a;
+            let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+            gather_live_slots(&p, active_is_a, buf_a, buf_b, &mut slots)?
+        };
         let new_id = u16::try_from(count).map_err(|_| Error::OutOfRange)?;
         if new_id == crate::tag::ID_NONE {
             return Err(Error::OutOfRange);
         }
         let op = WriteOp::CreateDir { id: new_id, name: dir_name_bytes, dir_pair: new_dir };
-        let op_dsize = 4 + (4 + dir_name_bytes.len()) + (4 + 8) + 8;
-
-        if committed_end + op_dsize <= S::BLOCK_SIZE {
-            let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
-            let new_end = {
-                let mut commit =
-                    crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
-                emit_op(&mut commit, &op)?;
-                commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
-                commit.bytes_written()
-            };
-            self.storage
-                .program(
-                    active_addr.as_u32(),
-                    committed_end as u32,
-                    &active_buf[committed_end..new_end],
-                )
-                .map_err(|_| Error::Io)?;
-        } else {
-            let new_revision = old_revision.wrapping_add(1);
-            let relocated = self.compact_and_program(
-                parent,
-                active_addr,
-                alternate_addr,
-                active_is_a,
-                new_revision,
-                &slots,
-                count,
-                &op,
-                None,
-                buf_a,
-                buf_b,
-            )?;
-            if let Some(new_pair) = relocated {
-                self.propagate_relocation(parent, new_pair, buf_a, buf_b)?;
-            }
-        }
-        self.storage.sync().map_err(|_| Error::Io)?;
-        Ok(())
+        self.apply_op_to_pair_inner(parent, &op, None, None, &new_blocks, buf_a, buf_b)
     }
 
     /// Write or update a file at `path` (path-based variant of
@@ -1902,70 +1801,12 @@ impl<S: Storage> Fs<S> {
             }
         }
 
-        // Gather pair state for the append-or-compact dispatch.
-        let active_addr;
-        let alternate_addr;
-        let active_is_a;
-        let committed_end;
-        let next_ptag;
-        let old_revision;
-        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
-        let count: usize;
-        {
-            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
-            active_addr = p.active_block;
-            alternate_addr = p.alternate_block;
-            active_is_a = active_addr == parent.a;
-            committed_end = p.reader.committed_end();
-            next_ptag = p.reader.next_ptag();
-            old_revision = p.reader.revision();
-            count = gather_live_slots(&p, active_is_a, buf_a, buf_b, &mut slots)?;
-        }
-
         let name_type = match kind {
             crate::dir::EntryKind::RegularFile => crate::tag::TagType::RegularFile,
             crate::dir::EntryKind::Directory => crate::tag::TagType::Directory,
         };
         let op = WriteOp::RenameInPlace { id: old_id, name_type, new_name: new_leaf_bytes };
-        let op_dsize = (4 + new_leaf_bytes.len()) + 8;
-
-        if committed_end + op_dsize <= S::BLOCK_SIZE {
-            let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
-            let new_end = {
-                let mut commit =
-                    crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
-                emit_op(&mut commit, &op)?;
-                commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
-                commit.bytes_written()
-            };
-            self.storage
-                .program(
-                    active_addr.as_u32(),
-                    committed_end as u32,
-                    &active_buf[committed_end..new_end],
-                )
-                .map_err(|_| Error::Io)?;
-        } else {
-            let new_revision = old_revision.wrapping_add(1);
-            let relocated = self.compact_and_program(
-                parent,
-                active_addr,
-                alternate_addr,
-                active_is_a,
-                new_revision,
-                &slots,
-                count,
-                &op,
-                None,
-                buf_a,
-                buf_b,
-            )?;
-            if let Some(new_pair) = relocated {
-                self.propagate_relocation(parent, new_pair, buf_a, buf_b)?;
-            }
-        }
-        self.storage.sync().map_err(|_| Error::Io)?;
-        Ok(())
+        self.apply_op_to_pair(parent, &op, buf_a, buf_b)
     }
 
     /// Rename an entry across directories (or in place).
@@ -2179,6 +2020,26 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
+        self.apply_op_to_pair_inner(pair_addr, op, extra_move_state, None, &[], buf_a, buf_b)
+    }
+
+    /// Inner form of [`Self::apply_op_to_pair_with_movestate`] that
+    /// also carries an optional `extra_relocate_state` body (used by
+    /// the wear-levelling parent-update cascade) and an `inflight`
+    /// list of block addresses the allocator must treat as in-use
+    /// even though they are not yet reachable from `root` (each
+    /// in-flight child relocation's fresh block).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_op_to_pair_inner(
+        &mut self,
+        pair_addr: BlockPair,
+        op: &WriteOp<'_>,
+        extra_move_state: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
+        extra_relocate_state: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
+        inflight: &[BlockAddress],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
         self.storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
         self.storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
 
@@ -2191,6 +2052,7 @@ impl<S: Storage> Fs<S> {
         let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
         let count: usize;
         let pair_existing_ms: [u8; crate::gstate::MOVE_STATE_BODY_SIZE];
+        let pair_existing_rs: [u8; crate::gstate::RELOCATE_STATE_BODY_SIZE];
         {
             let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
             active_addr = pair.active_block;
@@ -2200,12 +2062,15 @@ impl<S: Storage> Fs<S> {
             next_ptag = pair.reader.next_ptag();
             old_revision = pair.reader.revision();
             pair_existing_ms = scan_pair_move_state(&pair);
+            pair_existing_rs = scan_pair_relocate_state(&pair);
             count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
         }
 
         let extra_ms_dsize =
             extra_move_state.map_or(0, |_| 4 + crate::gstate::MOVE_STATE_BODY_SIZE);
-        let dsize = op_dsize_of(op) + extra_ms_dsize;
+        let extra_rs_dsize =
+            extra_relocate_state.map_or(0, |_| 4 + crate::gstate::RELOCATE_STATE_BODY_SIZE);
+        let dsize = op_dsize_of(op) + extra_ms_dsize + extra_rs_dsize;
         if committed_end + dsize <= S::BLOCK_SIZE {
             let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
             let new_end = {
@@ -2223,6 +2088,17 @@ impl<S: Storage> Fs<S> {
                         &body,
                     )?;
                 }
+                if let Some(body) = extra_relocate_state {
+                    commit.tag(
+                        crate::tag::Tag::new(
+                            true,
+                            crate::tag::TagType::RelocateState,
+                            crate::tag::ID_NONE,
+                            crate::gstate::RELOCATE_STATE_BODY_SIZE as u16,
+                        ),
+                        &body,
+                    )?;
+                }
                 commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
                 commit.bytes_written()
             };
@@ -2235,9 +2111,6 @@ impl<S: Storage> Fs<S> {
                 .map_err(|_| Error::Io)?;
         } else {
             let new_revision = old_revision.wrapping_add(1);
-            // The compacted block owns the pair's whole MoveState
-            // contribution. Fold the pre-existing accumulation with
-            // any extra contribution and emit a single MoveState tag.
             let mut net_ms = pair_existing_ms;
             if let Some(extra) = extra_move_state {
                 for (n, e) in net_ms.iter_mut().zip(extra.iter()) {
@@ -2249,6 +2122,17 @@ impl<S: Storage> Fs<S> {
             } else {
                 Some(net_ms)
             };
+            let mut net_rs = pair_existing_rs;
+            if let Some(extra) = extra_relocate_state {
+                for (n, e) in net_rs.iter_mut().zip(extra.iter()) {
+                    *n ^= *e;
+                }
+            }
+            let rs_arg = if net_rs == [0u8; crate::gstate::RELOCATE_STATE_BODY_SIZE] {
+                None
+            } else {
+                Some(net_rs)
+            };
             let relocated = self.compact_and_program(
                 pair_addr,
                 active_addr,
@@ -2259,11 +2143,13 @@ impl<S: Storage> Fs<S> {
                 count,
                 op,
                 ms_arg,
+                rs_arg,
+                inflight,
                 buf_a,
                 buf_b,
             )?;
             if let Some(new_pair) = relocated {
-                self.propagate_relocation(pair_addr, new_pair, buf_a, buf_b)?;
+                self.propagate_relocation(pair_addr, new_pair, inflight, buf_a, buf_b)?;
             }
         }
         self.storage.sync().map_err(|_| Error::Io)?;
@@ -2302,9 +2188,84 @@ impl<S: Storage> Fs<S> {
         count: usize,
         op: &WriteOp<'_>,
         ms_arg: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
+        rs_arg: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
+        inflight: &[BlockAddress],
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<Option<BlockPair>, Error> {
+        let relocating = should_relocate(pair_addr, self.root, new_revision, S::BLOCK_CYCLES);
+
+        // When relocating, allocate the fresh destination block FIRST
+        // so the relocation's `RelocateState` body — which encodes
+        // `(pair_addr, new_pair)` — can be embedded in both the
+        // alternate commit AND the fresh-block commit. A crash with
+        // the alternate programmed but the fresh not yet leaves a
+        // `RelocateState` reachable through the parent's (unchanged)
+        // reference, so mount-time recovery can detect the half-done
+        // cycle and cancel it.
+        //
+        // Buffer hygiene: the allocator's single-buffer BFS scan
+        // clobbers whatever buffer we hand it. We pass the
+        // alt-buffer (the one we're about to overwrite with the new
+        // compact bytes anyway), keeping the source-buffer intact
+        // so `slots[..count]`'s offsets remain valid.
+        let (fresh_opt, relocate_event_body) = if relocating {
+            let mut excluded = [BlockAddress::NONE; 2 + crate::alloc::MAX_QUEUED_PAIRS];
+            excluded[0] = active_addr;
+            excluded[1] = alternate_addr;
+            let mut ex_len = 2;
+            for &b in inflight {
+                if ex_len >= excluded.len() {
+                    return Err(Error::OutOfRange);
+                }
+                excluded[ex_len] = b;
+                ex_len += 1;
+            }
+            let fresh = if active_is_a {
+                crate::alloc::alloc_one_block_with_single_buf(
+                    &mut self.storage,
+                    self.root,
+                    &excluded[..ex_len],
+                    buf_b,
+                )?
+            } else {
+                crate::alloc::alloc_one_block_with_single_buf(
+                    &mut self.storage,
+                    self.root,
+                    &excluded[..ex_len],
+                    buf_a,
+                )?
+            };
+            let new_pair = BlockPair::new(
+                if pair_addr.a == alternate_addr { fresh } else { pair_addr.a },
+                if pair_addr.b == alternate_addr { fresh } else { pair_addr.b },
+            );
+            let body = crate::gstate::build_relocate_body(pair_addr, new_pair);
+            (Some((fresh, new_pair)), Some(body))
+        } else {
+            (None, None)
+        };
+
+        // Combine the caller's pre-existing rs contribution with the
+        // current relocation's body (if any) into a single net body
+        // for the compact commit.
+        let combined_rs = match (rs_arg, relocate_event_body) {
+            (None, None) => None,
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (Some(a), Some(b)) => {
+                let mut out = a;
+                for (o, e) in out.iter_mut().zip(b.iter()) {
+                    *o ^= *e;
+                }
+                if out == [0u8; crate::gstate::RELOCATE_STATE_BODY_SIZE] {
+                    None
+                } else {
+                    Some(out)
+                }
+            }
+        };
+
         let new_end = if active_is_a {
             build_compact_commit(
                 buf_b,
@@ -2316,6 +2277,7 @@ impl<S: Storage> Fs<S> {
                 S::PROG_SIZE,
                 S::BLOCK_SIZE,
                 ms_arg,
+                combined_rs,
             )?
         } else {
             build_compact_commit(
@@ -2328,10 +2290,10 @@ impl<S: Storage> Fs<S> {
                 S::PROG_SIZE,
                 S::BLOCK_SIZE,
                 ms_arg,
+                combined_rs,
             )?
         };
-        // Phase 1: program the compacted bytes to the existing
-        // alternate. This is the durability boundary.
+
         self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
         let alt_bytes_len = new_end;
         {
@@ -2341,28 +2303,10 @@ impl<S: Storage> Fs<S> {
                 .map_err(|_| Error::Io)?;
         }
 
-        if !should_relocate(pair_addr, self.root, new_revision, S::BLOCK_CYCLES) {
+        let Some((fresh, new_pair)) = fresh_opt else {
             return Ok(None);
-        }
-
-        // Phase 2: wear-levelling relocation. Reuse the source buffer
-        // (the one NOT holding the compacted bytes) as scan scratch
-        // to find a fresh block, then copy the same commit there.
-        let fresh = if active_is_a {
-            crate::alloc::alloc_one_block_with_single_buf(
-                &mut self.storage,
-                self.root,
-                &[active_addr, alternate_addr],
-                buf_a,
-            )?
-        } else {
-            crate::alloc::alloc_one_block_with_single_buf(
-                &mut self.storage,
-                self.root,
-                &[active_addr, alternate_addr],
-                buf_b,
-            )?
         };
+
         self.storage.erase(fresh.as_u32()).map_err(|_| Error::Io)?;
         {
             let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
@@ -2370,10 +2314,6 @@ impl<S: Storage> Fs<S> {
                 .program(fresh.as_u32(), 0, &alt_buf[..alt_bytes_len])
                 .map_err(|_| Error::Io)?;
         }
-        let new_pair = BlockPair::new(
-            if pair_addr.a == alternate_addr { fresh } else { pair_addr.a },
-            if pair_addr.b == alternate_addr { fresh } else { pair_addr.b },
-        );
         Ok(Some(new_pair))
     }
 
@@ -2388,19 +2328,45 @@ impl<S: Storage> Fs<S> {
         &mut self,
         old_pair: BlockPair,
         new_pair: BlockPair,
+        inflight: &[BlockAddress],
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
         if old_pair == self.root {
-            // Defensive: should_relocate excludes root, but stay
-            // robust if the predicate is ever weakened.
             return Ok(());
         }
         let (parent_pair, parent_id) =
             find_parent_in_tree(&mut self.storage, self.root, old_pair, buf_a, buf_b)?
                 .ok_or(Error::Corrupt)?;
         let op = WriteOp::UpdateDirStruct { id: parent_id, new_pair };
-        self.apply_op_to_pair_with_movestate(parent_pair, &op, None, buf_a, buf_b)
+        let relocate_body = crate::gstate::build_relocate_body(old_pair, new_pair);
+        // Add the fresh half of new_pair to inflight so the parent's
+        // own relocation (if it cascades) doesn't reallocate the
+        // block we just programmed.
+        let fresh = if old_pair.a == new_pair.a { new_pair.b } else { new_pair.a };
+        let mut next_inflight = [BlockAddress::NONE; crate::alloc::MAX_QUEUED_PAIRS];
+        let mut next_len = 0;
+        for &b in inflight {
+            if next_len >= next_inflight.len() {
+                return Err(Error::OutOfRange);
+            }
+            next_inflight[next_len] = b;
+            next_len += 1;
+        }
+        if next_len >= next_inflight.len() {
+            return Err(Error::OutOfRange);
+        }
+        next_inflight[next_len] = fresh;
+        next_len += 1;
+        self.apply_op_to_pair_inner(
+            parent_pair,
+            &op,
+            None,
+            Some(relocate_body),
+            &next_inflight[..next_len],
+            buf_a,
+            buf_b,
+        )
     }
 
     /// Remove an empty directory at `path`.
@@ -2609,77 +2575,16 @@ impl<S: Storage> Fs<S> {
             return Err(Error::InvalidPath);
         }
 
+        // Look up the target id, then dispatch through the standard
+        // apply path so the compact-or-append decision (and any
+        // wear-levelling that fires) flows through one code path.
         self.storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
         self.storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-
-        let active_addr;
-        let alternate_addr;
-        let active_is_a;
-        let committed_end;
-        let next_ptag;
-        let old_revision;
-        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
-        let count: usize;
-        let target_id: u16;
-        {
+        let target_id = {
             let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
-            active_addr = pair.active_block;
-            alternate_addr = pair.alternate_block;
-            active_is_a = active_addr == pair_addr.a;
-            committed_end = pair.reader.committed_end();
-            next_ptag = pair.reader.next_ptag();
-            old_revision = pair.reader.revision();
-
-            match crate::dir::lookup(&pair, name) {
-                Some(r) => target_id = r.entry.id,
-                None => return Err(Error::NotFound),
-            }
-            count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
-        }
-
-        let op = WriteOp::Remove { id: target_id };
-        let op_dsize = 4 + 8; // Delete tag (4) + CCRC (4 + 4)
-
-        if committed_end + op_dsize <= S::BLOCK_SIZE {
-            // ---- APPEND PATH ----
-            let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
-            let new_end = {
-                let mut commit =
-                    crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
-                emit_op(&mut commit, &op)?;
-                commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
-                commit.bytes_written()
-            };
-            self.storage
-                .program(
-                    active_addr.as_u32(),
-                    committed_end as u32,
-                    &active_buf[committed_end..new_end],
-                )
-                .map_err(|_| Error::Io)?;
-        } else {
-            // ---- COMPACT PATH ----
-            let new_revision = old_revision.wrapping_add(1);
-            let relocated = self.compact_and_program(
-                pair_addr,
-                active_addr,
-                alternate_addr,
-                active_is_a,
-                new_revision,
-                &slots,
-                count,
-                &op,
-                None,
-                buf_a,
-                buf_b,
-            )?;
-            if let Some(new_pair) = relocated {
-                self.propagate_relocation(pair_addr, new_pair, buf_a, buf_b)?;
-            }
-        }
-
-        self.storage.sync().map_err(|_| Error::Io)?;
-        Ok(())
+            crate::dir::lookup(&pair, name).ok_or(Error::NotFound)?.entry.id
+        };
+        self.apply_op_to_pair(pair_addr, &WriteOp::Remove { id: target_id }, buf_a, buf_b)
     }
 
     /// List the regular file and subdirectory names at the filesystem
@@ -2748,31 +2653,16 @@ impl<S: Storage> Fs<S> {
             return Err(Error::InvalidPath);
         }
 
-        // Read both blocks of the target pair.
+        // Look up existing entry (if any) and the next free id.
         self.storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
         self.storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-
-        // Gather the live state and decide which op (create vs update) to apply.
-        let active_addr;
-        let alternate_addr;
-        let active_is_a;
-        let committed_end;
-        let next_ptag;
-        let old_revision;
-        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
-        let count: usize;
-        let existing_id: Option<u16>;
-        {
+        let (existing_id, count): (Option<u16>, usize) = {
             let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
-            active_addr = pair.active_block;
-            alternate_addr = pair.alternate_block;
-            active_is_a = active_addr == pair_addr.a;
-            committed_end = pair.reader.committed_end();
-            next_ptag = pair.reader.next_ptag();
-            old_revision = pair.reader.revision();
-            existing_id = crate::dir::lookup(&pair, name).map(|r| r.entry.id);
-            count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
-        }
+            let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+            let active_is_a = pair.active_block == pair_addr.a;
+            let n = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
+            (crate::dir::lookup(&pair, name).map(|r| r.entry.id), n)
+        };
 
         let op = if let Some(id) = existing_id {
             WriteOp::Update { id, content }
@@ -2783,49 +2673,7 @@ impl<S: Storage> Fs<S> {
             }
             WriteOp::Create { id: new_id, name, content }
         };
-
-        let op_dsize = op_dsize_of(&op);
-
-        if committed_end + op_dsize <= S::BLOCK_SIZE {
-            // ---- APPEND PATH ----
-            let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
-            let new_end = {
-                let mut commit =
-                    crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
-                emit_op(&mut commit, &op)?;
-                commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
-                commit.bytes_written()
-            };
-            self.storage
-                .program(
-                    active_addr.as_u32(),
-                    committed_end as u32,
-                    &active_buf[committed_end..new_end],
-                )
-                .map_err(|_| Error::Io)?;
-        } else {
-            // ---- COMPACT PATH ----
-            let new_revision = old_revision.wrapping_add(1);
-            let relocated = self.compact_and_program(
-                pair_addr,
-                active_addr,
-                alternate_addr,
-                active_is_a,
-                new_revision,
-                &slots,
-                count,
-                &op,
-                None,
-                buf_a,
-                buf_b,
-            )?;
-            if let Some(new_pair) = relocated {
-                self.propagate_relocation(pair_addr, new_pair, buf_a, buf_b)?;
-            }
-        }
-
-        self.storage.sync().map_err(|_| Error::Io)?;
-        Ok(())
+        self.apply_op_to_pair(pair_addr, &op, buf_a, buf_b)
     }
 
     /// Format the storage device with a fresh, empty LittleFS v2
@@ -2980,6 +2828,9 @@ impl<S: Storage> Fs<S> {
         if let Some((src_pair, src_id)) = gstate.pending_move() {
             fs.recover_pending_move(src_pair, src_id, block_a_buf, block_b_buf)?;
         }
+        if let Some((old_pair, new_pair)) = gstate.pending_relocation() {
+            fs.recover_pending_relocation(old_pair, new_pair, block_a_buf, block_b_buf)?;
+        }
         Ok(fs)
     }
 
@@ -2999,6 +2850,27 @@ impl<S: Storage> Fs<S> {
             src_pair,
             &WriteOp::Remove { id: src_id },
             Some(balance),
+            buf_a,
+            buf_b,
+        )
+    }
+
+    /// Cancel a half-completed wear-levelling pair relocation by
+    /// emitting a balancing `RelocateState` commit on `old_pair`.
+    fn recover_pending_relocation(
+        &mut self,
+        old_pair: BlockPair,
+        new_pair: BlockPair,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        let balance = crate::gstate::build_relocate_body(old_pair, new_pair);
+        self.apply_op_to_pair_inner(
+            old_pair,
+            &WriteOp::Noop,
+            None,
+            Some(balance),
+            &[],
             buf_a,
             buf_b,
         )

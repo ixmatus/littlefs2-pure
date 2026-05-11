@@ -407,3 +407,153 @@ fn assert_pair_parses<S: Storage>(fs: &mut Fs<S>, pair: BlockPair) {
     fs.storage_mut().read(pair.b.as_u32(), 0, &mut b).expect("read b");
     MetadataPair::parse(pair.a, &a, pair.b, &b).expect("pair parses");
 }
+
+/// Torn-write wrapper over [`WearStorage`]. After `trigger_at` program
+/// calls, `program` and `erase` return `Err(())` so the FS observes
+/// the same I/O failure pattern a real power loss would produce.
+struct TornWearStorage {
+    inner: WearStorage,
+    trigger_at: usize,
+    program_count: usize,
+}
+
+impl TornWearStorage {
+    fn new(inner: WearStorage, trigger_at: usize) -> Self {
+        Self { inner, trigger_at, program_count: 0 }
+    }
+
+    fn into_inner(self) -> WearStorage {
+        self.inner
+    }
+}
+
+impl Storage for TornWearStorage {
+    type Error = ();
+    const READ_SIZE: usize = WearStorage::READ_SIZE;
+    const PROG_SIZE: usize = WearStorage::PROG_SIZE;
+    const BLOCK_SIZE: usize = WearStorage::BLOCK_SIZE;
+    const BLOCK_COUNT: u32 = WearStorage::BLOCK_COUNT;
+    const CACHE_SIZE: usize = WearStorage::CACHE_SIZE;
+    const LOOKAHEAD_SIZE: usize = WearStorage::LOOKAHEAD_SIZE;
+    const BLOCK_CYCLES: i32 = WearStorage::BLOCK_CYCLES;
+
+    fn read(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), ()> {
+        self.inner.read(block, off, buf)
+    }
+
+    fn program(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), ()> {
+        self.program_count += 1;
+        if self.program_count > self.trigger_at {
+            return Err(());
+        }
+        self.inner.program(block, off, data)
+    }
+
+    fn erase(&mut self, block: u32) -> Result<(), ()> {
+        if self.program_count > self.trigger_at {
+            return Err(());
+        }
+        self.inner.erase(block)
+    }
+}
+
+/// Torn-write atomicity for wear-level pair relocation.
+///
+/// Seed an FS with `/sub/k = "PRE"`, then run a write that triggers
+/// at least one relocation event. For each possible program-call
+/// boundary in the post-seed operation, "power off" at that boundary,
+/// remount the resulting image, and assert: either `/sub/k` reads
+/// back as the pre-state ("PRE") or as the post-state ("POST"). Never
+/// corrupt, never a phantom intermediate value.
+///
+/// The mount path's `recover_pending_relocation` is what cancels a
+/// half-completed cycle so the FS observes the pre-state. The
+/// alternate-then-fresh program order in `compact_and_program` is
+/// what makes the post-state reachable via the parent's unchanged
+/// reference once the alternate lands.
+#[test]
+fn relocation_atomic_across_every_power_loss() {
+    // Seed: format + write /sub/k = "PRE" with no torn writes.
+    let mut seed = WearStorage::new();
+    let mut scratch = vec![0u8; WearStorage::BLOCK_SIZE];
+    Fs::format(&mut seed, &mut scratch).unwrap();
+    let seed_data = {
+        let mut a = vec![0u8; WearStorage::BLOCK_SIZE];
+        let mut b = vec![0u8; WearStorage::BLOCK_SIZE];
+        let mut fs = Fs::mount(seed, &mut a, &mut b).unwrap();
+        fs.mkdir(Path::new("/sub").unwrap(), &mut a, &mut b).unwrap();
+        // Drive enough rewrites that the NEXT write will hit a
+        // compaction (and, with BLOCK_CYCLES = 1, sometimes a
+        // relocation). The exact threshold depends on inline tag
+        // sizes, so we hammer until the pair is close to full.
+        for i in 0..40u32 {
+            let val = vec![b'p'; 16 + (i % 16) as usize];
+            fs.write_to_path(Path::new("/sub/k").unwrap(), &val, &mut a, &mut b).unwrap();
+        }
+        // The known pre-state we'll match against on remount.
+        fs.write_to_path(Path::new("/sub/k").unwrap(), b"PRE", &mut a, &mut b).unwrap();
+        fs.into_storage().data
+    };
+
+    // Count program calls for the relocation-triggering scenario.
+    let scenario = |fs: &mut Fs<TornWearStorage>| {
+        let mut a = vec![0u8; WearStorage::BLOCK_SIZE];
+        let mut b = vec![0u8; WearStorage::BLOCK_SIZE];
+        // A handful of writes; enough to span at least one relocation
+        // cycle (BLOCK_CYCLES = 1 fires every ~3 compactions).
+        for _ in 0..20 {
+            let _ = fs.write_to_path(Path::new("/sub/k").unwrap(), b"POST", &mut a, &mut b);
+        }
+    };
+    let total_calls = {
+        let mut s = WearStorage::new();
+        s.data = seed_data.clone();
+        let torn = TornWearStorage::new(s, usize::MAX);
+        let mut a = vec![0u8; WearStorage::BLOCK_SIZE];
+        let mut b = vec![0u8; WearStorage::BLOCK_SIZE];
+        let mut fs = Fs::mount(torn, &mut a, &mut b).unwrap();
+        let before = fs.storage().program_count;
+        scenario(&mut fs);
+        let after = fs.storage().program_count;
+        after - before
+    };
+    assert!(total_calls > 0, "scenario should issue program calls");
+
+    for trigger in 1..=total_calls {
+        let mut s = WearStorage::new();
+        s.data = seed_data.clone();
+        let torn = TornWearStorage::new(s, trigger);
+        let mut a = vec![0u8; WearStorage::BLOCK_SIZE];
+        let mut b = vec![0u8; WearStorage::BLOCK_SIZE];
+        match Fs::mount(torn, &mut a, &mut b) {
+            Ok(mut fs) => {
+                scenario(&mut fs);
+                let inner = fs.into_storage().into_inner();
+                // Remount with a fresh (unlimited) torn wrapper so
+                // post-remount work — including any orphan recovery —
+                // is allowed to run to completion.
+                let recovered = TornWearStorage::new(inner, usize::MAX);
+                let mut fs2 = match Fs::mount(recovered, &mut a, &mut b) {
+                    Ok(fs) => fs,
+                    Err(e) => panic!(
+                        "trigger {trigger}: post-torn remount failed: {e:?} \
+                         (mount must always recover from a torn relocation)"
+                    ),
+                };
+                let mut out = vec![0u8; 16];
+                let n = fs2
+                    .read_at_path(Path::new("/sub/k").unwrap(), 0, &mut out, &mut a, &mut b)
+                    .unwrap_or_else(|e| {
+                        panic!("trigger {trigger}: /sub/k unreadable post-recovery: {e:?}")
+                    });
+                let content = &out[..n];
+                assert!(
+                    content == b"PRE" || content == b"POST",
+                    "trigger {trigger}: /sub/k read back as {content:?}; \
+                     must be pre-state b\"PRE\" or post-state b\"POST\""
+                );
+            }
+            Err(e) => panic!("trigger {trigger}: pre-scenario mount failed: {e:?}"),
+        }
+    }
+}

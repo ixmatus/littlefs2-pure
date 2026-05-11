@@ -42,6 +42,7 @@ The v1.0 / v1.1 / v1.2 punch list against the LittleFS v2 spec is complete. What
 - [x] User attribute write: `Fs::set_attr` and `Fs::remove_attr`. Values capped at `0x3FE` bytes (LittleFS length-field non-sentinel max).
 - [x] Atomic move state recovery (v1.1). Cross-directory rename emits balanced `MoveState` tags in both commits; `Fs::mount` BFS-walks every reachable metadata pair, XOR-accumulates every `MoveState` body, and if the result is non-zero decodes the in-flight `(src_pair, src_id)` and emits the missing source-side Delete + balancing MoveState. Compaction preserves a pair's net gstate contribution. Verified by `tests/atomic_move.rs` across every program-call boundary.
 - [x] Inter-pair wear levelling via pair relocation (v1.2). Compact-time predicate `(rev + 1) % ((BLOCK_CYCLES + 1) | 1) == 0` redirects the compact to a freshly allocated block; the parent's `DirStruct` flips via a new `WriteOp::UpdateDirStruct`. Atomic at the alternate-program boundary; `BLOCK_CYCLES <= 0` disables. Verified by `tests/wear_leveling.rs`. Design in `docs/decisions/0005-wear-leveling-pair-relocation.md`.
+- [x] Mount-time orphan recovery for half-completed wear-levelling relocations (v1.2). A balanced `RelocateState` tag rides every relocation commit; a non-zero XOR-aggregate at mount time decodes the in-flight `(old_pair, new_pair)` and emits a balancing commit on `old_pair` that cancels the cycle. The forfeited fresh block is reclaimed by the next allocator scan. Verified by `relocation_atomic_across_every_power_loss` in `tests/wear_leveling.rs`.
 
 ## Hardening
 
@@ -71,7 +72,6 @@ None of these are correctness blockers.
 
 - [x] **Stateful `File<'fs, S>` handle** with `open / read / write / seek / sync / set_len`. Batches many writes into a single `UpdateCtz` commit at sync time. CTZ-backed regular files (and missing-with-`create` and truncated-to-empty files); inline files are rejected with a typed error so the path-based API stays the right tool for small upserts. Random in-place writes (cursor `!=` size) are out of scope and return [`Error::OutOfRange`]. Drop discards uncommitted writes (the chain blocks become orphan and are reclaimed by the next allocator scan; no corruption).
 - [ ] **`cargo kani --features kani` job in CI** (gated on Kani availability on GitHub Actions hosted runners). Harnesses are in place under `src/verify/`; CI integration is a future enhancement.
-- [ ] **Mount-time orphan recovery for half-completed wear-levelling relocations.** A crash mid-relocate currently lands a non-relocated successful commit (the alternate write is the durability boundary, so user data is safe). The cycle is forfeit; the next predicate firing tries again. A C-reference-style orphan flag in gstate would complete the relocation on next mount, at the cost of multiplexing the gstate body the way the C reference does. Acceptable miss in current form.
 
 ## Out of scope
 
