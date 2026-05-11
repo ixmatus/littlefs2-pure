@@ -4,8 +4,38 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Changed
+
+- **`Fs::append_to_path` is now streaming for CTZ files (Phase 2f.2).**
+  Previously every append read the entire file into `content_scratch`
+  and rewrote a fresh chain (O(file_size) per call). The CTZ-extending
+  path now fills the existing tail block in place via NOR sub-window
+  programs (the trailing bytes of any chain block are still erased,
+  so this is a legal 1-to-0 program), then allocates only the blocks
+  needed for any overflow, and finally commits a single `UpdateCtz`
+  tag pointing entry at `(new_head, new_size)`. Existing chain blocks
+  are never re-erased and never relocated. Write amplification per
+  append is bounded by `additional.len() + (one block alloc/erase per
+  ~block_size of overflow)`, independent of the file size. The
+  inline-only and inline-to-CTZ transition paths still assemble in
+  `content_scratch`; for the CTZ-extending path callers may pass an
+  empty slice. Verified end-to-end against `StrictNorStorage` (any
+  0-to-1 program would panic).
+- **`build_compact_commit` now handles `WriteOp::UpdateCtz` correctly
+  (bug fix).** The compact path previously copied the old struct body
+  even when the in-flight op was an `UpdateCtz`. Streaming appends
+  fill the metadata block much faster than the rewrite-style append
+  did, so the first compaction would silently drop the new CTZ head
+  and size, losing every subsequent extension. The compactor now
+  emits the new `CtzStruct` body for the targeted id.
+
 ### Added
 
+- **`ctz::collect_chain_blocks`.** Refactor of the read-side backward
+  walk into a reusable helper. Reads only skip-pointer headers (4 or
+  8 bytes per block), so the streaming append can map an existing
+  chain's logical indices to physical addresses without touching the
+  content bytes. `read_ctz_at` now delegates to it.
 - **`Fs::rename_in_dir` (Phase 2g.2).** Same-parent rename via a new
   `WriteOp::RenameInPlace { id, name_type, new_name }` variant. The
   reader picks the latest NAME for any given id, so appending a new

@@ -34,8 +34,8 @@ Everything missing for v1.0. The list shrinks as phases land; v1.0 ships when th
 - [x] CTZ-on-CTZ updates: `write_to_root` and `write_to_path` rewrite the chain; the old chain becomes unreachable and is reclaimed by the next allocator scan. (Phase 2f.1)
 - [x] CTZ-on-inline / inline-on-CTZ transitions: handled transparently via `Update` / `UpdateCtz` overrides. (Phase 2f.1)
 - [x] `append_to_path`: atomic full-rewrite append. (Phase 2f.1)
-- [ ] **Streaming append for large CTZ files**: the current `append_to_path` is O(file_size). A true incremental chain extension (one read of the last block + one allocation per call) is a follow-up. (Phase 2f.2)
-- [ ] **Stateful `File<'fs, S>` handle** with `open / read / write / seek / sync / set_len`. Useful for batched writes (avoid re-reading on each entry). (Phase 2f.2)
+- [x] **Streaming append for large CTZ files**: `append_to_path` now fills the existing tail block in place via NOR sub-window programs and allocates only the blocks needed for overflow. Existing chain blocks are never re-erased; write amplification is bounded by `additional.len() + one block per ~block_size of overflow`, independent of file size. (Phase 2f.2)
+- [ ] **Stateful `File<'fs, S>` handle** with `open / read / write / seek / sync / set_len`. Useful for batching multiple writes into one `UpdateCtz` commit (amortizing the metadata-pair touch over a session of writes). The streaming `append_to_path` already covers the write-amplification side; this is purely about reducing metadata-commit pressure for write-heavy sessions. (Phase 2f.2 remaining)
 - [x] `Fs::format` producing a superblock the C reference can mount. (Phase 2a; bit accuracy verified against `meta::MetadataReader` round-trip; C-reference cross-check pending the conformance harness.)
 - [ ] Sync semantics (`Fs::sync`, drop on close).
 - [x] `remove_from_root`: delete a file by name from the root, splice-correct. (Phase 2b.4)

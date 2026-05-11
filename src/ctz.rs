@@ -192,6 +192,55 @@ pub fn read_ctz<S: Storage>(
     read_ctz_at(storage, ctz, 0, out, scratch)
 }
 
+/// Walk a CTZ chain backward from `head` (the physical address of the
+/// chain's last block) and fill `out[0..total_blocks]` with the chain's
+/// block addresses indexed by chain position.
+///
+/// Reads only skip-pointer headers (4 or 8 bytes per block), so the
+/// caller does not need a per-block scratch buffer. The traversal
+/// uses the same `count = 2 - (index & 1)` rule as
+/// `lfs_ctz_traverse` (`lfs.c:2990`).
+///
+/// # Errors
+///
+/// - [`Error::OutOfRange`] if `out.len() < total_blocks as usize`.
+/// - I/O errors propagate from `storage.read`.
+pub fn collect_chain_blocks<S: Storage>(
+    storage: &mut S,
+    head: BlockAddress,
+    total_blocks: u32,
+    out: &mut [BlockAddress],
+) -> Result<(), Error> {
+    if total_blocks == 0 {
+        return Ok(());
+    }
+    if (out.len() as u32) < total_blocks {
+        return Err(Error::OutOfRange);
+    }
+    let mut head = head;
+    let mut index = total_blocks - 1;
+    let mut sp_buf = [0u8; 8];
+    loop {
+        out[index as usize] = head;
+        if index == 0 {
+            break;
+        }
+        let count = 2 - (index & 1);
+        storage.read(head.as_u32(), 0, &mut sp_buf[..4 * count as usize]).map_err(|_| Error::Io)?;
+        let ptr0 = u32::from_le_bytes([sp_buf[0], sp_buf[1], sp_buf[2], sp_buf[3]]);
+        if count == 2 {
+            let ptr1 = u32::from_le_bytes([sp_buf[4], sp_buf[5], sp_buf[6], sp_buf[7]]);
+            out[(index - 1) as usize] = BlockAddress::new(ptr0);
+            head = BlockAddress::new(ptr1);
+            index -= 2;
+        } else {
+            head = BlockAddress::new(ptr0);
+            index -= 1;
+        }
+    }
+    Ok(())
+}
+
 /// Read up to `out.len()` bytes of a CTZ file starting at byte offset
 /// `start_off`. Returns the number of bytes copied (may be less than
 /// `out.len()` if `start_off + out.len() > ctz.size`).
@@ -221,33 +270,8 @@ pub fn read_ctz_at<S: Storage>(
         return Err(Error::OutOfRange);
     }
 
-    // Reverse walk to collect block addresses indexed by block position.
     let mut blocks = [BlockAddress::NONE; MAX_CTZ_BLOCKS];
-    let mut head = ctz.head_block;
-    let mut index = total_blocks - 1;
-    let mut sp_buf = [0u8; 8];
-
-    loop {
-        blocks[index as usize] = head;
-        if index == 0 {
-            break;
-        }
-        // Read 1 or 2 skip pointers from the head's block header.
-        let count = 2 - (index & 1);
-        storage.read(head.as_u32(), 0, &mut sp_buf[..4 * count as usize]).map_err(|_| Error::Io)?;
-        let ptr0 = u32::from_le_bytes([sp_buf[0], sp_buf[1], sp_buf[2], sp_buf[3]]);
-        if count == 2 {
-            let ptr1 = u32::from_le_bytes([sp_buf[4], sp_buf[5], sp_buf[6], sp_buf[7]]);
-            // Visit intermediate (block index-1) and jump to ptr1 (block index-2).
-            blocks[(index - 1) as usize] = BlockAddress::new(ptr0);
-            head = BlockAddress::new(ptr1);
-            index -= 2;
-        } else {
-            // count == 1, jump to ptr0 (block index-1).
-            head = BlockAddress::new(ptr0);
-            index -= 1;
-        }
-    }
+    collect_chain_blocks(storage, ctz.head_block, total_blocks, &mut blocks)?;
 
     // Forward read: pull each block's content portion into `out`,
     // skipping logical bytes before `start_off`.

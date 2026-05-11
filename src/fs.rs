@@ -310,6 +310,20 @@ fn build_compact_commit(
                 continue;
             }
         }
+        // UpdateCtz overrides the entry's struct body with the new
+        // (head_block, total_size). Without this case, an UpdateCtz
+        // that triggers compaction copies the prior struct body and
+        // silently drops the update.
+        if let WriteOp::UpdateCtz { id: update_id, head_block, total_size } = *op {
+            if (i as u16) == update_id {
+                let mut body = [0u8; 8];
+                body[0..4].copy_from_slice(&head_block.to_le_bytes());
+                body[4..8].copy_from_slice(&total_size.to_le_bytes());
+                commit.tag(crate::tag::Tag::new(true, TagType::CtzStruct, emit_id, 8), &body)?;
+                emit_id += 1;
+                continue;
+            }
+        }
         // RenameInPlace overrides the NAME emitted above by emitting a
         // newer NAME after, but for compact we want to emit just one
         // NAME. Backtrack: re-emit the slot from scratch using the new
@@ -755,31 +769,38 @@ impl<S: Storage> Fs<S> {
     }
 
     /// Append bytes to the file at `path`. Creates the file if it does
-    /// not exist; otherwise reads the existing content, concatenates
-    /// `additional`, and rewrites via [`Self::write_to_path`].
+    /// not exist.
     ///
-    /// **Storage model.** This is an *atomic full-rewrite* append. The
-    /// existing content is read into the caller-supplied
-    /// `content_scratch` buffer, the new bytes are appended in memory,
-    /// and the combined content is written as a single new entry. For
-    /// CTZ-backed files, the old chain becomes unreachable and the
-    /// allocator reclaims its blocks on the next scan.
+    /// **Storage model.** This is *streaming* for CTZ-backed files: the
+    /// existing chain is left intact, the trailing partial block is
+    /// filled in place (NOR allows programming bytes that are still
+    /// erased), and any overflow allocates exactly enough new blocks to
+    /// hold the new tail. Write amplification per append is bounded by
+    /// `additional.len() + (one block alloc/erase per ~block_size of
+    /// overflow)` rather than scaling with the existing file size.
     ///
-    /// This pattern is O(file_size) per append, so it suits use cases
-    /// with infrequent appends or small files. Append-heavy workloads
-    /// (log streaming) should use the future stateful `File` API,
-    /// which extends CTZ chains incrementally (Phase 2f.2).
+    /// The inline-file paths (missing file, inline-to-inline,
+    /// inline-to-CTZ transition) still assemble the combined content in
+    /// `content_scratch` and dispatch through
+    /// [`Self::write_to_path`]. For CTZ-extending appends (the common
+    /// case for log-style writers once the file outgrows
+    /// [`Self::INLINE_MAX`]) `content_scratch` is **not consulted**;
+    /// callers may pass an empty slice. The inline path needs
+    /// `content_scratch.len() >= existing_size + additional.len()`,
+    /// where `existing_size <= INLINE_MAX` until the transition fires.
     ///
-    /// `content_scratch` must be at least
-    /// `existing_size + additional.len()` bytes. Caller is expected to
-    /// budget enough space for the maximum expected file size.
+    /// The directory-entry update at the end of the streaming append is
+    /// the only commit that becomes visible after a successful return;
+    /// crash before that commit lands leaves the file at its pre-append
+    /// size and the newly allocated blocks unreferenced (reclaimed by
+    /// the next allocator scan).
     ///
     /// # Errors
     ///
-    /// - [`Error::OutOfRange`] if `content_scratch` is too small for
-    ///   the combined content.
-    /// - [`Error::AlreadyExists`] if the path exists but is a
-    ///   directory (cannot append to a directory).
+    /// - [`Error::OutOfRange`] if the inline-path `content_scratch` is
+    ///   too small, or the new total file size would need more than
+    ///   `MAX_CTZ_WRITE_BLOCKS` chain blocks.
+    /// - [`Error::AlreadyExists`] if the path exists but is a directory.
     /// - Storage and corruption errors propagate from underlying
     ///   reads/writes.
     pub fn append_to_path(
@@ -790,55 +811,264 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
-        // Resolve and copy the existing content into content_scratch.
-        let (existing_size, ctz_to_load): (usize, Option<crate::ctz::CtzStruct>) =
-            match self.resolve(path, buf_a, buf_b) {
-                Ok(r) => {
+        if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
+            return Err(Error::GeometryMismatch);
+        }
+        if additional.is_empty() {
+            return Ok(());
+        }
+
+        let (parent, leaf) = self.resolve_parent(path, buf_a, buf_b)?;
+        let name = leaf.as_bytes();
+        if name.is_empty() || name.len() > 0x3FF {
+            return Err(Error::InvalidPath);
+        }
+
+        // Read the parent pair once and classify the existing entry.
+        self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+
+        // Inline body is copied out so we can drop the pair borrow.
+        // Up to INLINE_MAX + 1 covers a freshly transitioned entry; we
+        // size the buffer slightly larger to absorb any future bump.
+        let mut inline_copy = [0u8; 256];
+        enum Layout {
+            Missing,
+            Inline { size: usize },
+            Ctz { ctz: crate::ctz::CtzStruct, id: u16 },
+        }
+        let layout = {
+            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
+            match crate::dir::lookup(&p, name) {
+                None => Layout::Missing,
+                Some(r) => {
                     if r.entry.kind != crate::dir::EntryKind::RegularFile {
                         return Err(Error::AlreadyExists);
                     }
                     match r.struct_type {
                         crate::tag::TagType::InlineStruct => {
                             let n = r.struct_body.len();
-                            if n + additional.len() > content_scratch.len() {
+                            if n > inline_copy.len() {
                                 return Err(Error::OutOfRange);
                             }
-                            content_scratch[..n].copy_from_slice(r.struct_body);
-                            (n, None)
+                            inline_copy[..n].copy_from_slice(r.struct_body);
+                            Layout::Inline { size: n }
                         }
                         crate::tag::TagType::CtzStruct => {
                             let ctz = crate::ctz::CtzStruct::from_bytes(r.struct_body)?;
-                            let n = ctz.size as usize;
-                            if n + additional.len() > content_scratch.len() {
-                                return Err(Error::OutOfRange);
-                            }
-                            (n, Some(ctz))
+                            Layout::Ctz { ctz, id: r.entry.id }
                         }
                         _ => return Err(Error::Corrupt),
                     }
                 }
-                Err(Error::NotFound) => {
-                    if additional.len() > content_scratch.len() {
-                        return Err(Error::OutOfRange);
-                    }
-                    (0, None)
-                }
-                Err(e) => return Err(e),
-            };
+            }
+        };
 
-        // For CTZ files, pull the chain content into the scratch.
-        if let Some(ctz) = ctz_to_load {
-            self.read_ctz(&ctz, &mut content_scratch[..existing_size], buf_a)?;
+        match layout {
+            Layout::Missing => self.write_to_path(path, additional, buf_a, buf_b),
+            Layout::Inline { size } => {
+                let total = size + additional.len();
+                if total > content_scratch.len() {
+                    return Err(Error::OutOfRange);
+                }
+                content_scratch[..size].copy_from_slice(&inline_copy[..size]);
+                content_scratch[size..total].copy_from_slice(additional);
+                self.write_to_path(path, &content_scratch[..total], buf_a, buf_b)
+            }
+            Layout::Ctz { ctz, id } => {
+                self.append_ctz_streaming(parent, id, ctz, additional, buf_a, buf_b)
+            }
+        }
+    }
+
+    /// Streaming CTZ append: fill the existing tail block in place via
+    /// NOR sub-block programs, then allocate and write any overflow
+    /// blocks, then commit a single `UpdateCtz` tag pointing at the new
+    /// head + size. Existing chain blocks are never re-erased.
+    fn append_ctz_streaming(
+        &mut self,
+        pair_addr: BlockPair,
+        entry_id: u16,
+        ctz: crate::ctz::CtzStruct,
+        data: &[u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        use crate::ctz::{
+            block_count, block_index_at_offset, collect_chain_blocks, content_bytes_in_block,
+            skip_pointers_in_block,
+        };
+
+        let bs = S::BLOCK_SIZE as u32;
+        let old_size = ctz.size;
+        let n_old = block_count(old_size, bs);
+        if (n_old as usize) > MAX_CTZ_WRITE_BLOCKS {
+            return Err(Error::OutOfRange);
         }
 
-        // Stamp the new bytes after the existing content.
-        content_scratch[existing_size..existing_size + additional.len()]
-            .copy_from_slice(additional);
-        let total = existing_size + additional.len();
+        // Collect the existing chain's physical addresses. The walk
+        // reads only skip-pointer headers (4 or 8 bytes per block), so
+        // it touches very little flash and never reads near the tail's
+        // free region.
+        let mut chain = [BlockAddress::NONE; MAX_CTZ_WRITE_BLOCKS];
+        if n_old > 0 {
+            collect_chain_blocks(
+                &mut self.storage,
+                ctz.head_block,
+                n_old,
+                &mut chain[..n_old as usize],
+            )?;
+        }
 
-        // Hand off to write_to_path, which auto-dispatches inline vs
-        // CTZ and handles update semantics for existing entries.
-        self.write_to_path(path, &content_scratch[..total], buf_a, buf_b)
+        // Step 1: pack as much of `data` as fits into the existing tail
+        // block's unused content region. The bytes there are still
+        // 0xFF (never programmed since erase), so the NOR-aligned
+        // wrapper can program through this offset safely.
+        let mut data_consumed: usize = 0;
+        let mut head_phys = ctz.head_block.as_u32();
+        if n_old > 0 {
+            let tail_idx = n_old - 1;
+            let header = 4 * skip_pointers_in_block(tail_idx);
+            let tail_cap = content_bytes_in_block(tail_idx, bs);
+            let (idx_check, abs_off) = block_index_at_offset(old_size - 1, bs);
+            debug_assert_eq!(idx_check, tail_idx);
+            let bytes_used = abs_off + 1 - header;
+            let room = tail_cap - bytes_used;
+            let fill = (room as usize).min(data.len());
+            if fill > 0 {
+                let tail_phys = chain[tail_idx as usize].as_u32();
+                self.storage
+                    .program(tail_phys, header + bytes_used, &data[..fill])
+                    .map_err(|_| Error::Io)?;
+                data_consumed = fill;
+                head_phys = tail_phys;
+            }
+        }
+
+        // Step 2: allocate new chain blocks for the remainder. Each new
+        // block stores skip pointers referencing earlier chain entries
+        // (existing or newly allocated) followed by content bytes.
+        if data_consumed < data.len() {
+            let new_total = old_size + data.len() as u32;
+            let new_n = block_count(new_total, bs);
+            if (new_n as usize) > MAX_CTZ_WRITE_BLOCKS {
+                return Err(Error::OutOfRange);
+            }
+            let new_start = n_old as usize;
+            let new_count = (new_n - n_old) as usize;
+
+            crate::alloc::alloc_blocks(
+                &mut self.storage,
+                self.root,
+                &mut chain[new_start..new_start + new_count],
+                buf_a,
+                buf_b,
+            )?;
+
+            let remaining = &data[data_consumed..];
+            let mut content_off = 0usize;
+            for new_i in n_old..new_n {
+                let header_bytes = 4 * skip_pointers_in_block(new_i) as usize;
+                for b in buf_a.iter_mut() {
+                    *b = 0xFF;
+                }
+                let ptr_count = skip_pointers_in_block(new_i) as usize;
+                for k in 0..ptr_count {
+                    let target_idx = (new_i as usize).checked_sub(1 << k).ok_or(Error::Corrupt)?;
+                    let target_phys = chain[target_idx].as_u32();
+                    let off = 4 * k;
+                    buf_a[off..off + 4].copy_from_slice(&target_phys.to_le_bytes());
+                }
+                let block_capacity = S::BLOCK_SIZE - header_bytes;
+                let take = block_capacity.min(remaining.len() - content_off);
+                buf_a[header_bytes..header_bytes + take]
+                    .copy_from_slice(&remaining[content_off..content_off + take]);
+                content_off += take;
+
+                let phys = chain[new_i as usize].as_u32();
+                self.storage.erase(phys).map_err(|_| Error::Io)?;
+                self.storage.program(phys, 0, &buf_a[..S::BLOCK_SIZE]).map_err(|_| Error::Io)?;
+            }
+            head_phys = chain[new_n as usize - 1].as_u32();
+        }
+
+        self.storage.sync().map_err(|_| Error::Io)?;
+
+        // Commit the directory-entry update. This is the atomic step:
+        // anything before the commit lands leaves the file at its
+        // pre-append state.
+        let new_size = old_size + data.len() as u32;
+        self.commit_update_ctz(pair_addr, entry_id, head_phys, new_size, buf_a, buf_b)
+    }
+
+    /// Emit an `UpdateCtz` commit on `pair_addr` pointing entry `id` at
+    /// `(head_block, total_size)`. Dispatches through the standard
+    /// append-or-compact machinery used by every other write op.
+    fn commit_update_ctz(
+        &mut self,
+        pair_addr: BlockPair,
+        id: u16,
+        head_block: u32,
+        total_size: u32,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        self.storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+
+        let active_addr;
+        let alternate_addr;
+        let active_is_a;
+        let committed_end;
+        let next_ptag;
+        let old_revision;
+        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+        let count: usize;
+        {
+            let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
+            active_addr = pair.active_block;
+            alternate_addr = pair.alternate_block;
+            active_is_a = active_addr == pair_addr.a;
+            committed_end = pair.reader.committed_end();
+            next_ptag = pair.reader.next_ptag();
+            old_revision = pair.reader.revision();
+            count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
+        }
+
+        let op = WriteOp::UpdateCtz { id, head_block, total_size };
+        let op_dsize = (4 + 8) + 8;
+
+        if committed_end + op_dsize <= S::BLOCK_SIZE {
+            let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
+            let new_end = {
+                let mut commit =
+                    crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
+                emit_op(&mut commit, &op)?;
+                commit.finish(0)?;
+                commit.bytes_written()
+            };
+            self.storage
+                .program(
+                    active_addr.as_u32(),
+                    committed_end as u32,
+                    &active_buf[committed_end..new_end],
+                )
+                .map_err(|_| Error::Io)?;
+        } else {
+            let new_revision = old_revision.wrapping_add(1);
+            let new_end = if active_is_a {
+                build_compact_commit(buf_b, buf_a, new_revision, &slots, count, &op)?
+            } else {
+                build_compact_commit(buf_a, buf_b, new_revision, &slots, count, &op)?
+            };
+            self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
+            let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+            self.storage
+                .program(alternate_addr.as_u32(), 0, &alt_buf[..new_end])
+                .map_err(|_| Error::Io)?;
+        }
+        self.storage.sync().map_err(|_| Error::Io)?;
+        Ok(())
     }
 
     /// Resolve a path's parent directory. Returns `(parent_pair,

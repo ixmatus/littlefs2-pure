@@ -18,7 +18,7 @@ This file points downstream consumers (SMIL firmware, etc.) at the relevant entr
 | Write a large file as CTZ | `Fs::write_ctz_to_root(name, content, ...)` | Allocates blocks and writes the skip-list chain |
 | Create a directory | `Fs::mkdir(path, ...)` | Allocates a fresh metadata pair, writes empty initial commit |
 | Remove a file at root | `Fs::remove_from_root(name, ...)` | Splice-correct; deleted entries no longer resolve |
-| Append to a file (atomic full-rewrite) | `Fs::append_to_path(path, additional, content_scratch, ...)` | Creates if missing; handles inline↔CTZ transitions |
+| Append to a file (streaming for CTZ) | `Fs::append_to_path(path, additional, content_scratch, ...)` | Creates if missing; fills the tail in place + allocates only overflow blocks for CTZ files; `content_scratch` only consulted for inline / inline-to-CTZ transitions |
 | Read at offset (inline + CTZ) | `Fs::read_at_path(path, offset, &mut out, ...)` | Returns bytes copied; works on any layout |
 | File size | `Fs::size_of(path, ...)` | Returns byte length (inline or CTZ) |
 | Truncate / extend | `Fs::truncate_path(path, new_size, content_scratch, ...)` | Shrink drops trailing bytes; extend zero-pads |
@@ -33,13 +33,12 @@ This file points downstream consumers (SMIL firmware, etc.) at the relevant entr
 
 | Capability | Tracking |
 |---|---|
-| Stateful `File<'fs, S>` handle with `open / read / write / seek / set_len / sync` | Phase 2f.2 (the existing `append_to_path` + `read_at_path` + `truncate_path` together cover the common cases atomically) |
-| Streaming append for huge files (no full read-rewrite) | Phase 2f.2 (true incremental CTZ chain extension) |
+| Stateful `File<'fs, S>` handle with `open / read / write / seek / set_len / sync` | Phase 2f.2 remaining (the existing `append_to_path` + `read_at_path` + `truncate_path` together cover the common cases atomically; a stateful handle would batch multiple writes into a single metadata commit) |
 | Cross-directory rename | Phase 2g.5 (same-directory rename is shipped) |
 | Multi-pair directory listing (HardTail chasing in `list_dir`) | Phase 2g.5 |
 | Power-loss fuzz / Kani harnesses | Phase 3 |
 
-For the SMIL audit logger specifically: `create_dir`, `File::write` with append/truncate, `File::seek`, and `set_len` all map to Phases 2c–2f. The current write surface is sufficient for upsert-style configuration files (small keys + small values), not for log-style streaming writes.
+For the SMIL audit logger specifically: `create_dir`, `File::write` with append/truncate, `File::seek`, and `set_len` all map to Phases 2c–2f. The current write surface is sufficient for the audit logger's log-style workload: `append_to_path` is streaming for CTZ files (the common case once the file outgrows `INLINE_MAX = 128`), so write amplification per append is bounded by `additional.len() + one block per ~block_size of overflow` rather than scaling with the file size.
 
 ## Suggested integration steps
 
@@ -51,7 +50,7 @@ For the SMIL audit logger specifically: `create_dir`, `File::write` with append/
 
 4. **Migrate inline writes when ready.** Configuration-style writes (small named values, upserted occasionally) work with `write_inline_to_root`. Compaction is transparent. Each `remove_from_root` durably drops an entry.
 
-5. **Wait on write-heavy paths.** Anything resembling a streaming log writer (the SMIL audit logger) needs the stateful `File` API. Track Phase 2f in `KNOWN_ISSUES.md`.
+5. **Streaming append is live.** Log-style writers (the SMIL audit logger) can call `append_to_path` repeatedly with sub-block payloads; the CTZ path fills the existing tail in place. A stateful `File` handle (single open, many writes, one commit on close) is the remaining Phase 2f.2 item but is purely an optimization on metadata-commit pressure, not a correctness blocker.
 
 ## Storage trait quick reference
 
