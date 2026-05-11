@@ -25,22 +25,21 @@
 //! Property tests in `tests/property_ctz.rs` cross check against an
 //! independent reimplementation.
 //!
-//! # Scope of this commit
+//! # Module surface
 //!
-//! Phase 1g deliverables:
-//!
-//! - [`CtzStruct`]: decode the 8 byte body (head block + size).
+//! - [`CtzStruct`]: decode / encode the 8-byte body (head block + size).
 //! - [`block_count`]: total number of blocks in a chain holding `size`
 //!   bytes.
 //! - [`skip_pointers_in_block`]: `ctz(index) + 1` for `index > 0`, else
 //!   `0`.
-//! - [`content_bytes_in_block`]: payload bytes after the skip pointer
+//! - [`content_bytes_in_block`]: payload bytes after the skip-pointer
 //!   header.
 //! - [`block_index_at_offset`]: the C reference's `lfs_ctz_index`
 //!   translated to Rust, returning `(block_index, offset_within_block)`.
-//!
-//! The storage-backed `read_ctz` (walk the chain from head, read each
-//! block's content portion, concatenate) is Phase 1h.
+//! - [`read_ctz`] and [`read_ctz_at`]: walk the chain backward from the
+//!   head and assemble file bytes; [`collect_chain_blocks`] is the
+//!   reusable backward-walk helper used by the streaming append in
+//!   [`crate::Fs::append_to_path`].
 
 use crate::block::BlockAddress;
 use crate::error::Error;

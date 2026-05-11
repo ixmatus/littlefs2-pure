@@ -73,7 +73,7 @@ pub struct MetadataReader<'a> {
     /// Offset just past the last verified CCRC. Zero when no commit verified.
     committed_end: usize,
     /// The running XOR base immediately after the last verified CCRC, with
-    /// the parity flip applied. Used by writers (Phase 2) to chain the next
+    /// the parity flip applied. Used by the writer to chain the next
     /// commit. Read only consumers can ignore.
     next_ptag: u32,
     /// The most recent Tail tag's pair address, decoded from the 8 byte
@@ -187,8 +187,8 @@ impl<'a> MetadataReader<'a> {
     }
 
     /// The XOR base for the next (uncommitted) tag, after the post CCRC
-    /// parity flip. Phase 2 writers need this; read only consumers can
-    /// ignore.
+    /// parity flip. The writer reads this to chain the next commit
+    /// onto the existing log; read-only consumers can ignore.
     #[must_use]
     pub fn next_ptag(&self) -> u32 {
         self.next_ptag

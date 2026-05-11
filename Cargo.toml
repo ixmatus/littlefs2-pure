@@ -40,7 +40,8 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Pure Rust no_std implementation of the LittleFS v2 on-disk format. 0.x is the foundation layer; v1.0 will ship full read and write."
+readme = "README.md"
+description = "Pure Rust no_std implementation of the LittleFS v2 on-disk format. Bit-accurate against the C reference in both directions; no FFI; no global allocator inside the kernel."
 keywords = ["littlefs", "filesystem", "embedded", "no-std", "flash"]
 categories = ["embedded", "filesystem", "no-std", "no-std::no-alloc"]
 

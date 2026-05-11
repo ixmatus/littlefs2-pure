@@ -61,7 +61,7 @@ pub trait Storage {
     /// metadata operation (`buf_a`, `buf_b`); there is no internal
     /// `CACHE_SIZE`-sized scratch. The constant is exposed so storage
     /// adapters mirror the LittleFS spec, and so a future internal
-    /// cache (Phase 3+) can honor caller-provided sizing without a
+    /// cache (forward-looking) can honor caller-provided sizing without a
     /// breaking change.
     const CACHE_SIZE: usize;
 
@@ -74,7 +74,7 @@ pub trait Storage {
     /// of the filesystem on every call, with a stack-allocated 4096-bit
     /// (512-byte) bitmap internal to the function. There is no
     /// caller-visible lookahead buffer. The constant is exposed so a
-    /// streaming-lookahead allocator (Phase 3+) can honor caller
+    /// streaming-lookahead allocator (forward-looking) can honor caller
     /// sizing without a breaking change.
     const LOOKAHEAD_SIZE: usize;
 

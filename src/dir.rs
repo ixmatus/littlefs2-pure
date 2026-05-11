@@ -1,32 +1,29 @@
 //! Directory entry enumeration.
 //!
 //! A directory in LittleFS is materialized as a metadata pair whose tag
-//! stream carries NAME and STRUCT tags for each entry. The NAME tag's type
-//! field discriminates regular files from sub directories
+//! stream carries NAME and STRUCT tags for each entry. The NAME tag's
+//! type field discriminates regular files from sub-directories
 //! ([`TagType::RegularFile`] vs [`TagType::Directory`]); the NAME tag's
 //! body holds the entry's name as raw bytes; the matching STRUCT tag at
 //! the same id holds the entry's storage layout (inline data, CTZ skip
-//! list head, or sub directory pair address).
+//! list head, or sub-directory pair address).
 //!
-//! # Scope of this module
+//! # The three views
 //!
-//! Phase 1e exposes a forward iterator over NAME tags in a single
-//! [`MetadataPair`]. Each yielded [`DirEntry`] carries the id, the name
-//! bytes, and the kind (file or directory).
+//! - [`entries`] is the raw walker: one entry per NAME tag in commit
+//!   order, no splice handling. Useful when every committed tag must be
+//!   observable (e.g. conformance debugging).
+//! - [`live_entries`] is the splice-correct walker: a `Delete` tag at
+//!   id `N` removes the entry at `N` and renumbers entries with
+//!   `id > N` down by one. This is what user-visible APIs walk.
+//! - [`lookup`] is the single-pair name lookup, splice-correct, and
+//!   returns the entry plus its paired STRUCT body (so an inline file's
+//!   contents are reachable in one walk).
 //!
-//! What this module does **not** yet do:
-//!
-//! - **Splice handling.** A [`TagType::Delete`] tag for id `N` removes the
-//!   entry at `N` and renumbers entries with id `> N` down by one. The
-//!   current iterator ignores Splice tags and may yield deleted entries.
-//!   Acceptable for read only mounts of freshly written filesystems; will
-//!   be tightened before Phase 2.
-//! - **HardTail chasing.** A directory whose entries overflow one metadata
-//!   pair is split across pairs threaded via [`TagType::HardTail`] tags.
-//!   The current iterator covers one pair only.
-//! - **Path resolution.** Walking from the root pair down to an arbitrary
-//!   subdirectory by name requires composing this iterator with a follow
-//!   step on each [`DirEntry::kind`] of `Directory`. Phase 1f deliverable.
+//! All three operate on a single [`MetadataPair`]. Crossing
+//! HardTail-threaded continuation pairs is the caller's responsibility;
+//! [`crate::Fs::resolve`] handles it for path walks and
+//! [`crate::Fs::list_dir`] handles it for enumeration.
 
 use crate::meta::{MetadataPair, TagIter};
 use crate::tag::TagType;
@@ -60,8 +57,9 @@ pub enum EntryKind {
 /// Iterator over the directory entries of a [`MetadataPair`].
 ///
 /// Returned by [`entries`]. Yields one [`DirEntry`] per NAME tag, in
-/// commit order. See the module documentation for the limitations of the
-/// Phase 1e scope.
+/// commit order. This walker does **not** apply splice (Create/Delete)
+/// renumbering and may yield entries that a later `Delete` removed; use
+/// [`live_entries`] for the splice-correct view.
 #[derive(Clone, Debug)]
 pub struct Entries<'a> {
     inner: TagIter<'a>,
@@ -213,9 +211,10 @@ where
 /// - [`EntryKind::RegularFile`] with an [`crate::TagType::InlineStruct`]
 ///   STRUCT tag: `struct_body` *is* the file content (inline small file).
 /// - [`EntryKind::RegularFile`] with an [`crate::TagType::CtzStruct`]
-///   STRUCT tag: `struct_body` is 8 bytes encoding the CTZ skip list head
-///   block (LE `u32`) followed by the file size (LE `u32`). Phase 1g
-///   adds the helper to follow the skip list.
+///   STRUCT tag: `struct_body` is 8 bytes encoding the CTZ skip list
+///   head block (LE `u32`) followed by the file size (LE `u32`). Decode
+///   via [`crate::ctz::CtzStruct::from_bytes`] and walk the chain with
+///   [`crate::ctz::read_ctz`] (or [`crate::Fs::read_ctz`]).
 /// - [`EntryKind::Directory`] with a [`crate::TagType::DirStruct`] STRUCT
 ///   tag: `struct_body` is 8 bytes, two LE `u32`s addressing the
 ///   subdirectory's metadata pair.
