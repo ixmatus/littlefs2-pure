@@ -44,6 +44,7 @@ pub mod ctz;
 pub mod dir;
 pub mod error;
 pub mod fs;
+pub mod gstate;
 pub mod meta;
 pub mod nor;
 pub mod path;

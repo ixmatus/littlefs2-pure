@@ -4,6 +4,31 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Added (v1.1 hardening)
+
+- **Atomic move state recovery for cross-directory rename.** A
+  rename's two commits (Create-in-dst and Delete-in-src) now each
+  carry a balanced `MoveState` tag whose 12-byte body XORs to zero
+  once both land. A crash between them leaves the filesystem-global
+  gstate non-zero; `Fs::mount` walks every reachable metadata pair
+  (bounded by `alloc::MAX_QUEUED_PAIRS`), XOR-accumulates every
+  committed `MoveState` body, and if the result is non-zero decodes
+  the in-flight `(src_pair, src_id)` and emits the missing
+  source-side Delete + balancing MoveState before returning the
+  `Fs` handle. Callers never observe the duplicate-entry state.
+  Compaction also preserves a pair's net gstate contribution: the
+  compactor scans the source block for `MoveState` tags, XOR-folds
+  them with any new contribution, and emits a single `MoveState`
+  tag in the compacted block so a compaction landing during the
+  recovery window does not corrupt the gstate. New `gstate` module
+  (`src/gstate.rs`) hosts the encoding helpers and `Gstate` type;
+  three unit tests pin the body round-trip + decode. Two new
+  integration tests in `tests/atomic_move.rs`: the happy path
+  (rename runs to completion, mount sees no pending move) and the
+  recovery path (rename torn at every program-call boundary,
+  mount-time recovery converges, second mount is idempotent).
+  This closes the documented v1.0 gap "re-run rename to converge."
+
 ### Added (v1.0 finalize)
 
 - **`Fs::sync`.** Routine durability gate; equivalent to

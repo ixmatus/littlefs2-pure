@@ -1,0 +1,150 @@
+//! Filesystem-global state, XOR-accumulated across every metadata
+//! pair's `MoveState` tags.
+//!
+//! LittleFS tracks at most one in-flight cross-directory move at a
+//! time via a 12-byte "gstate" field encoded as a triple of LE `u32`s:
+//!
+//! 1. The deletion tag that would complete the move (a regular
+//!    `Delete` tag at the source id).
+//! 2. The source pair's first block address.
+//! 3. The source pair's second block address.
+//!
+//! Each cross-directory rename's two commits (Create-in-dst,
+//! Delete-in-src) emit the SAME `MoveState` body, so they XOR to zero
+//! after both land. Crash between them: the accumulated gstate is
+//! non-zero, and mount-time recovery decodes the in-flight move and
+//! completes it.
+//!
+//! Compaction preserves a pair's net `MoveState` contribution by
+//! accumulating every committed `MoveState` body during replay and
+//! emitting one balanced `MoveState` in the compacted block; without
+//! that, a compaction landing between the rename's two commits would
+//! corrupt the gstate.
+
+use crate::block::{BlockAddress, BlockPair};
+use crate::tag::{Tag, TagType};
+
+/// Wire-format size of one `MoveState` tag body.
+pub const MOVE_STATE_BODY_SIZE: usize = 12;
+
+/// Accumulated filesystem-global state. Initialized at mount time
+/// by XORing every committed `MoveState` body across every reachable
+/// metadata pair. Zero gstate means no in-flight move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Gstate {
+    /// XOR-accumulated tag word. When non-zero, decodes as the
+    /// `Delete` tag that would complete the in-flight move.
+    pub move_tag: u32,
+    /// XOR-accumulated source-pair first block.
+    pub move_pair_a: u32,
+    /// XOR-accumulated source-pair second block.
+    pub move_pair_b: u32,
+}
+
+impl Gstate {
+    /// Zero state: no in-flight move.
+    pub const ZERO: Self = Self { move_tag: 0, move_pair_a: 0, move_pair_b: 0 };
+
+    /// True if the gstate represents no in-flight move.
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.move_tag == 0 && self.move_pair_a == 0 && self.move_pair_b == 0
+    }
+
+    /// True if a cross-directory move is in flight (gstate carries
+    /// the deletion the source pair still owes).
+    #[must_use]
+    pub fn has_pending_move(&self) -> bool {
+        !self.is_zero()
+    }
+
+    /// XOR the bytes of one on-disk `MoveState` body into the running
+    /// gstate. Called once per committed `MoveState` tag during
+    /// mount-time accumulation; called again during compaction to
+    /// roll up a pair's net contribution.
+    pub fn xor_body(&mut self, body: &[u8; MOVE_STATE_BODY_SIZE]) {
+        self.move_tag ^= u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+        self.move_pair_a ^= u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+        self.move_pair_b ^= u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+    }
+
+    /// Encode the gstate as a 12-byte LE-triple ready to be emitted
+    /// as a `MoveState` tag body.
+    #[must_use]
+    pub fn to_body(self) -> [u8; MOVE_STATE_BODY_SIZE] {
+        let mut out = [0u8; MOVE_STATE_BODY_SIZE];
+        out[0..4].copy_from_slice(&self.move_tag.to_le_bytes());
+        out[4..8].copy_from_slice(&self.move_pair_a.to_le_bytes());
+        out[8..12].copy_from_slice(&self.move_pair_b.to_le_bytes());
+        out
+    }
+
+    /// Decode the in-flight move, if any. Returns `(source_pair,
+    /// source_id)` when `has_pending_move()` is true.
+    #[must_use]
+    pub fn pending_move(&self) -> Option<(BlockPair, u16)> {
+        if !self.has_pending_move() {
+            return None;
+        }
+        let tag = Tag::from_bits(self.move_tag);
+        if tag.tag_type() != TagType::Delete {
+            // The encoded tag is malformed; treat as no move (the
+            // alternative is a panic, which is worse for a recovery
+            // path). The Kani harness in `verify::commit_proofs` and
+            // the fuzz parser cover the input-side; this guards the
+            // semantic decode.
+            return None;
+        }
+        let src_pair = BlockPair::new(
+            BlockAddress::new(self.move_pair_a),
+            BlockAddress::new(self.move_pair_b),
+        );
+        Some((src_pair, tag.id()))
+    }
+}
+
+/// Build a `MoveState` body that records (or balances) an in-flight
+/// move from `src_pair`, deleting entry `src_id` at the source.
+/// The same body is emitted on both sides of the cross-directory
+/// rename so they XOR to zero once both commits land.
+#[must_use]
+pub fn build_move_body(src_pair: BlockPair, src_id: u16) -> [u8; MOVE_STATE_BODY_SIZE] {
+    let tag = Tag::new(true, TagType::Delete, src_id, 0).into_bits();
+    let mut out = [0u8; MOVE_STATE_BODY_SIZE];
+    out[0..4].copy_from_slice(&tag.to_le_bytes());
+    out[4..8].copy_from_slice(&src_pair.a.as_u32().to_le_bytes());
+    out[8..12].copy_from_slice(&src_pair.b.as_u32().to_le_bytes());
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_roundtrip_through_xor() {
+        let pair = BlockPair::new(BlockAddress::new(4), BlockAddress::new(5));
+        let body = build_move_body(pair, 7);
+        let mut g = Gstate::ZERO;
+        g.xor_body(&body);
+        g.xor_body(&body);
+        assert!(g.is_zero(), "double-XOR of the same body must zero out");
+    }
+
+    #[test]
+    fn pending_move_decodes_after_single_xor() {
+        let pair = BlockPair::new(BlockAddress::new(4), BlockAddress::new(5));
+        let body = build_move_body(pair, 7);
+        let mut g = Gstate::ZERO;
+        g.xor_body(&body);
+        let (decoded_pair, id) = g.pending_move().expect("non-zero gstate has a pending move");
+        assert_eq!(decoded_pair, pair);
+        assert_eq!(id, 7);
+    }
+
+    #[test]
+    fn zero_gstate_has_no_pending_move() {
+        assert_eq!(Gstate::ZERO.pending_move(), None);
+        assert!(!Gstate::ZERO.has_pending_move());
+    }
+}

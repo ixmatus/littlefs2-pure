@@ -283,6 +283,7 @@ fn build_compact_commit(
     op: &WriteOp<'_>,
     prog_size: usize,
     block_size: usize,
+    move_state: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
 ) -> Result<usize, Error> {
     use crate::tag::TagType;
 
@@ -409,11 +410,116 @@ fn build_compact_commit(
         }
         _ => {}
     }
+    // If the caller passed a MoveState body (typically the pair's
+    // pre-compaction accumulated gstate XOR any new contribution),
+    // emit it as a single tag so the compacted block carries the
+    // pair's net gstate contribution. Skip the all-zero body: an
+    // empty contribution is the default and the compactor should
+    // not waste bytes on it.
+    if let Some(body) = move_state {
+        if body != [0u8; crate::gstate::MOVE_STATE_BODY_SIZE] {
+            commit.tag(
+                crate::tag::Tag::new(
+                    true,
+                    TagType::MoveState,
+                    crate::tag::ID_NONE,
+                    crate::gstate::MOVE_STATE_BODY_SIZE as u16,
+                ),
+                &body,
+            )?;
+        }
+    }
     commit.finish_padded(0, prog_size, block_size)?;
     Ok(commit.bytes_written())
 }
 
 /// Wire-level commit size for a [`WriteOp`], including the trailing
+/// Walk the metadata-pair forest from `root` and accumulate every
+/// committed `MoveState` body into a single [`crate::gstate::Gstate`].
+/// Used by mount-time atomic-move-state recovery: if the resulting
+/// gstate is non-zero, a cross-directory rename was crashed between
+/// its two commits and the source `Delete` must still be emitted.
+///
+/// Bounded at [`crate::alloc::MAX_QUEUED_PAIRS`] visited pairs to
+/// match the allocator's BFS budget; deeper directory trees return
+/// `Error::OutOfRange`.
+fn accumulate_gstate<S: Storage>(
+    storage: &mut S,
+    root: BlockPair,
+    buf_a: &mut [u8],
+    buf_b: &mut [u8],
+) -> Result<crate::gstate::Gstate, Error> {
+    let mut queue: [BlockPair; crate::alloc::MAX_QUEUED_PAIRS] =
+        [BlockPair::new(BlockAddress::NONE, BlockAddress::NONE); crate::alloc::MAX_QUEUED_PAIRS];
+    queue[0] = root;
+    let mut tail = 1usize;
+    let mut head = 0usize;
+    let mut gstate = crate::gstate::Gstate::ZERO;
+
+    while head < tail {
+        let pair_addr = queue[head];
+        head += 1;
+
+        storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
+
+        gstate.xor_body(&scan_pair_move_state(&pair));
+
+        for entry in pair.reader.iter_tags() {
+            match entry.tag.tag_type() {
+                crate::tag::TagType::HardTail
+                | crate::tag::TagType::SoftTail
+                | crate::tag::TagType::DirStruct
+                    if entry.body.len() == 8 =>
+                {
+                    let a = u32::from_le_bytes([
+                        entry.body[0],
+                        entry.body[1],
+                        entry.body[2],
+                        entry.body[3],
+                    ]);
+                    let b = u32::from_le_bytes([
+                        entry.body[4],
+                        entry.body[5],
+                        entry.body[6],
+                        entry.body[7],
+                    ]);
+                    let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
+                    if !queue[..tail].contains(&child) {
+                        if tail >= crate::alloc::MAX_QUEUED_PAIRS {
+                            return Err(Error::OutOfRange);
+                        }
+                        queue[tail] = child;
+                        tail += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(gstate)
+}
+
+/// Scan a metadata pair's committed tag stream for `MoveState` tags
+/// and XOR-accumulate their bodies into a single 12-byte body. The
+/// pair's contribution to the filesystem-global gstate is whatever
+/// this function returns; compaction must preserve it.
+fn scan_pair_move_state(pair: &MetadataPair<'_>) -> [u8; crate::gstate::MOVE_STATE_BODY_SIZE] {
+    let mut acc = [0u8; crate::gstate::MOVE_STATE_BODY_SIZE];
+    for entry in pair.reader.iter_tags() {
+        if entry.tag.tag_type() == crate::tag::TagType::MoveState
+            && entry.body.len() == crate::gstate::MOVE_STATE_BODY_SIZE
+        {
+            for (a, e) in acc.iter_mut().zip(entry.body.iter()) {
+                *a ^= *e;
+            }
+        }
+    }
+    acc
+}
+
 /// CCRC tag (8 bytes). Used by callers to decide whether to append in
 /// place or compact onto the alternate.
 fn op_dsize_of(op: &WriteOp<'_>) -> usize {
@@ -710,6 +816,7 @@ impl<S: Storage> Fs<S> {
                     &op,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
+                    None,
                 )?
             } else {
                 build_compact_commit(
@@ -721,6 +828,7 @@ impl<S: Storage> Fs<S> {
                     &op,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
+                    None,
                 )?
             };
             self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
@@ -1207,6 +1315,7 @@ impl<S: Storage> Fs<S> {
                     &op,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
+                    None,
                 )?
             } else {
                 build_compact_commit(
@@ -1218,6 +1327,7 @@ impl<S: Storage> Fs<S> {
                     &op,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
+                    None,
                 )?
             };
             self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
@@ -1378,6 +1488,7 @@ impl<S: Storage> Fs<S> {
                     &op,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
+                    None,
                 )?
             } else {
                 build_compact_commit(
@@ -1389,6 +1500,7 @@ impl<S: Storage> Fs<S> {
                     &op,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
+                    None,
                 )?
             };
             self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
@@ -1669,6 +1781,7 @@ impl<S: Storage> Fs<S> {
                     &op,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
+                    None,
                 )?
             } else {
                 build_compact_commit(
@@ -1680,6 +1793,7 @@ impl<S: Storage> Fs<S> {
                     &op,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
+                    None,
                 )?
             };
             self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
@@ -1829,20 +1943,58 @@ impl<S: Storage> Fs<S> {
         // Doing Create first keeps the entry reachable through the
         // failure window (duplicate, not loss); doing Delete first
         // would risk a true vanish if Create then failed.
-        self.apply_op_to_pair(new_parent, &create_op, buf_a, buf_b)?;
-        self.apply_op_to_pair(old_parent, &WriteOp::Remove { id: src_id }, buf_a, buf_b)
+        // Atomic-move-state encoding: both commits carry the same
+        // MoveState body so they XOR to zero once both land. A crash
+        // between step 1 and step 2 leaves the gstate non-zero, which
+        // mount-time recovery decodes and completes.
+        let move_body = crate::gstate::build_move_body(old_parent, src_id);
+        self.apply_op_to_pair_with_movestate(
+            new_parent,
+            &create_op,
+            Some(move_body),
+            buf_a,
+            buf_b,
+        )?;
+        self.apply_op_to_pair_with_movestate(
+            old_parent,
+            &WriteOp::Remove { id: src_id },
+            Some(move_body),
+            buf_a,
+            buf_b,
+        )
     }
 
     /// Apply a `WriteOp` to a metadata pair through the standard
-    /// append-or-compact dispatch (append if there's room in the
-    /// active block, otherwise compact onto the alternate and bump
-    /// the revision). Reads both blocks of the pair before parsing,
-    /// gathers live slots in case a compaction is needed, and syncs
-    /// before returning.
+    /// append-or-compact dispatch. Convenience wrapper around
+    /// [`Self::apply_op_to_pair_with_movestate`] with no MoveState
+    /// piggyback (the common case).
     fn apply_op_to_pair(
         &mut self,
         pair_addr: BlockPair,
         op: &WriteOp<'_>,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        self.apply_op_to_pair_with_movestate(pair_addr, op, None, buf_a, buf_b)
+    }
+
+    /// Apply a `WriteOp` to a metadata pair, optionally piggybacking
+    /// a `MoveState` tag on the same commit. Used by cross-directory
+    /// rename to encode in-flight gstate atomically with the user-
+    /// visible change.
+    ///
+    /// On the append path, the MoveState tag is emitted alongside the
+    /// op in the same commit. On the compact path, the pair's
+    /// pre-existing accumulated MoveState contribution is XOR-folded
+    /// with `extra_move_state` and emitted as one net MoveState in
+    /// the compacted block; without this the gstate would be lost
+    /// whenever a cross-dir rename's destination pair compacts
+    /// between the two rename commits.
+    fn apply_op_to_pair_with_movestate(
+        &mut self,
+        pair_addr: BlockPair,
+        op: &WriteOp<'_>,
+        extra_move_state: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
@@ -1857,6 +2009,7 @@ impl<S: Storage> Fs<S> {
         let old_revision;
         let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
         let count: usize;
+        let pair_existing_ms: [u8; crate::gstate::MOVE_STATE_BODY_SIZE];
         {
             let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
             active_addr = pair.active_block;
@@ -1865,16 +2018,30 @@ impl<S: Storage> Fs<S> {
             committed_end = pair.reader.committed_end();
             next_ptag = pair.reader.next_ptag();
             old_revision = pair.reader.revision();
+            pair_existing_ms = scan_pair_move_state(&pair);
             count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
         }
 
-        let dsize = op_dsize_of(op);
+        let extra_ms_dsize =
+            extra_move_state.map_or(0, |_| 4 + crate::gstate::MOVE_STATE_BODY_SIZE);
+        let dsize = op_dsize_of(op) + extra_ms_dsize;
         if committed_end + dsize <= S::BLOCK_SIZE {
             let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
             let new_end = {
                 let mut commit =
                     crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
                 emit_op(&mut commit, op)?;
+                if let Some(body) = extra_move_state {
+                    commit.tag(
+                        crate::tag::Tag::new(
+                            true,
+                            crate::tag::TagType::MoveState,
+                            crate::tag::ID_NONE,
+                            crate::gstate::MOVE_STATE_BODY_SIZE as u16,
+                        ),
+                        &body,
+                    )?;
+                }
                 commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
                 commit.bytes_written()
             };
@@ -1887,6 +2054,20 @@ impl<S: Storage> Fs<S> {
                 .map_err(|_| Error::Io)?;
         } else {
             let new_revision = old_revision.wrapping_add(1);
+            // The compacted block owns the pair's whole MoveState
+            // contribution. Fold the pre-existing accumulation with
+            // any extra contribution and emit a single MoveState tag.
+            let mut net_ms = pair_existing_ms;
+            if let Some(extra) = extra_move_state {
+                for (n, e) in net_ms.iter_mut().zip(extra.iter()) {
+                    *n ^= *e;
+                }
+            }
+            let ms_arg = if net_ms == [0u8; crate::gstate::MOVE_STATE_BODY_SIZE] {
+                None
+            } else {
+                Some(net_ms)
+            };
             let new_end = if active_is_a {
                 build_compact_commit(
                     buf_b,
@@ -1897,6 +2078,7 @@ impl<S: Storage> Fs<S> {
                     op,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
+                    ms_arg,
                 )?
             } else {
                 build_compact_commit(
@@ -1908,6 +2090,7 @@ impl<S: Storage> Fs<S> {
                     op,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
+                    ms_arg,
                 )?
             };
             self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
@@ -2185,6 +2368,7 @@ impl<S: Storage> Fs<S> {
                     &op,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
+                    None,
                 )?
             } else {
                 build_compact_commit(
@@ -2196,6 +2380,7 @@ impl<S: Storage> Fs<S> {
                     &op,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
+                    None,
                 )?
             };
             self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
@@ -2343,6 +2528,7 @@ impl<S: Storage> Fs<S> {
                     &op,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
+                    None,
                 )?
             } else {
                 build_compact_commit(
@@ -2354,6 +2540,7 @@ impl<S: Storage> Fs<S> {
                     &op,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
+                    None,
                 )?
             };
             self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
@@ -2503,7 +2690,44 @@ impl<S: Storage> Fs<S> {
             return Err(Error::GeometryMismatch);
         }
 
-        Ok(Self { storage, superblock: sb, root: ROOT_BLOCK_PAIR })
+        // pair was a Copy struct over the buffer slices; letting it
+        // go out of scope releases the borrow. Reuse `block_a_buf`
+        // and `block_b_buf` for the gstate sweep below.
+        let _ = pair;
+        let mut fs = Self { storage, superblock: sb, root: ROOT_BLOCK_PAIR };
+
+        // Atomic-move-state recovery: walk every reachable metadata
+        // pair, XOR-accumulate `MoveState` tag bodies into a single
+        // gstate. If non-zero, a cross-directory rename was crashed
+        // between its destination Create and source Delete; complete
+        // the move before returning the Fs handle so the user never
+        // observes the duplicate state.
+        let gstate = accumulate_gstate(&mut fs.storage, fs.root, block_a_buf, block_b_buf)?;
+        if let Some((src_pair, src_id)) = gstate.pending_move() {
+            fs.recover_pending_move(src_pair, src_id, block_a_buf, block_b_buf)?;
+        }
+        Ok(fs)
+    }
+
+    /// Complete a cross-directory rename whose destination commit
+    /// landed but whose source Delete did not. Emits a Delete at
+    /// `src_id` in `src_pair` along with a balancing `MoveState` tag
+    /// so the filesystem's gstate returns to zero.
+    fn recover_pending_move(
+        &mut self,
+        src_pair: BlockPair,
+        src_id: u16,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        let balance = crate::gstate::build_move_body(src_pair, src_id);
+        self.apply_op_to_pair_with_movestate(
+            src_pair,
+            &WriteOp::Remove { id: src_id },
+            Some(balance),
+            buf_a,
+            buf_b,
+        )
     }
 
     /// Decoded superblock for this filesystem.
