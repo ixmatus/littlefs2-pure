@@ -197,22 +197,38 @@ fn ctz_to_inline_shrink_via_write_to_root() {
 }
 
 #[test]
-fn write_to_root_rejects_overwriting_directory() {
-    // mkdir /foo, then try to write to /foo (as a file). Must fail
-    // with AlreadyExists; the directory must remain intact.
+fn write_to_root_rejects_overwriting_directory_ctz() {
+    // mkdir /foo, then try to write a >INLINE_MAX file to /foo. The CTZ
+    // write path must reject with AlreadyExists; the directory stays.
     let mut fs = make_fs();
     let mut a = [0u8; MemStorage::BLOCK_SIZE];
     let mut b = [0u8; MemStorage::BLOCK_SIZE];
     fs.mkdir(Path::new("/foo").unwrap(), &mut a, &mut b).unwrap();
 
-    // Small content -> tries write_inline; current write_inline_to_pair
-    // accepts existing-as-directory via Update which is wrong. Let me
-    // first test the CTZ path (which we just added the kind check to).
     let big: Vec<u8> = vec![0; 400];
     let err = fs.write_to_root(b"foo", &big, &mut a, &mut b).unwrap_err();
     assert_eq!(err, Error::AlreadyExists);
 
-    // /foo must still be a directory.
+    let r = fs.resolve(Path::new("/foo").unwrap(), &mut a, &mut b).unwrap();
+    assert_eq!(r.entry.kind, EntryKind::Directory);
+}
+
+#[test]
+fn write_to_root_rejects_overwriting_directory_inline() {
+    // Same scenario as above but with content small enough to take the
+    // inline write path. Without the kind-check guard, the Update op
+    // would substitute an InlineStruct over the DirStruct slot during
+    // compaction and orphan the children pair.
+    let mut fs = make_fs();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    fs.mkdir(Path::new("/foo").unwrap(), &mut a, &mut b).unwrap();
+
+    // Small content -> inline path.
+    let err = fs.write_to_root(b"foo", b"x", &mut a, &mut b).unwrap_err();
+    assert_eq!(err, Error::AlreadyExists);
+
+    // /foo must still be a directory and still mountable.
     let r = fs.resolve(Path::new("/foo").unwrap(), &mut a, &mut b).unwrap();
     assert_eq!(r.entry.kind, EntryKind::Directory);
 }

@@ -2653,7 +2653,11 @@ impl<S: Storage> Fs<S> {
             return Err(Error::InvalidPath);
         }
 
-        // Look up existing entry (if any) and the next free id.
+        // Look up existing entry (if any) and the next free id. Reject
+        // overwrite of a Directory: the Update path would substitute an
+        // InlineStruct over the existing DirStruct slot during compaction,
+        // orphaning the directory's children pair. Mirrors the matching
+        // check in `write_ctz_to_pair`.
         self.storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
         self.storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
         let (existing_id, count): (Option<u16>, usize) = {
@@ -2661,7 +2665,16 @@ impl<S: Storage> Fs<S> {
             let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
             let active_is_a = pair.active_block == pair_addr.a;
             let n = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
-            (crate::dir::lookup(&pair, name).map(|r| r.entry.id), n)
+            let existing = match crate::dir::lookup(&pair, name) {
+                Some(r) => {
+                    if r.entry.kind != crate::dir::EntryKind::RegularFile {
+                        return Err(Error::AlreadyExists);
+                    }
+                    Some(r.entry.id)
+                }
+                None => None,
+            };
+            (existing, n)
         };
 
         let op = if let Some(id) = existing_id {
