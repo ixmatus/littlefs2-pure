@@ -45,6 +45,28 @@ use crate::block::BlockAddress;
 use crate::error::Error;
 use crate::storage::Storage;
 
+/// Reject a CTZ block address decoded from on-disk bytes that lies
+/// outside the device.
+///
+/// CTZ skip pointers are attacker-controlled in a corrupt or
+/// adversarial image (the `Storage` threat model names them
+/// explicitly). The kernel already pre-checks metadata pair addresses
+/// (`fs::pair_in_bounds`); this is the symmetric guard for the CTZ
+/// path, classifying an out-of-range pointer as [`Error::Corrupt`]
+/// (the on-disk structure is malformed) rather than letting it reach
+/// `Storage::read` and surface as the indistinguishable [`Error::Io`],
+/// or, with a non-conforming adapter, as memory unsafety. Defense in
+/// depth: a conforming `Storage` impl also rejects the access, but the
+/// kernel does not depend on that for a correct error classification.
+#[inline]
+fn require_in_bounds<S: Storage>(b: BlockAddress) -> Result<BlockAddress, Error> {
+    if b.as_u32() < S::BLOCK_COUNT {
+        Ok(b)
+    } else {
+        Err(Error::Corrupt)
+    }
+}
+
 /// Decoded CTZ struct, as carried in the body of a
 /// [`crate::TagType::CtzStruct`] tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,7 +242,12 @@ pub fn collect_chain_blocks<S: Storage>(
     let mut index = total_blocks - 1;
     let mut sp_buf = [0u8; 8];
     loop {
-        out[index as usize] = head;
+        // Every address written to `out` is bounds-checked here, so
+        // both this walk's `storage.read(head, ..)` and the caller's
+        // later forward read of `out[i]` only ever dereference an
+        // in-device block; an out-of-range skip pointer is rejected as
+        // `Error::Corrupt`.
+        out[index as usize] = require_in_bounds::<S>(head)?;
         if index == 0 {
             break;
         }
@@ -229,7 +256,7 @@ pub fn collect_chain_blocks<S: Storage>(
         let ptr0 = u32::from_le_bytes([sp_buf[0], sp_buf[1], sp_buf[2], sp_buf[3]]);
         if count == 2 {
             let ptr1 = u32::from_le_bytes([sp_buf[4], sp_buf[5], sp_buf[6], sp_buf[7]]);
-            out[(index - 1) as usize] = BlockAddress::new(ptr0);
+            out[(index - 1) as usize] = require_in_bounds::<S>(BlockAddress::new(ptr0))?;
             head = BlockAddress::new(ptr1);
             index -= 2;
         } else {
