@@ -2851,6 +2851,16 @@ impl<S: Storage> Fs<S> {
     /// landed but whose source Delete did not. Emits a Delete at
     /// `src_id` in `src_pair` along with a balancing `MoveState` tag
     /// so the filesystem's gstate returns to zero.
+    ///
+    /// After a genuine crashed rename `src_id` is always the live id
+    /// the source entry held at rename time (recovery runs at mount,
+    /// before any user operation can renumber it). The defensive guard
+    /// here is for a corrupted or adversarial `MoveState` body that
+    /// decodes to an out-of-range id: emitting a `Delete` past the
+    /// live count would corrupt the splice state of `src_pair`, and
+    /// the balancing `MoveState` would permanently mask the
+    /// inconsistency by zeroing the gstate. Surface it as
+    /// [`Error::Corrupt`] at mount instead.
     fn recover_pending_move(
         &mut self,
         src_pair: BlockPair,
@@ -2858,6 +2868,19 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
+        // Validate src_id against the live entry count of src_pair.
+        self.storage.read(src_pair.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(src_pair.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        {
+            let pair = MetadataPair::parse(src_pair.a, &*buf_a, src_pair.b, &*buf_b)?;
+            let active_is_a = pair.active_block == src_pair.a;
+            let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+            let count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
+            if (src_id as usize) >= count {
+                return Err(Error::Corrupt);
+            }
+        }
+
         let balance = crate::gstate::build_move_body(src_pair, src_id);
         self.apply_op_to_pair_with_movestate(
             src_pair,
