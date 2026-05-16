@@ -14,9 +14,13 @@
 //! - The path must not exceed [`MAX_PATH`].
 //! - Individual components (between `/` separators) must not exceed
 //!   [`crate::NAME_MAX`] bytes.
-//! - Components must not be `.` or `..`. LittleFS does not interpret these
-//!   specially and would create literal entries with those names; the crate
-//!   rejects them at the boundary to prevent confusion.
+//! - Components must not be `.` or `..`. The C reference *does* interpret
+//!   these: `lfs_dir_find` skips a `.` component and applies `..`
+//!   parent-cancellation. This crate instead rejects them at construction,
+//!   a deliberately stricter and simpler invariant: it keeps no-path
+//!   arithmetic out of the `no_std` kernel and makes every accepted `Path`
+//!   already normalized. The caller normalizes before construction if it
+//!   needs `.`/`..` semantics.
 //! - Components must not be empty (so `//` is rejected).
 //!
 //! The validation is strict on construction so that downstream code can

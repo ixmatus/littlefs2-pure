@@ -32,11 +32,12 @@ use core::result::Result;
 /// decoded from on-disk structures (directory pair pointers, CTZ skip
 /// pointers, tail links) can be arbitrary in a corrupt or adversarial
 /// image. The kernel defensively rejects out-of-range pair addresses
-/// before dereferencing them, but it relies on this trait contract as
-/// the final backstop: an implementation that indexes a backing buffer
-/// without its own bounds check turns a malformed image into memory
-/// unsafety in the adapter. The reference [`crate::NorAlignedStorage`]
-/// and all test adapters honor this.
+/// and CTZ skip pointers before dereferencing them, classifying such
+/// an address as [`crate::Error::Corrupt`], but it still relies on
+/// this trait contract as the final backstop: an implementation that
+/// indexes a backing buffer without its own bounds check turns a
+/// malformed image into memory unsafety in the adapter. The reference
+/// [`crate::NorAlignedStorage`] and all test adapters honor this.
 ///
 /// # Geometry invariants
 ///

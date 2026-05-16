@@ -271,25 +271,43 @@ impl Storage for MemStorage {
     const CACHE_SIZE: usize = Self::CACHE_SIZE;
     const LOOKAHEAD_SIZE: usize = Self::LOOKAHEAD_SIZE;
 
+    // Bounds checks mirror the fuzzer's `ImageStorage`: an explicit
+    // `block >= BLOCK_COUNT` reject and checked arithmetic so an
+    // out-of-range or overflowing block address (an adversarial CTZ
+    // skip pointer or pair link) returns `Err(())` rather than
+    // wrapping into a valid-looking offset or panicking on a slice
+    // index. This honors the `Storage` contract and lets a test
+    // observe the kernel's clean reject of such an address.
     fn read(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), ()> {
-        let start = (block as usize) * Self::BLOCK_SIZE + (off as usize);
-        if start + buf.len() > self.data.len() {
+        let start = (block as usize)
+            .checked_mul(Self::BLOCK_SIZE)
+            .and_then(|b| b.checked_add(off as usize))
+            .ok_or(())?;
+        let end = start.checked_add(buf.len()).ok_or(())?;
+        if block >= Self::BLOCK_COUNT || end > self.data.len() {
             return Err(());
         }
-        buf.copy_from_slice(&self.data[start..start + buf.len()]);
+        buf.copy_from_slice(&self.data[start..end]);
         Ok(())
     }
 
     fn program(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), ()> {
-        let start = (block as usize) * Self::BLOCK_SIZE + (off as usize);
-        if start + data.len() > self.data.len() {
+        let start = (block as usize)
+            .checked_mul(Self::BLOCK_SIZE)
+            .and_then(|b| b.checked_add(off as usize))
+            .ok_or(())?;
+        let end = start.checked_add(data.len()).ok_or(())?;
+        if block >= Self::BLOCK_COUNT || end > self.data.len() {
             return Err(());
         }
-        self.data[start..start + data.len()].copy_from_slice(data);
+        self.data[start..end].copy_from_slice(data);
         Ok(())
     }
 
     fn erase(&mut self, block: u32) -> Result<(), ()> {
+        if block >= Self::BLOCK_COUNT {
+            return Err(());
+        }
         let start = (block as usize) * Self::BLOCK_SIZE;
         let end = start + Self::BLOCK_SIZE;
         if end > self.data.len() {

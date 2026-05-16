@@ -22,7 +22,7 @@ Open issues against the v1.x line (regressions, ergonomic gaps that surface in r
 ## Write path
 
 - [x] Slice-based commit builder (`meta::Commit`): tag stream encoding + CCRC tail.
-- [x] Commit construction with FCRC redundancy. `meta::Commit::finish_padded` emits an FCRC tag describing the next prog window's post-erase CRC and pads the CCRC body so the next commit starts at a prog-aligned offset.
+- [x] FCRC, written **and** validated. `meta::Commit::finish_padded` emits an FCRC tag describing the next prog window's post-erase CRC and pads the CCRC body so the next commit starts at a prog-aligned offset. `MetadataReader::new`, after a commit's CCRC verifies, recomputes that window's CRC from disk and rolls the commit back one level on mismatch, so an intra-program torn write following a CCRC-valid commit is rejected rather than accepted (review item R2; matches the C reference). Verified by `tests/review_r2_fcrc.rs` and the C-written conformance vectors.
 - [x] Block allocator: scan-based BFS walk from root, tracks used blocks via bitmap. (`src/alloc.rs`)
 - [x] Compaction on overflow: when the active block fills, GC live state plus the new write into a fresh commit on the alternate, bump revision.
 - [x] NOR-aligned program wrapper: `NorAlignedStorage` caches programs to `PROG_SIZE`-aligned windows. (`src/nor.rs`)
@@ -32,7 +32,7 @@ Open issues against the v1.x line (regressions, ergonomic gaps that surface in r
 - [x] `Fs::format` producing a superblock the C reference can mount, verified bidirectionally via `tests/conformance.rs` and `tests/roundtrip.rs`.
 - [x] Sync semantics. `Fs::sync` exposes the storage layer's sync; every public mutation already syncs as its final step.
 - [x] `remove_from_root`, `remove_at_path`: delete a file by name, splice-correct.
-- [x] `list_root`, `list_dir`: enumerate entries; splice-correct; chase HardTails through up to 32 continuation pairs.
+- [x] `list_root`, `list_dir`: enumerate entries; splice-correct; chase HardTails with a Brent's cycle-safe walk (no arbitrary length cap at this layer; a cyclic chain is rejected `Corrupt`, see ADR-0009). End-to-end the reachable metadata-pair set is bounded by `MAX_QUEUED_PAIRS = 32` at mount; see the limitation note below.
 - [x] `exists`: typed wrapper over `resolve`.
 - [x] `mkdir`, `rmdir` at arbitrary paths.
 - [x] `read_at_path`, `size_of`: offset-aware random read (inline + CTZ).
@@ -46,10 +46,10 @@ Open issues against the v1.x line (regressions, ergonomic gaps that surface in r
 
 ## Hardening
 
-- [x] Power-loss safety: torn-write scenarios across every program-call boundary land the FS as either the pre-state or post-state. Verified by `tests/power_loss.rs` using `TornWriteStorage` for inline-write and CTZ-streaming-append scenarios.
+- [x] Power-loss safety, both torn-write classes. Program-call-boundary tears land the FS as either the pre-state or post-state, verified by `tests/power_loss.rs` (`TornWriteStorage`, inline-write and CTZ-streaming-append scenarios). Intra-program tears (a power loss inside the program that follows a CCRC-valid commit) are caught reader-side by FCRC validation: the affected commit is rejected and the pair falls back to the prior durable state, verified by `tests/review_r2_fcrc.rs` (review item R2). The CCRC alone could not distinguish this case.
 - [x] Fuzz harnesses on the parsers and the commit reader. `fuzz/` (libFuzzer, nightly-only, outside the main workspace) covers `MetadataReader::new`, `Tag::from_bits`, `Path::new`, `Superblock::from_bytes`, and `CtzStruct::from_bytes`.
 - [x] Kani harness: revision counter comparison totality under wrap.
-- [x] Kani harness: commit accept-or-reject dispatch totality.
+- [x] Kani harness: commit accept-or-reject dispatch **panic-freedom**. `commit_proofs.rs` stubs `crc::update` to a nondeterministic value, so the harness proves the dispatch never panics on arbitrary input (the stub strengthens that result); it does **not** prove accept/reject *correctness*, which is pinned instead by the conformance and roundtrip vectors against the C reference.
 - [x] Kani harness: tag dispatch + CRC equivalence.
 
 ## Conformance
@@ -81,5 +81,8 @@ Every item that gated v1.0 shipped before the freeze. The list is preserved here
 
 - **LittleFS v1 on-disk format support.** The crate name is `littlefs2-pure` for a reason.
 - **HardTail-chain pair relocation.** Our writer never emits `HardTail` tags (directories cap at `MAX_LIVE_ENTRIES = 256` per pair without splitting). Continuation-pair relocation is unreachable through this kernel; supporting it would require first adding directory splitting and a corresponding `UpdateHardTail` write op. The path is documented in ADR-0005.
+- **Reachable metadata-pair set larger than `MAX_QUEUED_PAIRS = 32`.** `Fs::mount` runs the `accumulate_gstate` move/relocation-recovery sweep, a deduplicating BFS over the directory forest bounded by `MAX_QUEUED_PAIRS = 32` (`src/alloc.rs`). An image whose reachable pair set exceeds 32, including a single directory the C reference split across more than 32 continuation pairs, is rejected at mount with `Error::OutOfRange` before enumeration is reached. The tail-walk layer itself is cycle-safe and cap-free (Brent's, ADR-0009); lifting this end-to-end limit would require an unbounded dedup set in a no-alloc kernel and would enlarge the ADR-0006-pinned Cortex-M0+ stack arrays, so it is a deliberate v1.x constraint, not a defect. Documented in ADR-0009.
+- **Non-UTF-8 entry names through the public path API.** LittleFS entry names are arbitrary bytes; the crate's lower layers are byte-clean, but [`Path`] is the public chokepoint and is UTF-8. A conformant C filesystem containing a non-UTF-8 entry name is therefore partially unreachable through the `Path`-taking API. The bytes are intact on disk; only the safe path surface declines them. Widening `Path` to bytes is a 2.x API question.
+- **`INLINE_MAX = 128` is a fixed writer-side inline/CTZ threshold.** The C reference chooses the inline cap dynamically from geometry; `Fs::INLINE_MAX` hardcodes 128. This affects only this crate's *writer* (where it promotes a file from inline to a CTZ chain). The reader dispatches on the on-disk struct tag type, not on size, so a C-written file is read back faithfully whether or not C would have kept it inline; read interop is fully preserved. The only divergence is the boundary at which this crate's writer promotes to CTZ. Benign, documented here so it is not rediscovered as a divergence.
 - **Async I/O.** The `Storage` trait is synchronous. A future async wrapper crate is allowed but does not block v1.0.
 - **Multi-threading.** The kernel is single-threaded by construction; users serialize at the boundary.
