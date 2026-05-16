@@ -78,6 +78,16 @@ a deeply nested tree with cascading relocations is the unmitigated worst
 case. A consumer on a severely stack constrained target must size the
 stack against tree depth, not against a constant.
 
+Quantified: the recursion depth is bounded above by the number of
+reachable metadata pairs, which mount caps at `MAX_QUEUED_PAIRS = 32`
+(see ADR-0009; an image exceeding it is rejected at mount). The
+unmitigated worst case is therefore on the order of `32 * 2.5 KiB`,
+roughly 80 KiB of concurrent `SlotOffsets` frames, plus the transient
+6 KiB `lookup` peak, on the `thumbv6m-none-eabi` ship target. This is
+an upper bound, not a typical figure (real depth is 1 or 2); it exists
+so a constrained consumer has a concrete number to size against rather
+than an open-ended "tree depth."
+
 **Explicitly out of scope.** This ADR does not introduce a recursion
 depth limit, does not move the scratch arrays to caller supplied
 buffers, and does not change `MAX_LIVE_ENTRIES`. A 2.x revision is free

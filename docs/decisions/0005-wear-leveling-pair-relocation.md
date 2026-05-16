@@ -141,6 +141,15 @@ practice and not exercised.
   directories) the walk is much shorter. The constant factor is
   acceptable for an operation that fires once every
   `BLOCK_CYCLES` compactions.
+- The C reference aligns a pair's initial revision count to the
+  relocation modulus so the first relocation lands a fixed phase
+  into the pair's life; this writer starts revisions at 1 and does
+  not phase-align. The effect is a benign cadence shift: the same
+  number of relocations happen over the device's life, just on a
+  different schedule, and an image written by either is read by the
+  other (the modulus governs *when* a relocation fires, not the
+  on-disk shape). Noted so the difference is not later mistaken for
+  a fidelity bug.
 
 **Explicitly out of scope.**
 

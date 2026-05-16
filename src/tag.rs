@@ -14,9 +14,12 @@
 //! bullet below). It is one field on the wire; the split is shown
 //! here so the box is not misread as a flat 11 bit value.
 //!
-//! - **valid (1 bit).** `0` means the tag is valid; `1` means the tag slot is
-//!   either erased (all `0xFF` reads as `1` after the XOR with the previous
-//!   tag inverts to `0` for a valid tag) or otherwise reserved.
+//! - **valid (1 bit).** After the XOR decode, `0` (the MSB clear) marks a
+//!   tag that occupies a real slot in the commit log; `1` marks a slot that
+//!   is not a written tag (erased flash, or reserved). This is exactly
+//!   [`Tag::is_valid`] (`(bits >> 31) == 0`), and matches the C reference's
+//!   `lfs_tag_isvalid` polarity. How an all-`0xFF` erased region decodes is
+//!   covered in *The XOR convention* below.
 //! - **type (11 bits).** The high 3 bits are the *abstract type* (see
 //!   [`AbstractType`]); the low 8 bits are a *chunk* that subdivides each
 //!   abstract type into concrete tag kinds.
@@ -170,8 +173,11 @@ pub enum TagType {
     /// unused `0x7fe` slot in the Globals abstract type). Carries a
     /// 16-byte body encoding `(old_pair, new_pair)` for mount-time
     /// recovery of half-completed wear-levelling relocations.
-    /// C littlefs readers see this as an unknown tag and skip it per
-    /// the spec's forward-compat rule.
+    /// C littlefs does not recognize this `0x7fe` slot; interop with a
+    /// torn `0x7fe` aggregate is not verified against the C reference.
+    /// The crate-side recovery is documented in ADR-0005; the C-interop
+    /// behaviour is asserted by neither the spec nor a conformance
+    /// vector and must not be relied on.
     RelocateState,
 
     /// A tag whose 11 bit type field did not match any known variant. The

@@ -16,6 +16,7 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 ### Changed
 
 - The Kani CI job pins `model-checking/kani-github-action@v1.1` and `kani-version: 0.67.0` instead of tracking floating `@v1` / `kani-version: latest`, so a Kani bump is an explicit reviewed change rather than silent drift (post-review item M9). The job remains non blocking by deliberate design.
+- Verification posture corrected to match what is actually proven (review item R4, no behaviour change). `crc::update` is now pinned to an oracle external to this codebase: the published CRC-32 check value `CRC32("123456789") = 0xCBF43926` ("CRC-32/ISO-HDLC", CRC RevEng catalogue), via `!update(INIT, b"123456789") == 0xCBF43926`; the prior `crc.rs` doctest was an admitted tautology and the only anchor was transitive through conformance mount. Overstated or inaccurate claims were corrected in place: the `KNOWN_ISSUES.md` Kani commit-dispatch entry now says panic-freedom (not accept/reject correctness, which the `crc::update` stub does not prove); the `RelocateState` tag doc no longer asserts a nonexistent spec forward-compat rule; the `Path` doc no longer claims the C reference treats `.`/`..` literally (it does interpret them; the crate is deliberately stricter); the tag module valid-bit sentence is de-garbled; ADR-0006 now quantifies the worst-case stack ceiling; ADR-0005 notes the benign initial-revision modulus cadence shift; and `KNOWN_ISSUES.md` records the UTF-8 `Path` and fixed `INLINE_MAX` interop notes.
 
 ## [1.0.1] - 2026-05-15
 
