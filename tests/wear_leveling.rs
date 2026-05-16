@@ -613,10 +613,7 @@ fn relocate_state_xor_from_root<S: Storage>(
                         let body = tag_entry.body;
                         let ca = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
                         let cb = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
-                        queue.push(BlockPair::new(
-                            BlockAddress::new(ca),
-                            BlockAddress::new(cb),
-                        ));
+                        queue.push(BlockPair::new(BlockAddress::new(ca), BlockAddress::new(cb)));
                     }
                 }
             }
@@ -678,9 +675,8 @@ fn relocation_xor_aggregate_zeros_on_success() {
     let mut b2 = vec![0u8; WearStorage::BLOCK_SIZE];
     let mut fs2 = Fs::mount(storage, &mut a2, &mut b2).unwrap();
     let mut out = vec![0u8; 64];
-    let n = fs2
-        .read_at_path(Path::new("/sub/hot").unwrap(), 0, &mut out, &mut a2, &mut b2)
-        .unwrap();
+    let n =
+        fs2.read_at_path(Path::new("/sub/hot").unwrap(), 0, &mut out, &mut a2, &mut b2).unwrap();
     let expected_len = 16 + (199u32 % 32) as usize;
     assert_eq!(n, expected_len);
     assert!(out[..n].iter().all(|&c| c == b'x'));
