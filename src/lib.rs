@@ -107,6 +107,11 @@ pub use crate::dir::{entries, live_entries, lookup, DirEntry, EntryKind, Resolve
 pub use crate::error::{Error, Result};
 pub use crate::file::{File, OpenOptions, SeekFrom};
 pub use crate::fs::{Fs, ResolvedPath};
+// Low-level metadata plumbing, re-exported only for the conformance and
+// adversarial test harnesses. Hidden from the rendered docs and a
+// candidate to move to `pub(crate)` in 2.0; see the per-item notes in
+// `crate::meta`. The re-export stays so the 1.x semver contract holds.
+#[doc(hidden)]
 pub use crate::meta::{MetadataPair, MetadataReader, TagEntry};
 pub use crate::nor::NorAlignedStorage;
 pub use crate::path::Path;

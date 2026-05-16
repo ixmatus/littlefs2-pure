@@ -3155,6 +3155,13 @@ impl<S: Storage> Fs<S> {
     ///
     /// The returned [`MetadataPair`] borrows from `buf_a` and `buf_b`, so
     /// the buffers must outlive the borrow.
+    ///
+    /// **Low-level internal.** Exposed for the conformance and
+    /// adversarial test harnesses. It stays semver-covered for the 1.x
+    /// line but is not part of the recommended surface and is a
+    /// candidate to move to `pub(crate)` in 2.0; depend on it only with
+    /// that in mind.
+    #[doc(hidden)]
     pub fn read_pair<'b>(
         &mut self,
         addr: BlockPair,
