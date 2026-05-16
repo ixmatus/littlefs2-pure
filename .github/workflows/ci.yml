@@ -113,6 +113,36 @@ jobs:
         run: make -C tools/verify_image
       - run: cargo test --test roundtrip
 
+  fuzz_smoke:
+    # Build and briefly run every cargo-fuzz target on a bounded
+    # budget. This catches a target that no longer compiles against
+    # the library API or panics on its seed; it is a tripwire, not a
+    # campaign (the exhaustive runs stay manual, see fuzz/README.md).
+    #
+    # Advisory, exactly like the kani job: it is deliberately kept out
+    # of the required-checks list, because a nightly libFuzzer or
+    # sanitizer toolchain regression should surface here rather than
+    # block changes unrelated to the fuzz surface. A genuine panic
+    # still fails this job (no continue-on-error), it just does not
+    # gate the merge.
+    name: fuzz smoke (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: smoke every target
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          for t in $(cargo +nightly fuzz list); do
+            echo "::group::fuzz $t"
+            cargo +nightly fuzz run "$t" -- -runs=20000 -max_total_time=30
+            echo "::endgroup::"
+          done
+
   kani:
     # Discharge every #[kani::proof] under src/verify/ via the
     # model-checking action. The two commit_proofs harnesses
