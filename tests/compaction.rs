@@ -16,8 +16,8 @@ use common::MemStorage;
 /// written.
 fn fill_root(fs: &mut Fs<MemStorage>) -> Vec<String> {
     let mut written = Vec::new();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     for i in 0..30u32 {
         let name = format!("f{i:02}");
         let content = format!("=={i:02}");
@@ -33,10 +33,10 @@ fn fill_root(fs: &mut Fs<MemStorage>) -> Vec<String> {
 #[test]
 fn compaction_triggers_when_block_fills() {
     let mut storage = MemStorage::new();
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut storage, &mut scratch).unwrap();
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
     let written = fill_root(&mut fs);
@@ -44,8 +44,8 @@ fn compaction_triggers_when_block_fills() {
 
     // Every successfully-written name should still resolve.
     for name in &written {
-        let mut a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
         let path = format!("/{name}");
         let r = fs.resolve(Path::new(&path).unwrap(), &mut a, &mut b).unwrap();
         let expected = format!("=={}", &name[1..]);
@@ -56,11 +56,11 @@ fn compaction_triggers_when_block_fills() {
 #[test]
 fn compaction_survives_remount() {
     let mut storage = MemStorage::new();
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut storage, &mut scratch).unwrap();
     let written = {
-        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
         let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
         let names = fill_root(&mut fs);
         storage = fs.into_storage();
@@ -72,12 +72,12 @@ fn compaction_survives_remount() {
     assert!(written.len() > 8, "test geometry must produce a compaction");
 
     // Remount fresh and verify everything is still there.
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
     for name in &written {
-        let mut a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
         let path = format!("/{name}");
         let r = fs.resolve(Path::new(&path).unwrap(), &mut a, &mut b).unwrap();
         let expected = format!("=={}", &name[1..]);
@@ -88,12 +88,12 @@ fn compaction_survives_remount() {
 #[test]
 fn compaction_bumps_revision_counter() {
     let mut storage = MemStorage::new();
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut storage, &mut scratch).unwrap();
 
     // After format, block 0 has revision 1, block 1 is erased.
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
     let _written = fill_root(&mut fs);

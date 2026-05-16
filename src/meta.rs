@@ -52,6 +52,12 @@ use crate::error::Error;
 use crate::tag::{Tag, TagType};
 
 /// One tag plus its body bytes, as emitted by [`MetadataReader::iter_tags`].
+///
+/// **Low-level internal.** Exposed for the conformance and adversarial
+/// test harnesses. It stays semver-covered for the 1.x line but is not
+/// part of the recommended surface and is a candidate to move to
+/// `pub(crate)` in 2.0; depend on it only with that in mind.
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct TagEntry<'a> {
     /// The decoded tag (after XOR against the running base).
@@ -66,6 +72,12 @@ pub struct TagEntry<'a> {
 /// identify the committed region. Subsequent calls to
 /// [`MetadataReader::iter_tags`] enumerate tags from that region without
 /// re verifying CRCs.
+///
+/// **Low-level internal.** Exposed for the conformance and adversarial
+/// test harnesses. It stays semver-covered for the 1.x line but is not
+/// part of the recommended surface and is a candidate to move to
+/// `pub(crate)` in 2.0; depend on it only with that in mind.
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct MetadataReader<'a> {
     block: &'a [u8],
@@ -306,6 +318,12 @@ fn scan_for_tail(block: &[u8], committed_end: usize) -> (Option<BlockPair>, bool
 ///
 /// The byte layout matches what [`MetadataReader`] consumes (verified
 /// against `lfs_dir_commit` in the C reference).
+///
+/// **Low-level internal.** Exposed for the conformance and adversarial
+/// test harnesses. It stays semver-covered for the 1.x line but is not
+/// part of the recommended surface and is a candidate to move to
+/// `pub(crate)` in 2.0; depend on it only with that in mind.
+#[doc(hidden)]
 #[derive(Debug)]
 pub struct Commit<'a> {
     buf: &'a mut [u8],
@@ -536,6 +554,12 @@ pub fn rev_scmp(a: u32, b: u32) -> i32 {
 /// one with the higher revision counter (signed comparison, wrap aware);
 /// if that block has no successfully verified commits, the alternate is
 /// used instead.
+///
+/// **Low-level internal.** Exposed for the conformance and adversarial
+/// test harnesses. It stays semver-covered for the 1.x line but is not
+/// part of the recommended surface and is a candidate to move to
+/// `pub(crate)` in 2.0; depend on it only with that in mind.
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct MetadataPair<'a> {
     /// Address of the active block (the one whose tags `reader` returns).

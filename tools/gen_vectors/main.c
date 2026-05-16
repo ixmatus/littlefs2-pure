@@ -178,6 +178,82 @@ static void scenario_nested_dir(const char *out_path) {
     dump(out_path);
 }
 
+// 05_hardtail_dir: a directory dense enough that the C reference splits
+// its metadata across more than one pair, linking them with a HardTail.
+// At this geometry (256 byte blocks, 8 blocks) the device is tiny, so we
+// add single byte named, zero length files until the filesystem reports
+// no space, then stop. The densest directory the geometry admits is the
+// one most likely to have forced a continuation pair; the Rust side
+// asserts every created name is listed, which only holds if the reader
+// walks the whole HardTail chain.
+static void scenario_hardtail_dir(const char *out_path) {
+    reset();
+    lfs_t lfs;
+    must(lfs_format(&lfs, &cfg), "format");
+    must(lfs_mount(&lfs, &cfg), "mount");
+    must(lfs_mkdir(&lfs, "/d"), "mkdir");
+    // Names "/d/a" .. "/d/z"; stop at the first allocation failure
+    // instead of aborting so the image is the densest one that fits.
+    char path[8];
+    for (char c = 'a'; c <= 'z'; c++) {
+        snprintf(path, sizeof path, "/d/%c", c);
+        lfs_file_t f;
+        int err = lfs_file_open(&lfs, &f, path, LFS_O_WRONLY | LFS_O_CREAT);
+        if (err < 0) break;  // out of space: the directory is now full
+        if (lfs_file_close(&lfs, &f) < 0) break;
+    }
+    must(lfs_unmount(&lfs), "unmount");
+    dump(out_path);
+}
+
+// 06_inline_ctz_boundary: two files straddling the inline/CTZ struct
+// boundary, /b128 (128 bytes) and /b129 (129 bytes). Which one the C
+// reference stores inline versus as a CTZ skip list is geometry
+// dependent; the point of the vector is that our reader classifies each
+// exactly as the C writer did, so the Rust test reads the struct type
+// back rather than assuming it.
+static void scenario_inline_ctz_boundary(const char *out_path) {
+    reset();
+    lfs_t lfs;
+    must(lfs_format(&lfs, &cfg), "format");
+    must(lfs_mount(&lfs, &cfg), "mount");
+    uint8_t body[129];
+    for (size_t i = 0; i < sizeof body; i++) body[i] = (uint8_t)(i & 0xff);
+    lfs_file_t f;
+    must(lfs_file_open(&lfs, &f, "/b128", LFS_O_WRONLY | LFS_O_CREAT), "open b128");
+    must(lfs_file_write(&lfs, &f, body, 128), "write b128");
+    must(lfs_file_close(&lfs, &f), "close b128");
+    must(lfs_file_open(&lfs, &f, "/b129", LFS_O_WRONLY | LFS_O_CREAT), "open b129");
+    must(lfs_file_write(&lfs, &f, body, 129), "write b129");
+    must(lfs_file_close(&lfs, &f), "close b129");
+    must(lfs_unmount(&lfs), "unmount");
+    dump(out_path);
+}
+
+// 07_deleted_recreated: create /x, delete it, recreate /x with a
+// different body. Exercises the reader against a metadata pair that
+// carries a delete tombstone followed by a fresh create for the same
+// name; a naive reader that stops at the first matching name or ignores
+// the delete would resolve the stale content.
+static void scenario_deleted_recreated(const char *out_path) {
+    reset();
+    lfs_t lfs;
+    must(lfs_format(&lfs, &cfg), "format");
+    must(lfs_mount(&lfs, &cfg), "mount");
+    lfs_file_t f;
+    must(lfs_file_open(&lfs, &f, "/x", LFS_O_WRONLY | LFS_O_CREAT), "open first");
+    static const char first[] = "stale-v1";  // 8 bytes
+    must(lfs_file_write(&lfs, &f, first, 8), "write first");
+    must(lfs_file_close(&lfs, &f), "close first");
+    must(lfs_remove(&lfs, "/x"), "remove");
+    must(lfs_file_open(&lfs, &f, "/x", LFS_O_WRONLY | LFS_O_CREAT), "open second");
+    static const char second[] = "fresh-v2!!";  // 10 bytes
+    must(lfs_file_write(&lfs, &f, second, 10), "write second");
+    must(lfs_file_close(&lfs, &f), "close second");
+    must(lfs_unmount(&lfs), "unmount");
+    dump(out_path);
+}
+
 int main(int argc, char **argv) {
     const char *outdir = argc > 1 ? argv[1] : ".";
     char path[512];
@@ -193,6 +269,15 @@ int main(int argc, char **argv) {
 
     snprintf(path, sizeof path, "%s/04_nested_dir.bin", outdir);
     scenario_nested_dir(path);
+
+    snprintf(path, sizeof path, "%s/05_hardtail_dir.bin", outdir);
+    scenario_hardtail_dir(path);
+
+    snprintf(path, sizeof path, "%s/06_inline_ctz_boundary.bin", outdir);
+    scenario_inline_ctz_boundary(path);
+
+    snprintf(path, sizeof path, "%s/07_deleted_recreated.bin", outdir);
+    scenario_deleted_recreated(path);
 
     return 0;
 }

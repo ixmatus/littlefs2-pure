@@ -557,3 +557,127 @@ fn relocation_atomic_across_every_power_loss() {
         }
     }
 }
+
+/// BFS the reachable metadata-pair forest from the root and
+/// XOR-accumulate every committed `RelocateState` body, mirroring the
+/// kernel's private `accumulate_gstate` walk using only the public API.
+///
+/// For each visited pair only the active block's tag stream contributes
+/// (matching `MetadataPair::parse`, which exposes the higher-revision
+/// block's reader). Children are followed via live `DirStruct` tags and
+/// the pair's tail, exactly as `accumulate_gstate` does.
+fn relocate_state_xor_from_root<S: Storage>(
+    fs: &mut Fs<S>,
+    root: BlockPair,
+) -> [u8; littlefs2_pure::gstate::RELOCATE_STATE_BODY_SIZE] {
+    use littlefs2_pure::gstate::RELOCATE_STATE_BODY_SIZE;
+    use littlefs2_pure::TagType;
+
+    let mut acc = [0u8; RELOCATE_STATE_BODY_SIZE];
+    let mut queue: core_alloc::vec::Vec<BlockPair> = core_alloc::vec![root];
+    let mut visited: core_alloc::vec::Vec<BlockPair> = core_alloc::vec::Vec::new();
+
+    while let Some(pair_addr) = queue.pop() {
+        if visited.contains(&pair_addr) {
+            continue;
+        }
+        visited.push(pair_addr);
+
+        let mut a = vec![0u8; S::BLOCK_SIZE];
+        let mut b = vec![0u8; S::BLOCK_SIZE];
+        fs.storage_mut().read(pair_addr.a.as_u32(), 0, &mut a).expect("read a");
+        fs.storage_mut().read(pair_addr.b.as_u32(), 0, &mut b).expect("read b");
+        let pair = MetadataPair::parse(pair_addr.a, &a, pair_addr.b, &b).expect("pair parses");
+
+        for entry in pair.reader.iter_tags() {
+            if entry.tag.tag_type() == TagType::RelocateState
+                && entry.body.len() == RELOCATE_STATE_BODY_SIZE
+            {
+                for (acc_b, e) in acc.iter_mut().zip(entry.body.iter()) {
+                    *acc_b ^= *e;
+                }
+            }
+        }
+
+        // Enqueue children via live DirStruct entries plus the tail,
+        // matching the kernel BFS. `entries` is the raw walker; in the
+        // test scenarios below there are no deletions so raw == live.
+        for de in littlefs2_pure::entries(&pair) {
+            if de.kind == littlefs2_pure::EntryKind::Directory {
+                // Find the DirStruct body at this id.
+                for tag_entry in pair.reader.iter_tags() {
+                    if tag_entry.tag.tag_type() == TagType::DirStruct
+                        && tag_entry.tag.id() == de.id
+                        && tag_entry.body.len() == 8
+                    {
+                        let body = tag_entry.body;
+                        let ca = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                        let cb = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                        queue.push(BlockPair::new(BlockAddress::new(ca), BlockAddress::new(cb)));
+                    }
+                }
+            }
+        }
+        if let Some(tail) = pair.reader.tail() {
+            queue.push(tail);
+        }
+    }
+    acc
+}
+
+/// Pins the relocation-recovery design contract: after a clean
+/// (non-torn) sequence of wear-level relocations, every committed
+/// `RelocateState` body reachable from the root must XOR to zero.
+///
+/// Each relocation writes one `RelocateState` body onto the relocated
+/// pair's new active block and a balancing copy into the parent's
+/// `propagate_relocation` commit; the two cancel. The post-relocation
+/// pair address is `(old_active, fresh)` — the recycled alternate is
+/// unreferenced from the root and is correctly NOT walked. If
+/// `accumulate_gstate` ever regressed to also fold the orphaned
+/// alternate, or dropped the parent's cancel body, this aggregate
+/// would be non-zero and a spurious recovery would fire on every
+/// mount.
+#[test]
+fn relocation_xor_aggregate_zeros_on_success() {
+    let mut storage = WearStorage::new();
+    let mut scratch = vec![0u8; WearStorage::BLOCK_SIZE];
+    Fs::format(&mut storage, &mut scratch).unwrap();
+    let mut a = vec![0u8; WearStorage::BLOCK_SIZE];
+    let mut b = vec![0u8; WearStorage::BLOCK_SIZE];
+    let mut fs = Fs::mount(storage, &mut a, &mut b).unwrap();
+
+    fs.mkdir(Path::new("/sub").unwrap(), &mut a, &mut b).unwrap();
+    let initial = read_subdir_pair_from_root_path(&mut fs, "/sub");
+
+    // Force /sub to relocate several times (same pattern as the proven
+    // subdir_pair_relocates_to_fresh_blocks test).
+    for i in 0..200u32 {
+        let val = vec![b'x'; 16 + (i % 32) as usize];
+        fs.write_to_path(Path::new("/sub/hot").unwrap(), &val, &mut a, &mut b).unwrap();
+    }
+    let post = read_subdir_pair_from_root_path(&mut fs, "/sub");
+    assert_ne!(initial, post, "/sub must have relocated for this test to be meaningful");
+
+    let root = fs.root();
+    let acc = relocate_state_xor_from_root(&mut fs, root);
+    assert_eq!(
+        acc,
+        [0u8; littlefs2_pure::gstate::RELOCATE_STATE_BODY_SIZE],
+        "RelocateState bodies must XOR to zero after clean relocations; \
+         non-zero means accumulate_gstate's reachable set or the \
+         parent-cancel pairing has regressed"
+    );
+
+    // Steady-state remount must succeed without recovery side effects.
+    let storage = fs.into_storage();
+    let mut a2 = vec![0u8; WearStorage::BLOCK_SIZE];
+    let mut b2 = vec![0u8; WearStorage::BLOCK_SIZE];
+    let mut fs2 = Fs::mount(storage, &mut a2, &mut b2).unwrap();
+    let mut out = vec![0u8; 64];
+    let n =
+        fs2.read_at_path(Path::new("/sub/hot").unwrap(), 0, &mut out, &mut a2, &mut b2).unwrap();
+    let expected_len = 16 + (199u32 % 32) as usize;
+    assert_eq!(n, expected_len);
+    assert!(out[..n].iter().all(|&c| c == b'x'));
+}

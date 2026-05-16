@@ -8,18 +8,18 @@ use common::MemStorage;
 
 fn make_fs() -> Fs<MemStorage> {
     let mut storage = MemStorage::new();
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut storage, &mut scratch).unwrap();
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap()
 }
 
 #[test]
 fn rmdir_empty_directory_succeeds() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     fs.mkdir(Path::new("/empty").unwrap(), &mut a, &mut b).unwrap();
     assert!(fs.exists(Path::new("/empty").unwrap(), &mut a, &mut b).unwrap());
     fs.rmdir(Path::new("/empty").unwrap(), &mut a, &mut b).unwrap();
@@ -29,8 +29,8 @@ fn rmdir_empty_directory_succeeds() {
 #[test]
 fn rmdir_non_empty_returns_not_empty() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     fs.mkdir(Path::new("/d").unwrap(), &mut a, &mut b).unwrap();
     fs.write_to_path(Path::new("/d/file").unwrap(), b"contents", &mut a, &mut b).unwrap();
     let err = fs.rmdir(Path::new("/d").unwrap(), &mut a, &mut b).unwrap_err();
@@ -43,8 +43,8 @@ fn rmdir_non_empty_returns_not_empty() {
 #[test]
 fn rmdir_on_regular_file_returns_already_exists() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     fs.write_to_path(Path::new("/file").unwrap(), b"x", &mut a, &mut b).unwrap();
     let err = fs.rmdir(Path::new("/file").unwrap(), &mut a, &mut b).unwrap_err();
     assert_eq!(err, Error::AlreadyExists);
@@ -53,8 +53,8 @@ fn rmdir_on_regular_file_returns_already_exists() {
 #[test]
 fn remove_at_path_on_directory_returns_already_exists() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     fs.mkdir(Path::new("/d").unwrap(), &mut a, &mut b).unwrap();
     let err = fs.remove_at_path(Path::new("/d").unwrap(), &mut a, &mut b).unwrap_err();
     assert_eq!(err, Error::AlreadyExists);
@@ -63,8 +63,8 @@ fn remove_at_path_on_directory_returns_already_exists() {
 #[test]
 fn rmdir_then_recreate_directory() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     fs.mkdir(Path::new("/audit").unwrap(), &mut a, &mut b).unwrap();
     fs.rmdir(Path::new("/audit").unwrap(), &mut a, &mut b).unwrap();
     // Recreate it; the allocator should have reclaimed the blocks.
@@ -75,8 +75,8 @@ fn rmdir_then_recreate_directory() {
 #[test]
 fn read_at_path_inline_with_offset() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     fs.write_to_path(Path::new("/cfg").unwrap(), b"abcdefghij", &mut a, &mut b).unwrap();
 
     let mut buf = [0u8; 4];
@@ -92,8 +92,8 @@ fn read_at_path_inline_with_offset() {
 #[test]
 fn read_at_path_ctz_with_offset() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let content: Vec<u8> = (0..500).map(|i| (i & 0xff) as u8).collect();
     fs.write_to_path(Path::new("/log").unwrap(), &content, &mut a, &mut b).unwrap();
 
@@ -113,8 +113,8 @@ fn read_at_path_ctz_with_offset() {
 #[test]
 fn size_of_reports_correct_size() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     fs.write_to_path(Path::new("/small").unwrap(), b"abc", &mut a, &mut b).unwrap();
     assert_eq!(fs.size_of(Path::new("/small").unwrap(), &mut a, &mut b).unwrap(), 3);
 
@@ -126,8 +126,8 @@ fn size_of_reports_correct_size() {
 #[test]
 fn truncate_path_shrinks_file() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let mut cs = [0u8; 1024];
     fs.write_to_path(Path::new("/f").unwrap(), b"abcdefghij", &mut a, &mut b).unwrap();
 
@@ -143,8 +143,8 @@ fn truncate_path_shrinks_file() {
 #[test]
 fn truncate_path_extends_with_zeros() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let mut cs = [0u8; 1024];
     fs.write_to_path(Path::new("/f").unwrap(), b"abc", &mut a, &mut b).unwrap();
 
@@ -160,8 +160,8 @@ fn truncate_path_extends_with_zeros() {
 #[test]
 fn tail_room_zero_for_inline_file() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     fs.write_to_path(Path::new("/cfg").unwrap(), b"hello", &mut a, &mut b).unwrap();
     assert_eq!(fs.tail_room(Path::new("/cfg").unwrap(), &mut a, &mut b).unwrap(), 0);
 }
@@ -170,8 +170,8 @@ fn tail_room_zero_for_inline_file() {
 fn tail_room_reports_remaining_space_in_ctz_tail() {
     // 200 bytes -> CTZ with one block (block 0, capacity = BLOCK_SIZE = 256).
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let initial: Vec<u8> = (0..200).map(|i| (i & 0xff) as u8).collect();
     fs.write_to_path(Path::new("/log").unwrap(), &initial, &mut a, &mut b).unwrap();
     // Tail (block 0) holds 200 of 256 content bytes; 56 free.
@@ -184,8 +184,8 @@ fn tail_room_shrinks_after_streaming_append() {
     // an append, tail_room decreases by exactly the bytes that fit in
     // the previous tail.
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let initial: Vec<u8> = (0..200).map(|i| (i & 0xff) as u8).collect();
     fs.write_to_path(Path::new("/log").unwrap(), &initial, &mut a, &mut b).unwrap();
     let room_before = fs.tail_room(Path::new("/log").unwrap(), &mut a, &mut b).unwrap();
@@ -201,8 +201,8 @@ fn truncate_path_to_zero() {
     // truncate(0) effectively clears the file. Useful for "open with
     // truncate" semantics.
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let mut cs = [0u8; 1024];
     fs.write_to_path(Path::new("/log").unwrap(), b"contents", &mut a, &mut b).unwrap();
     fs.truncate_path(Path::new("/log").unwrap(), 0, &mut cs, &mut a, &mut b).unwrap();

@@ -51,6 +51,19 @@ use crate::{BlockAddress, ROOT_BLOCK_PAIR};
 /// [`crate::dir::live_entries`] accepts can also be compacted.
 const MAX_LIVE_ENTRIES: usize = crate::dir::MAX_LIVE_ENTRIES;
 
+// Stack budget guard. `gather_live_slots` callers stack a
+// `[SlotOffsets; MAX_LIVE_ENTRIES]` scratch array, and that array is on
+// the frame of `apply_op_to_pair_inner` while it recurses through
+// `propagate_relocation`. The Cortex-M0+ ship target has a small stack,
+// so the per-frame cost of this array is a documented, pinned budget,
+// not an incidental detail. If `SlotOffsets` grows, this fails to
+// compile until docs/decisions/0006-stack-budget.md is revisited.
+const _: () = assert!(
+    core::mem::size_of::<SlotOffsets>() == 10
+        && core::mem::size_of::<[SlotOffsets; MAX_LIVE_ENTRIES]>() == 2560,
+    "SlotOffsets stack budget changed; revisit docs/decisions/0006-stack-budget.md"
+);
+
 /// Maximum chain length a single CTZ write can produce.
 ///
 /// At 4 KiB blocks this caps a single full-rewrite CTZ write at ~1 MiB;
@@ -106,6 +119,19 @@ impl SlotOffsets {
 /// tags. Returns the number of live entries.
 ///
 /// `active_is_a` selects which of `buf_a`/`buf_b` is the source.
+///
+/// # Stack budget
+///
+/// `slots` is a `[SlotOffsets; MAX_LIVE_ENTRIES]` (256 * 10 = 2560
+/// bytes). It is not allocated here but every caller stacks it as a
+/// local before the call, and one such caller is
+/// [`Fs::apply_op_to_pair_inner`], which holds that 2.5 KiB frame while
+/// it recurses through [`Fs::propagate_relocation`] back into itself
+/// during wear-levelling relocation. On the Cortex-M0+ ship target this
+/// is a deliberate, pinned budget rather than an accident; the static
+/// assertion near [`MAX_LIVE_ENTRIES`] fails the build if `SlotOffsets`
+/// grows, and `docs/decisions/0006-stack-budget.md` records the full
+/// accounting and the recursion-depth bound.
 fn gather_live_slots(
     pair: &MetadataPair<'_>,
     active_is_a: bool,
@@ -545,6 +571,12 @@ fn accumulate_gstate<S: Storage>(
         // and don't multiplex into the live-entries view; enqueue the
         // latest tail just like the read-side resolver does.
         if let Some(tail_pair) = pair.reader.tail() {
+            // A live tail pointing outside the device is genuine
+            // corruption; proceeding would yield an incomplete gstate
+            // and silently mis-recover.
+            if !pair_in_bounds::<S>(tail_pair) {
+                return Err(Error::Corrupt);
+            }
             if !queue[..tail].contains(&tail_pair) {
                 if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                     return Err(Error::OutOfRange);
@@ -562,6 +594,12 @@ fn accumulate_gstate<S: Storage>(
                 let a = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
                 let b = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
                 let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
+                // A live DirStruct pointing outside the device is
+                // genuine corruption; reject rather than read garbage
+                // and mis-accumulate the recovery gstate.
+                if !pair_in_bounds::<S>(child) {
+                    return Err(Error::Corrupt);
+                }
                 if !queue[..tail].contains(&child) {
                     if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                         return Err(Error::OutOfRange);
@@ -673,6 +711,19 @@ fn should_relocate(
     new_revision % m == 0
 }
 
+/// True when both blocks of a metadata-pair address decoded from disk
+/// fall inside the device geometry. A `DirStruct` / tail body in a
+/// corrupt or adversarial image can encode any 32-bit value; the
+/// kernel must validate before handing the address to
+/// [`Storage::read`] (whose contract requires it to error on
+/// out-of-range, but which the kernel does not depend on for its own
+/// correctness). Out-of-range pair addresses are never legitimately
+/// reachable, so callers skip or reject them.
+#[inline]
+fn pair_in_bounds<S: Storage>(pair: BlockPair) -> bool {
+    pair.a.as_u32() < S::BLOCK_COUNT && pair.b.as_u32() < S::BLOCK_COUNT
+}
+
 /// BFS-walk the metadata-pair forest from `root` and return the
 /// `(parent_pair, id)` of the entry whose `DirStruct` body matches
 /// `target`. Returns `Ok(None)` if `target` is not referenced by any
@@ -741,7 +792,10 @@ fn find_parent_in_tree<S: Storage>(
                     if child == target {
                         return Ok(Some((pair_addr, entry.tag.id())));
                     }
-                    if !queue[..tail].contains(&child) {
+                    // An out-of-range DirStruct body cannot be the
+                    // target (a real allocated pair) and must never be
+                    // dereferenced; skip it rather than enqueue.
+                    if pair_in_bounds::<S>(child) && !queue[..tail].contains(&child) {
                         if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                             return Err(Error::OutOfRange);
                         }
@@ -765,7 +819,7 @@ fn find_parent_in_tree<S: Storage>(
                         entry.body[7],
                     ]);
                     let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
-                    if !queue[..tail].contains(&child) {
+                    if pair_in_bounds::<S>(child) && !queue[..tail].contains(&child) {
                         if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                             return Err(Error::OutOfRange);
                         }
@@ -2412,19 +2466,16 @@ impl<S: Storage> Fs<S> {
             BlockPair::new(BlockAddress::new(a), BlockAddress::new(b))
         };
 
-        // Read the directory's pair and verify it's empty.
-        self.storage.read(dir_pair.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(dir_pair.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        {
-            let dp = MetadataPair::parse(dir_pair.a, &*buf_a, dir_pair.b, &*buf_b)?;
-            let mut live_count = 0usize;
-            crate::dir::live_entries(&dp, |_| {
-                live_count += 1;
-                Ok::<(), Error>(())
-            })?;
-            if live_count > 0 {
-                return Err(Error::NotEmpty);
-            }
+        // Verify the directory is empty. A directory may be threaded
+        // across HardTail continuation pairs; counting only the first
+        // pair would wrongly accept rmdir of a directory whose entries
+        // live in a continuation pair. This writer never emits
+        // HardTail tags, so single-pair directories are the common
+        // case, but an image written by the C reference (or a future
+        // chaining writer) can have them. Walk the whole chain.
+        let live_count = self.list_pair_chain(dir_pair, |_| {}, buf_a, buf_b)?;
+        if live_count > 0 {
+            return Err(Error::NotEmpty);
         }
 
         self.remove_from_pair(parent, leaf.as_bytes(), buf_a, buf_b)
@@ -2653,7 +2704,11 @@ impl<S: Storage> Fs<S> {
             return Err(Error::InvalidPath);
         }
 
-        // Look up existing entry (if any) and the next free id.
+        // Look up existing entry (if any) and the next free id. Reject
+        // overwrite of a Directory: the Update path would substitute an
+        // InlineStruct over the existing DirStruct slot during compaction,
+        // orphaning the directory's children pair. Mirrors the matching
+        // check in `write_ctz_to_pair`.
         self.storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
         self.storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
         let (existing_id, count): (Option<u16>, usize) = {
@@ -2661,7 +2716,16 @@ impl<S: Storage> Fs<S> {
             let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
             let active_is_a = pair.active_block == pair_addr.a;
             let n = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
-            (crate::dir::lookup(&pair, name).map(|r| r.entry.id), n)
+            let existing = match crate::dir::lookup(&pair, name) {
+                Some(r) => {
+                    if r.entry.kind != crate::dir::EntryKind::RegularFile {
+                        return Err(Error::AlreadyExists);
+                    }
+                    Some(r.entry.id)
+                }
+                None => None,
+            };
+            (existing, n)
         };
 
         let op = if let Some(id) = existing_id {
@@ -2838,6 +2902,16 @@ impl<S: Storage> Fs<S> {
     /// landed but whose source Delete did not. Emits a Delete at
     /// `src_id` in `src_pair` along with a balancing `MoveState` tag
     /// so the filesystem's gstate returns to zero.
+    ///
+    /// After a genuine crashed rename `src_id` is always the live id
+    /// the source entry held at rename time (recovery runs at mount,
+    /// before any user operation can renumber it). The defensive guard
+    /// here is for a corrupted or adversarial `MoveState` body that
+    /// decodes to an out-of-range id: emitting a `Delete` past the
+    /// live count would corrupt the splice state of `src_pair`, and
+    /// the balancing `MoveState` would permanently mask the
+    /// inconsistency by zeroing the gstate. Surface it as
+    /// [`Error::Corrupt`] at mount instead.
     fn recover_pending_move(
         &mut self,
         src_pair: BlockPair,
@@ -2845,6 +2919,19 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
+        // Validate src_id against the live entry count of src_pair.
+        self.storage.read(src_pair.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(src_pair.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        {
+            let pair = MetadataPair::parse(src_pair.a, &*buf_a, src_pair.b, &*buf_b)?;
+            let active_is_a = pair.active_block == src_pair.a;
+            let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+            let count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
+            if (src_id as usize) >= count {
+                return Err(Error::Corrupt);
+            }
+        }
+
         let balance = crate::gstate::build_move_body(src_pair, src_id);
         self.apply_op_to_pair_with_movestate(
             src_pair,
@@ -3094,6 +3181,13 @@ impl<S: Storage> Fs<S> {
     ///
     /// The returned [`MetadataPair`] borrows from `buf_a` and `buf_b`, so
     /// the buffers must outlive the borrow.
+    ///
+    /// **Low-level internal.** Exposed for the conformance and
+    /// adversarial test harnesses. It stays semver-covered for the 1.x
+    /// line but is not part of the recommended surface and is a
+    /// candidate to move to `pub(crate)` in 2.0; depend on it only with
+    /// that in mind.
+    #[doc(hidden)]
     pub fn read_pair<'b>(
         &mut self,
         addr: BlockPair,

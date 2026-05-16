@@ -56,6 +56,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "mount_image"
+path = "fuzz_targets/mount_image.rs"
+test = false
+doc = false
+bench = false
+
 # Workspace exclusion: the parent workspace ignores this nested
 # crate so `cargo build` at the repo root does not pick it up
 # automatically. The exclusion lives in the parent Cargo.toml.

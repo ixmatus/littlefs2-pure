@@ -14,7 +14,7 @@ fn assert_read(data: &[u8]) {
     let ctz = build_ctz_chain(&mut storage, 2, data);
 
     let mut out = vec![0u8; data.len()];
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     let n = read_ctz(&mut storage, &ctz, &mut out, &mut scratch).unwrap();
     assert_eq!(n, data.len());
     assert_eq!(out, data);
@@ -25,7 +25,7 @@ fn read_zero_bytes() {
     let mut storage = MemStorage::new();
     let ctz = build_ctz_chain(&mut storage, 2, &[]);
     let mut out = [0u8; 4];
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     let n = read_ctz(&mut storage, &ctz, &mut out, &mut scratch).unwrap();
     assert_eq!(n, 0);
 }
@@ -107,7 +107,7 @@ fn read_partial_into_short_output() {
     let mut storage = MemStorage::new();
     let ctz = build_ctz_chain(&mut storage, 2, &data);
     let mut out = [0u8; 100];
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     let n = read_ctz(&mut storage, &ctz, &mut out, &mut scratch).unwrap();
     assert_eq!(n, 100);
     assert_eq!(&out[..], &data[..100]);

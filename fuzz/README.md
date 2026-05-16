@@ -18,6 +18,7 @@ with the library crate's stable / no_std posture.
 | `path_validate` | `Path::new` rejects every disallowed UTF-8 input cleanly; accepted paths satisfy every documented invariant |
 | `superblock_parse` | `Superblock::from_bytes` on arbitrary slices is total |
 | `ctz_struct_decode` | `CtzStruct::from_bytes`/`to_bytes` are inverses on 8-byte inputs; non-8-byte inputs error |
+| `mount_image` | `Fs::mount` + a bounded root listing on an arbitrary whole-device image is total: a mounted filesystem or a typed `Error`, never a panic, never an out-of-bounds store access, never an unbounded loop |
 
 ## Running
 
@@ -46,7 +47,14 @@ cargo +nightly fuzz run meta_reader_parse -- -runs=10000
 
 ## CI
 
-Fuzz targets are NOT run by the per-commit CI matrix — their
-runtime is unbounded by design. They are intended for ad-hoc
-"discover what panics" sessions and for the longer-running
-verification gate before each minor release.
+A `fuzz_smoke` job runs every target for a short bounded budget
+(`-runs`, a few seconds each) on every push. It is advisory: like the
+Kani job it stays out of the required checks, because a libFuzzer
+toolchain or sanitizer regression should flag here rather than block
+unrelated changes. The smoke budget catches a target that panics on
+its seed or fails to build; it is not a substitute for a real
+campaign.
+
+The exhaustive runs stay manual. Their runtime is unbounded by design;
+they are for ad hoc "discover what panics" sessions and for the
+longer running verification gate before each minor release.

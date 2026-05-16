@@ -58,13 +58,13 @@ fn dir_iter_yields_each_name_tag() {
     };
     storage.write_block(0, &common::build_superblock_block(&sb, MemStorage::BLOCK_SIZE));
 
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
     // Read the directory at (2, 3).
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let pair = fs
         .read_pair(BlockPair::new(BlockAddress::new(2), BlockAddress::new(3)), &mut a, &mut b)
         .unwrap();
@@ -106,12 +106,12 @@ fn dir_iter_empty_pair_yields_nothing() {
     };
     storage.write_block(0, &common::build_superblock_block(&sb, MemStorage::BLOCK_SIZE));
 
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let pair = fs
         .read_pair(BlockPair::new(BlockAddress::new(2), BlockAddress::new(3)), &mut a, &mut b)
         .unwrap();
@@ -145,12 +145,12 @@ fn lookup_finds_inline_file() {
     };
     storage.write_block(0, &common::build_superblock_block(&sb, MemStorage::BLOCK_SIZE));
 
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let pair = fs
         .read_pair(BlockPair::new(BlockAddress::new(2), BlockAddress::new(3)), &mut a, &mut b)
         .unwrap();
@@ -192,12 +192,12 @@ fn lookup_finds_directory() {
     };
     storage.write_block(0, &common::build_superblock_block(&sb, MemStorage::BLOCK_SIZE));
 
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let pair = fs
         .read_pair(BlockPair::new(BlockAddress::new(2), BlockAddress::new(3)), &mut a, &mut b)
         .unwrap();
@@ -239,12 +239,12 @@ fn lookup_missing_name_returns_none() {
     };
     storage.write_block(0, &common::build_superblock_block(&sb, MemStorage::BLOCK_SIZE));
 
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let pair = fs
         .read_pair(BlockPair::new(BlockAddress::new(2), BlockAddress::new(3)), &mut a, &mut b)
         .unwrap();
@@ -277,12 +277,12 @@ fn dir_iter_skips_non_name_tags() {
     };
     storage.write_block(0, &common::build_superblock_block(&sb, MemStorage::BLOCK_SIZE));
 
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let pair = fs
         .read_pair(BlockPair::new(BlockAddress::new(2), BlockAddress::new(3)), &mut a, &mut b)
         .unwrap();

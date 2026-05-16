@@ -36,10 +36,10 @@ use common::{MemStorage, TornWriteStorage};
 fn count_program_calls<F: FnOnce(&mut Fs<TornWriteStorage>)>(scenario: F) -> usize {
     let storage = MemStorage::new();
     let mut torn = TornWriteStorage::new(storage, usize::MAX);
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut torn, &mut scratch).unwrap();
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(torn, &mut buf_a, &mut buf_b).unwrap();
     let pre_count = fs.storage().program_count;
     scenario(&mut fs);
@@ -61,7 +61,7 @@ where
 
     // First, format. If format gets torn, the chip is in a partial
     // state and Fs::mount will return Unformatted or Corrupt.
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     let format_result = Fs::format(&mut torn, &mut scratch);
     if format_result.is_err() {
         // Format itself was torn. The chip is unformatted (still all
@@ -69,8 +69,8 @@ where
         return remount_and_read_log(torn);
     }
     {
-        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
         match Fs::mount(torn, &mut buf_a, &mut buf_b) {
             Ok(mut fs) => {
                 // Run the scenario; the storage may fail mid-call.
@@ -85,11 +85,11 @@ where
 
 fn remount_and_read_log(torn: TornWriteStorage) -> Result<Vec<u8>, Error> {
     let storage = torn.into_inner();
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b)?;
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     if fs.exists(Path::new("/log").unwrap(), &mut a, &mut b)? {
         let size = fs.size_of(Path::new("/log").unwrap(), &mut a, &mut b)?;
         let mut out = vec![0u8; size as usize];
@@ -106,8 +106,8 @@ fn inline_write_atomic_across_every_power_loss() {
     // Across every possible power-loss point, the FS must mount as
     // either: no /log (pre-state) or /log = "ONE" (post-state).
     let scenario = |fs: &mut Fs<TornWriteStorage>| {
-        let mut a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
         let _ = fs.write_to_path(Path::new("/log").unwrap(), b"ONE", &mut a, &mut b);
     };
 
@@ -143,14 +143,14 @@ fn ctz_streaming_append_atomic_across_every_power_loss() {
     // streaming append path is exercised. Then append 16 bytes
     // (single tail-fill program + UpdateCtz commit).
     let mut seed_storage = MemStorage::new();
-    let mut seed_scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut seed_scratch = common::make_buffer();
     Fs::format(&mut seed_storage, &mut seed_scratch).unwrap();
     let seed_bytes = {
-        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
         let mut fs = Fs::mount(seed_storage, &mut buf_a, &mut buf_b).unwrap();
-        let mut a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
         let initial: Vec<u8> = (0..200).map(|i| (i & 0xff) as u8).collect();
         fs.write_to_path(Path::new("/log").unwrap(), &initial, &mut a, &mut b).unwrap();
         fs.into_storage()
@@ -158,8 +158,8 @@ fn ctz_streaming_append_atomic_across_every_power_loss() {
     let seed_data = seed_bytes.data.clone();
 
     let append_scenario = |fs: &mut Fs<TornWriteStorage>| {
-        let mut a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
         let _ = fs.append_to_path(
             Path::new("/log").unwrap(),
             b"0123456789ABCDEF",
@@ -174,8 +174,8 @@ fn ctz_streaming_append_atomic_across_every_power_loss() {
         let mut storage = MemStorage::new();
         storage.data = seed_data.clone();
         let torn = TornWriteStorage::new(storage, usize::MAX);
-        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
         let mut fs = Fs::mount(torn, &mut buf_a, &mut buf_b).unwrap();
         let pre = fs.storage().program_count;
         append_scenario(&mut fs);
@@ -192,8 +192,8 @@ fn ctz_streaming_append_atomic_across_every_power_loss() {
         storage.data = seed_data.clone();
         let torn = TornWriteStorage::new(storage, trigger);
         let result = {
-            let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-            let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+            let mut buf_a = common::make_buffer();
+            let mut buf_b = common::make_buffer();
             match Fs::mount(torn, &mut buf_a, &mut buf_b) {
                 Ok(mut fs) => {
                     append_scenario(&mut fs);

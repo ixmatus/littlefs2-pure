@@ -55,9 +55,10 @@
 //! allocator scan, so no corruption occurs, but the file remains at
 //! its pre-open state. Always call [`File::sync`] or
 //! [`File::close`] explicitly to commit. The `#[must_use]` attribute
-//! on [`Fs::open`](crate::Fs::open) and a debug-assertion in the
-//! Drop impl flag the unsynced path; release builds silently
-//! discard.
+//! on [`Fs::open`](crate::Fs::open) is the only compile-time nudge
+//! toward an explicit sync; the Drop impl deliberately stays silent
+//! (it has no way to surface a diagnostic and the dropped blocks are
+//! reclaimable, so there is nothing safe or useful for it to do).
 
 use crate::block::BlockPair;
 use crate::ctz::CtzStruct;

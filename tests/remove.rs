@@ -9,18 +9,18 @@ use common::MemStorage;
 
 fn make_fs() -> Fs<MemStorage> {
     let mut storage = MemStorage::new();
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut storage, &mut scratch).unwrap();
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap()
 }
 
 #[test]
 fn remove_then_resolve_returns_not_found() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     fs.write_inline_to_root(b"doomed", b"contents", &mut a, &mut b).unwrap();
 
     // Confirm it exists, then remove.
@@ -35,8 +35,8 @@ fn remove_then_resolve_returns_not_found() {
 #[test]
 fn remove_missing_returns_not_found() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let err = fs.remove_from_root(b"nope", &mut a, &mut b).unwrap_err();
     assert_eq!(err, Error::NotFound);
 }
@@ -44,8 +44,8 @@ fn remove_missing_returns_not_found() {
 #[test]
 fn remove_renumbers_subsequent_entries() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     fs.write_inline_to_root(b"a", b"AAA", &mut a, &mut b).unwrap();
     fs.write_inline_to_root(b"b", b"BBB", &mut a, &mut b).unwrap();
     fs.write_inline_to_root(b"c", b"CCC", &mut a, &mut b).unwrap();
@@ -65,16 +65,16 @@ fn remove_renumbers_subsequent_entries() {
 #[test]
 fn remove_with_compaction_survives_remount() {
     let mut storage = MemStorage::new();
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut storage, &mut scratch).unwrap();
 
     let final_state: Vec<(Vec<u8>, Vec<u8>)>;
     {
-        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
         let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
-        let mut a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
 
         // Write enough files to drive at least one compaction. With
         // MemStorage's 256-byte blocks, 8 small entries already force
@@ -102,11 +102,11 @@ fn remove_with_compaction_survives_remount() {
     }
 
     // Fresh mount: every survivor still readable, every removed one gone.
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     for (name, expected) in &final_state {
         let mut path_buf = vec![b'/'];
         path_buf.extend_from_slice(name);
@@ -123,8 +123,8 @@ fn remove_with_compaction_survives_remount() {
 #[test]
 fn list_root_enumerates_only_user_entries() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     fs.write_inline_to_root(b"alpha", b"1", &mut a, &mut b).unwrap();
     fs.write_inline_to_root(b"beta", b"2", &mut a, &mut b).unwrap();
     fs.write_inline_to_root(b"gamma", b"3", &mut a, &mut b).unwrap();
@@ -149,8 +149,8 @@ fn list_root_enumerates_only_user_entries() {
 #[test]
 fn list_root_skips_removed_entries() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     fs.write_inline_to_root(b"keep", b"k", &mut a, &mut b).unwrap();
     fs.write_inline_to_root(b"drop", b"d", &mut a, &mut b).unwrap();
     fs.remove_from_root(b"drop", &mut a, &mut b).unwrap();
@@ -163,15 +163,15 @@ fn list_root_skips_removed_entries() {
 #[test]
 fn exists_handles_root() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     assert!(fs.exists(Path::new("/").unwrap(), &mut a, &mut b).unwrap());
 }
 
 #[test]
 fn exists_returns_false_for_missing() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     assert!(!fs.exists(Path::new("/not-here").unwrap(), &mut a, &mut b).unwrap());
 }

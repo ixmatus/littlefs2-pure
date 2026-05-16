@@ -4,9 +4,15 @@
 //! identifies what follows. The bit layout, in MSB to LSB order, is:
 //!
 //! ```text
-//! [1 bit  ][ 11 bits ][ 10 bits ][ 10 bits ]
-//!  valid   type        id         length
+//! [1 bit  ][ 11 bits         ][ 10 bits ][ 10 bits ]
+//!  valid   type                id         length
+//!          ^^^^ = [3 bits abstract][8 bits chunk]
 //! ```
+//!
+//! The 11 bit `type` field is itself split: the high 3 bits are the
+//! abstract type and the low 8 bits are the chunk (see the `type`
+//! bullet below). It is one field on the wire; the split is shown
+//! here so the box is not misread as a flat 11 bit value.
 //!
 //! - **valid (1 bit).** `0` means the tag is valid; `1` means the tag slot is
 //!   either erased (all `0xFF` reads as `1` after the XOR with the previous
@@ -318,7 +324,12 @@ impl Tag {
         // construction.
         match AbstractType::from_bits(((self.0 >> 28) & 0x7) as u8) {
             Some(t) => t,
-            None => AbstractType::Name, // unreachable; abstract_type bits are masked to 3.
+            // `& 0x7` constrains the input to 0..8, and
+            // `AbstractType::from_bits` is total over that range, so
+            // this arm is unreachable. Make that a hard fact: a future
+            // change that drops a variant fails loudly here instead of
+            // silently mis-classifying every tag as `Name`.
+            None => unreachable!(),
         }
     }
 
@@ -419,18 +430,20 @@ impl fmt::Debug for Tag {
 mod tests {
     use super::*;
 
-    /// A freshly erased region (all `0xFF` bytes) XORed against the
-    /// previous tag value `0xFFFFFFFF` decodes to a tag with the valid bit
-    /// clear. This is the "end of commit log" sentinel.
+    /// A freshly erased word (`0xFFFFFFFF`) XORed against the running
+    /// base `0xFFFFFFFF` decodes to exactly `0x00000000`, whose valid
+    /// bit (MSB) is clear so [`Tag::is_valid`] returns `true`. The test
+    /// asserts only that decoded value; it is named for what it
+    /// checks, not for "end of log". End-of-log is a higher-level
+    /// condition (the commit walker stops when the running tag matches
+    /// the on-disk word), not a property of this single decode.
     #[test]
-    fn erased_region_decodes_to_end_marker() {
+    fn erased_word_xored_against_all_ones_decodes_to_zero_tag() {
         let erased = Tag::from_bits(0xFFFF_FFFF);
         let prev = Tag::from_bits(0xFFFF_FFFF);
         let decoded = erased.xor(prev);
         assert_eq!(decoded.into_bits(), 0);
-        assert!(decoded.is_valid()); // 0 has valid bit (MSB) clear, so is_valid() == true
-                                     // The interesting end-of-log sentinel is *after* the XOR: when the
-                                     // running tag matches what's on disk, no further commits remain.
+        assert!(decoded.is_valid());
     }
 
     /// Pin the bit layout against a hand crafted vector: a Superblock NAME
