@@ -22,7 +22,7 @@ Open issues against the v1.x line (regressions, ergonomic gaps that surface in r
 ## Write path
 
 - [x] Slice-based commit builder (`meta::Commit`): tag stream encoding + CCRC tail.
-- [x] Commit construction with FCRC redundancy. `meta::Commit::finish_padded` emits an FCRC tag describing the next prog window's post-erase CRC and pads the CCRC body so the next commit starts at a prog-aligned offset.
+- [x] FCRC, written **and** validated. `meta::Commit::finish_padded` emits an FCRC tag describing the next prog window's post-erase CRC and pads the CCRC body so the next commit starts at a prog-aligned offset. `MetadataReader::new`, after a commit's CCRC verifies, recomputes that window's CRC from disk and rolls the commit back one level on mismatch, so an intra-program torn write following a CCRC-valid commit is rejected rather than accepted (review item R2; matches the C reference). Verified by `tests/review_r2_fcrc.rs` and the C-written conformance vectors.
 - [x] Block allocator: scan-based BFS walk from root, tracks used blocks via bitmap. (`src/alloc.rs`)
 - [x] Compaction on overflow: when the active block fills, GC live state plus the new write into a fresh commit on the alternate, bump revision.
 - [x] NOR-aligned program wrapper: `NorAlignedStorage` caches programs to `PROG_SIZE`-aligned windows. (`src/nor.rs`)
@@ -46,7 +46,7 @@ Open issues against the v1.x line (regressions, ergonomic gaps that surface in r
 
 ## Hardening
 
-- [x] Power-loss safety: torn-write scenarios across every program-call boundary land the FS as either the pre-state or post-state. Verified by `tests/power_loss.rs` using `TornWriteStorage` for inline-write and CTZ-streaming-append scenarios.
+- [x] Power-loss safety, both torn-write classes. Program-call-boundary tears land the FS as either the pre-state or post-state, verified by `tests/power_loss.rs` (`TornWriteStorage`, inline-write and CTZ-streaming-append scenarios). Intra-program tears (a power loss inside the program that follows a CCRC-valid commit) are caught reader-side by FCRC validation: the affected commit is rejected and the pair falls back to the prior durable state, verified by `tests/review_r2_fcrc.rs` (review item R2). The CCRC alone could not distinguish this case.
 - [x] Fuzz harnesses on the parsers and the commit reader. `fuzz/` (libFuzzer, nightly-only, outside the main workspace) covers `MetadataReader::new`, `Tag::from_bits`, `Path::new`, `Superblock::from_bytes`, and `CtzStruct::from_bytes`.
 - [x] Kani harness: revision counter comparison totality under wrap.
 - [x] Kani harness: commit accept-or-reject dispatch **panic-freedom**. `commit_proofs.rs` stubs `crc::update` to a nondeterministic value, so the harness proves the dispatch never panics on arbitrary input (the stub strengthens that result); it does **not** prove accept/reject *correctness*, which is pinned instead by the conformance and roundtrip vectors against the C reference.

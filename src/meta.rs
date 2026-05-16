@@ -122,6 +122,22 @@ impl<'a> MetadataReader<'a> {
         let mut committed_end: usize = 0;
         let mut next_ptag: u32 = 0xFFFF_FFFF;
 
+        // Forward-CRC (FCRC) state. After a commit's CCRC verifies, the
+        // C reference recomputes the CRC of the next prog-aligned
+        // window and rejects the commit if it does not match the FCRC
+        // the commit recorded for that window's (erased) state. This
+        // closes the intra-program torn-write hole the CCRC alone
+        // cannot: a power loss *inside* the program that follows a
+        // valid commit. Only the *last* verified commit needs the
+        // check: any earlier commit is followed by a CCRC-valid
+        // commit, which itself proves the writer programmed past it
+        // without a torn write, so at most a single one-commit
+        // rollback is ever required.
+        let mut pending_fcrc: Option<(usize, u32)> = None;
+        let mut last_fcrc: Option<(usize, u32)> = None;
+        let mut prev_committed_end: usize = 0;
+        let mut prev_next_ptag: u32 = 0xFFFF_FFFF;
+
         loop {
             off += Tag::from_bits(ptag).dsize();
             if off + 4 > block.len() {
@@ -170,17 +186,61 @@ impl<'a> MetadataReader<'a> {
                     // CRC mismatch: this commit is not durable.
                     break;
                 }
-                // Commit verified. Advance the committed boundary.
+                // Commit verified. Remember the prior boundary so a
+                // failed forward check on *this* commit can roll back
+                // exactly one level, then advance.
+                prev_committed_end = committed_end;
+                prev_next_ptag = next_ptag;
                 committed_end = off + tag.dsize();
                 // Apply the parity flip to the running XOR base.
                 let chunk = tag.ccrc_chunk().unwrap_or(0);
                 ptag ^= (u32::from(chunk) & 1) << 31;
                 next_ptag = ptag;
+                // This commit's FCRC (if it carried one) governs the
+                // window that follows it; any FCRC from a superseded
+                // commit is now irrelevant.
+                last_fcrc = pending_fcrc.take();
                 // Reset the CRC accumulator for the next commit.
                 running_crc = crc::INIT;
             } else {
                 // Normal tag: accumulate its body into the CRC.
                 running_crc = crc::update(running_crc, &block[off + 4..off + tag.dsize()]);
+                // Capture an FCRC tag's (window_size, expected_crc) to
+                // validate once this commit's CCRC verifies. The tag is
+                // inside the commit and so is itself covered by the
+                // CCRC: a torn write cannot forge it undetected.
+                if tag.tag_type() == TagType::ForwardCrc && tag.body_len() >= 8 {
+                    let b = off + 4;
+                    let sz =
+                        u32::from_le_bytes([block[b], block[b + 1], block[b + 2], block[b + 3]]);
+                    let fc = u32::from_le_bytes([
+                        block[b + 4],
+                        block[b + 5],
+                        block[b + 6],
+                        block[b + 7],
+                    ]);
+                    pending_fcrc = Some((sz as usize, fc));
+                }
+            }
+        }
+
+        // Forward-CRC check on the last verified commit. If it carried
+        // an FCRC, the next prog window must still read as the erased
+        // state the writer recorded; a mismatch means a torn write
+        // landed there after the commit (a power loss inside the
+        // following program), so the commit is not durable and is
+        // rolled back one level. An out-of-range or unreadable window
+        // is treated the same way: do not trust a commit whose forward
+        // window cannot be verified.
+        if let Some((sz, expected)) = last_fcrc {
+            let end = committed_end;
+            let actual = end
+                .checked_add(sz)
+                .filter(|&w| w <= block.len())
+                .map(|w| crc::update(crc::INIT, &block[end..w]));
+            if actual != Some(expected) {
+                committed_end = prev_committed_end;
+                next_ptag = prev_next_ptag;
             }
         }
 
