@@ -4,6 +4,14 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Fixed
+
+- The advisory `cargo kani` CI job is repaired. It had failed at compile on every `main` push since it was introduced in v0.3.1: `crc_update_stub` is referenced only through `#[kani::stub]`, which rustc's dead code pass does not count as a use, so the false positive `dead_code` lint became a hard error under CI's `RUSTFLAGS=-D warnings` before any harness ran. `#[allow(dead_code)]` on the stub fixes the compile; all 17 harnesses now discharge in CI. No change to any non `kani` build (the item is `#[cfg(kani)]`). This is a CI only fix landed after the `v1.0.1` tag; it is not part of that release.
+
+### Changed
+
+- The Kani CI job pins `model-checking/kani-github-action@v1.1` and `kani-version: 0.67.0` instead of tracking floating `@v1` / `kani-version: latest`, so a Kani bump is an explicit reviewed change rather than silent drift (post-review item M9). The job remains non blocking by deliberate design.
+
 ## [1.0.1] - 2026-05-15
 
 Post v1.0 deep review remediation. No public API changes; the 1.x semver contract is intact. This release closes the review's correctness and adversarial input findings and hardens the verification surface.
