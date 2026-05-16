@@ -4,6 +4,10 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Security
+
+- The metadata resolution path now bounds and cycle checks every `HardTail` walk. `Fs::resolve`'s final component loop and the internal `find_dir_pair` chased `pair.reader.tail()` with no count cap and no revisit check, so a corrupt or adversarial image whose tail points back into its own chain (a self cycle, or an A to B to A loop) made path resolution, `exists`, and the operations layered on them issue storage reads forever and never return: a liveness failure on the exact untrusted input class the threat model names. A shared `TailGuard` (fixed `[Option<BlockPair>; MAX_DIR_CHAIN]`, no allocation) rejects a revisited or over long chain with `Error::Corrupt`, matching the C reference's Brent guarded tail walk. `Fs::mount`'s gstate sweep was already deduped and is unaffected. Regression reproducer in `tests/`; the `mount_image` fuzz target now also drives the resolution path so the formerly unbounded loops are exercised. From the 2026-05-15 six agent correctness review (item R1).
+
 ### Fixed
 
 - The advisory `cargo kani` CI job is repaired. It had failed at compile on every `main` push since it was introduced in v0.3.1: `crc_update_stub` is referenced only through `#[kani::stub]`, which rustc's dead code pass does not count as a use, so the false positive `dead_code` lint became a hard error under CI's `RUSTFLAGS=-D warnings` before any harness ran. `#[allow(dead_code)]` on the stub fixes the compile; all 17 harnesses now discharge in CI. No change to any non `kani` build (the item is `#[cfg(kani)]`). This is a CI only fix landed after the `v1.0.1` tag; it is not part of that release.

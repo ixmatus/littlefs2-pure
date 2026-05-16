@@ -82,6 +82,56 @@ const MAX_CTZ_WRITE_BLOCKS: usize = 256;
 /// [`Error::OutOfRange`] on enumeration.
 const MAX_DIR_CHAIN: usize = 32;
 
+/// Bounded, cycle-detecting guard for a HardTail chain walk.
+///
+/// The resolution path (`Fs::resolve`'s final-component loop and the
+/// internal `find_dir_pair`) chases `pair.reader.tail()` until a lookup
+/// hits or a pair has no tail. On a well-formed image the chain is a
+/// short acyclic list. On a corrupt or adversarial image the tail can
+/// point back into the chain (a self-cycle, or an A -> B -> A loop);
+/// without a guard the walk reads storage forever and never returns.
+///
+/// `visit` records every pair entered and rejects, with
+/// [`Error::Corrupt`], either a pair already seen (a cycle) or a chain
+/// longer than [`MAX_DIR_CHAIN`] distinct pairs. This mirrors the C
+/// reference, which guards every tail walk (Brent's algorithm,
+/// `lfs.c` `lfs_dir_fetchmatch`) and returns `LFS_ERR_CORRUPT`. The
+/// visited set is a fixed `[Option<BlockPair>; MAX_DIR_CHAIN]`: no
+/// allocation, kernel-safe, and exactly large enough because any chain
+/// reaching `MAX_DIR_CHAIN + 1` distinct pairs is already rejected by
+/// the length bound.
+///
+/// `Error::Corrupt` (not `Error::OutOfRange`, which the already-bounded
+/// enumeration path returns at its cap) is the right code here: the
+/// caller asked to resolve a path and the on-disk chain is malformed,
+/// matching the C oracle's classification. The enumeration cap is a
+/// separate concern tracked under review item R3.
+struct TailGuard {
+    seen: [Option<BlockPair>; MAX_DIR_CHAIN],
+    len: usize,
+}
+
+impl TailGuard {
+    fn new() -> Self {
+        Self { seen: [None; MAX_DIR_CHAIN], len: 0 }
+    }
+
+    /// Record `pair` as entered. Returns [`Error::Corrupt`] if `pair`
+    /// was already visited (cycle) or the chain has exceeded
+    /// [`MAX_DIR_CHAIN`] distinct pairs (over-long, treated as corrupt).
+    fn visit(&mut self, pair: BlockPair) -> Result<(), Error> {
+        if self.seen[..self.len].contains(&Some(pair)) {
+            return Err(Error::Corrupt);
+        }
+        if self.len >= MAX_DIR_CHAIN {
+            return Err(Error::Corrupt);
+        }
+        self.seen[self.len] = Some(pair);
+        self.len += 1;
+        Ok(())
+    }
+}
+
 /// Offsets and lengths of a live entry's NAME and STRUCT tags within
 /// the source metadata block. Used by the compaction path to copy
 /// live entries to the alternate block without owning the source data.
@@ -3083,8 +3133,12 @@ impl<S: Storage> Fs<S> {
 
         // Final component: look up in the current pair, chasing HardTails.
         // The matching read leaves buf_a/buf_b populated with that pair's
-        // bytes; we return a `ResolvedPath<'b>` borrowing from them.
+        // bytes; we return a `ResolvedPath<'b>` borrowing from them. The
+        // guard bounds the walk and rejects a cyclic tail with
+        // `Error::Corrupt` (review item R1) instead of looping forever.
+        let mut guard = TailGuard::new();
         loop {
+            guard.visit(current)?;
             self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
             self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
             // We need to drop the pair borrow before potentially looping
@@ -3134,7 +3188,11 @@ impl<S: Storage> Fs<S> {
         buf_b: &mut [u8],
     ) -> Result<BlockPair, Error> {
         let mut current = dir_pair;
+        // Bound the descent and reject a cyclic HardTail with
+        // `Error::Corrupt` (review item R1) rather than looping forever.
+        let mut guard = TailGuard::new();
         loop {
+            guard.visit(current)?;
             self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
             self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
             let pair = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;

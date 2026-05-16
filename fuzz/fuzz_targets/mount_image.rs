@@ -21,7 +21,7 @@
 //! Kani's loop budget cannot reach.
 
 use libfuzzer_sys::fuzz_target;
-use littlefs2_pure::{Fs, Storage};
+use littlefs2_pure::{Fs, Path, Storage};
 
 /// Geometry mirrors `tests/common::MemStorage` and the conformance
 /// vectors: 8 blocks of 256 bytes, 16-byte read/prog units.
@@ -111,5 +111,24 @@ fuzz_target!(|data: &[u8]| {
             &mut a,
             &mut b,
         );
+
+        // Also drive the resolution path so the fuzzer reaches
+        // `Fs::resolve`'s final-component loop and the internal
+        // `find_dir_pair` loop. Before R1 these chased a HardTail
+        // with no count cap and no cycle check, so a crafted cyclic
+        // tail hung here even though `list_root` (bounded) did not.
+        // A fixed single-component path exercises the resolve loop; a
+        // two-component path forces the find_dir_pair descent. The
+        // contract is the same as everywhere else: terminate with a
+        // typed `Error`, never loop. There is no wall-clock guard
+        // here on purpose; the kernel must bound itself, and a
+        // regression resurfaces as the fuzzer timing out on this
+        // input rather than as a silent pass.
+        if let Ok(leaf) = Path::new("/fuzz") {
+            let _ = fs.exists(leaf, &mut a, &mut b);
+        }
+        if let Ok(nested) = Path::new("/fuzz/leaf") {
+            let _ = fs.exists(nested, &mut a, &mut b);
+        }
     }
 });
