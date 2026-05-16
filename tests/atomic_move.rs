@@ -28,15 +28,15 @@ fn corrupt_move_state_with_out_of_range_src_id_fails_mount() {
     use littlefs2_pure::ROOT_BLOCK_PAIR;
 
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     // Root now has a small, known number of live entries.
     fs.write_to_path(Path::new("/f").unwrap(), b"x", &mut a, &mut b).unwrap();
     let mut storage = fs.into_storage();
 
     // Read the root pair, find the active block and append cursor.
-    let mut ba = [0u8; MemStorage::BLOCK_SIZE];
-    let mut bb = [0u8; MemStorage::BLOCK_SIZE];
+    let mut ba = common::make_buffer();
+    let mut bb = common::make_buffer();
     storage.read(ROOT_BLOCK_PAIR.a.as_u32(), 0, &mut ba).unwrap();
     storage.read(ROOT_BLOCK_PAIR.b.as_u32(), 0, &mut bb).unwrap();
     let (active_addr, committed_end, next_ptag, active_is_a) = {
@@ -70,8 +70,8 @@ fn corrupt_move_state_with_out_of_range_src_id_fails_mount() {
         .unwrap();
 
     // Mount must reject rather than damage the filesystem.
-    let mut m_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut m_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut m_a = common::make_buffer();
+    let mut m_b = common::make_buffer();
     let err = Fs::mount(storage, &mut m_a, &mut m_b)
         .expect_err("mount must fail on out-of-range MoveState src_id");
     assert_eq!(err, littlefs2_pure::Error::Corrupt);
@@ -79,10 +79,10 @@ fn corrupt_move_state_with_out_of_range_src_id_fails_mount() {
 
 fn make_fs() -> Fs<MemStorage> {
     let mut storage = MemStorage::new();
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut storage, &mut scratch).unwrap();
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap()
 }
 
@@ -91,8 +91,8 @@ fn successful_cross_dir_rename_leaves_gstate_zero() {
     // After a complete rename, mount should see no pending move:
     // the two MoveState tags balance.
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     fs.mkdir(Path::new("/archive").unwrap(), &mut a, &mut b).unwrap();
     fs.write_to_path(Path::new("/file").unwrap(), b"contents", &mut a, &mut b).unwrap();
     fs.rename(Path::new("/file").unwrap(), Path::new("/archive/file").unwrap(), &mut a, &mut b)
@@ -100,11 +100,11 @@ fn successful_cross_dir_rename_leaves_gstate_zero() {
 
     // Re-mount and confirm the entry is in exactly one place.
     let storage = fs.into_storage();
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
-    let mut a2 = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b2 = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a2 = common::make_buffer();
+    let mut b2 = common::make_buffer();
     assert!(!fs.exists(Path::new("/file").unwrap(), &mut a2, &mut b2).unwrap());
     assert!(fs.exists(Path::new("/archive/file").unwrap(), &mut a2, &mut b2).unwrap());
 }
@@ -122,14 +122,14 @@ fn rename_interrupted_between_commits_recovers_on_remount() {
 
     // 1. Set up: format and pre-populate /file and /archive.
     let mut seed_storage = MemStorage::new();
-    let mut seed_scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut seed_scratch = common::make_buffer();
     Fs::format(&mut seed_storage, &mut seed_scratch).unwrap();
     {
-        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
         let mut fs = Fs::mount(seed_storage, &mut buf_a, &mut buf_b).unwrap();
-        let mut a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
         fs.mkdir(Path::new("/archive").unwrap(), &mut a, &mut b).unwrap();
         fs.write_to_path(Path::new("/file").unwrap(), b"persistent", &mut a, &mut b).unwrap();
         seed_storage = fs.into_storage();
@@ -143,12 +143,12 @@ fn rename_interrupted_between_commits_recovers_on_remount() {
         let mut storage = MemStorage::new();
         storage.data = seed_data.clone();
         let torn = TornWriteStorage::new(storage, usize::MAX);
-        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
         let mut fs = Fs::mount(torn, &mut buf_a, &mut buf_b).unwrap();
         let pre = fs.storage().program_count;
-        let mut a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
         fs.rename(Path::new("/file").unwrap(), Path::new("/archive/file").unwrap(), &mut a, &mut b)
             .unwrap();
         let post = fs.storage().program_count;
@@ -165,11 +165,11 @@ fn rename_interrupted_between_commits_recovers_on_remount() {
         storage.data = seed_data.clone();
         let torn = TornWriteStorage::new(storage, trigger);
         let torn_after = {
-            let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-            let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+            let mut buf_a = common::make_buffer();
+            let mut buf_b = common::make_buffer();
             let mut fs = Fs::mount(torn, &mut buf_a, &mut buf_b).unwrap();
-            let mut a = [0u8; MemStorage::BLOCK_SIZE];
-            let mut b = [0u8; MemStorage::BLOCK_SIZE];
+            let mut a = common::make_buffer();
+            let mut b = common::make_buffer();
             let _ = fs.rename(
                 Path::new("/file").unwrap(),
                 Path::new("/archive/file").unwrap(),
@@ -181,11 +181,11 @@ fn rename_interrupted_between_commits_recovers_on_remount() {
 
         // Re-mount with normal MemStorage. Recovery runs during mount
         // if the rename was crashed between its two commits.
-        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
         let mut fs = Fs::mount(torn_after, &mut buf_a, &mut buf_b).unwrap();
-        let mut a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
 
         let src_present = fs.exists(Path::new("/file").unwrap(), &mut a, &mut b).unwrap();
         let dst_present = fs.exists(Path::new("/archive/file").unwrap(), &mut a, &mut b).unwrap();
@@ -205,11 +205,11 @@ fn rename_interrupted_between_commits_recovers_on_remount() {
         // A second mount should reach the same state (recovery is
         // idempotent: gstate is now zero, so no further recovery).
         let storage_after_recover = fs.into_storage();
-        let mut buf_a2 = [0u8; MemStorage::BLOCK_SIZE];
-        let mut buf_b2 = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_a2 = common::make_buffer();
+        let mut buf_b2 = common::make_buffer();
         let mut fs2 = Fs::mount(storage_after_recover, &mut buf_a2, &mut buf_b2).unwrap();
-        let mut a2 = [0u8; MemStorage::BLOCK_SIZE];
-        let mut b2 = [0u8; MemStorage::BLOCK_SIZE];
+        let mut a2 = common::make_buffer();
+        let mut b2 = common::make_buffer();
         let src2 = fs2.exists(Path::new("/file").unwrap(), &mut a2, &mut b2).unwrap();
         let dst2 = fs2.exists(Path::new("/archive/file").unwrap(), &mut a2, &mut b2).unwrap();
         assert_eq!(

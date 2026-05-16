@@ -108,12 +108,12 @@ fn build_image_with_subdir() -> MemStorage {
 #[test]
 fn resolve_root_level_file() {
     let storage = build_image_with_subdir();
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let resolved = fs.resolve(Path::new("/config.toml").unwrap(), &mut a, &mut b).unwrap();
     assert_eq!(resolved.entry.kind, EntryKind::RegularFile);
     assert_eq!(resolved.entry.name, b"config.toml");
@@ -124,12 +124,12 @@ fn resolve_root_level_file() {
 #[test]
 fn resolve_root_level_directory() {
     let storage = build_image_with_subdir();
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let resolved = fs.resolve(Path::new("/logs").unwrap(), &mut a, &mut b).unwrap();
     assert_eq!(resolved.entry.kind, EntryKind::Directory);
     assert_eq!(resolved.struct_type, TagType::DirStruct);
@@ -142,12 +142,12 @@ fn resolve_root_level_directory() {
 #[test]
 fn resolve_nested_file() {
     let storage = build_image_with_subdir();
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let resolved = fs.resolve(Path::new("/logs/today.txt").unwrap(), &mut a, &mut b).unwrap();
     assert_eq!(resolved.entry.kind, EntryKind::RegularFile);
     assert_eq!(resolved.entry.name, b"today.txt");
@@ -159,12 +159,12 @@ fn resolve_nested_file() {
 #[test]
 fn resolve_missing_leaf_returns_not_found() {
     let storage = build_image_with_subdir();
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let err = fs.resolve(Path::new("/missing.txt").unwrap(), &mut a, &mut b).unwrap_err();
     assert_eq!(err, Error::NotFound);
 }
@@ -172,12 +172,12 @@ fn resolve_missing_leaf_returns_not_found() {
 #[test]
 fn resolve_missing_intermediate_returns_not_found() {
     let storage = build_image_with_subdir();
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let err = fs.resolve(Path::new("/nosuch/foo.txt").unwrap(), &mut a, &mut b).unwrap_err();
     assert_eq!(err, Error::NotFound);
 }
@@ -185,12 +185,12 @@ fn resolve_missing_intermediate_returns_not_found() {
 #[test]
 fn resolve_intermediate_is_file_returns_not_found() {
     let storage = build_image_with_subdir();
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     // config.toml is a regular file; treating it as a directory must fail.
     let err = fs.resolve(Path::new("/config.toml/foo").unwrap(), &mut a, &mut b).unwrap_err();
     assert_eq!(err, Error::NotFound);
@@ -199,12 +199,12 @@ fn resolve_intermediate_is_file_returns_not_found() {
 #[test]
 fn resolve_root_path_is_invalid() {
     let storage = build_image_with_subdir();
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let err = fs.resolve(Path::new("/").unwrap(), &mut a, &mut b).unwrap_err();
     assert_eq!(err, Error::InvalidPath);
 }

@@ -74,14 +74,14 @@ fn invoke_verifier(verifier: &std::path::Path, image: &std::path::Path, scenario
 fn roundtrip_inline_file() {
     let Some(verifier) = require_verifier() else { return };
     let mut storage = MemStorage::new();
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut storage, &mut scratch).unwrap();
     {
-        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
         let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
-        let mut a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
         fs.write_to_path(Path::new("/cfg").unwrap(), b"hello, rust", &mut a, &mut b).unwrap();
         storage = fs.into_storage();
     }
@@ -94,14 +94,14 @@ fn roundtrip_inline_file() {
 fn roundtrip_ctz_file() {
     let Some(verifier) = require_verifier() else { return };
     let mut storage = MemStorage::new();
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut storage, &mut scratch).unwrap();
     {
-        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
         let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
-        let mut a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
         let body: Vec<u8> = (0..500).map(|i| (i & 0xff) as u8).collect();
         fs.write_to_path(Path::new("/payload.bin").unwrap(), &body, &mut a, &mut b).unwrap();
         storage = fs.into_storage();
@@ -115,14 +115,14 @@ fn roundtrip_ctz_file() {
 fn roundtrip_nested_dir() {
     let Some(verifier) = require_verifier() else { return };
     let mut storage = MemStorage::new();
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut storage, &mut scratch).unwrap();
     {
-        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
         let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
-        let mut a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
         fs.mkdir(Path::new("/audit").unwrap(), &mut a, &mut b).unwrap();
         fs.write_to_path(Path::new("/audit/log").unwrap(), b"entry-0001;", &mut a, &mut b).unwrap();
         storage = fs.into_storage();

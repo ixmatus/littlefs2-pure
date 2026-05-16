@@ -17,16 +17,16 @@ use core_alloc::vec;
 
 fn fresh_fs() -> Fs<MemStorage> {
     let mut storage = MemStorage::new();
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut storage, &mut scratch).unwrap();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     Fs::mount(storage, &mut a, &mut b).unwrap()
 }
 
 fn root_revision(fs: &mut Fs<MemStorage>) -> u32 {
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let pair = fs.read_pair(fs.root(), &mut a, &mut b).unwrap();
     pair.reader.revision()
 }
@@ -34,8 +34,8 @@ fn root_revision(fs: &mut Fs<MemStorage>) -> u32 {
 #[test]
 fn open_create_then_write_then_sync_persists() {
     let mut fs = fresh_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let path = Path::new("/log").unwrap();
 
     {
@@ -60,8 +60,8 @@ fn batched_writes_amortize_to_one_commit() {
     // The headline File property: many File::write calls produce ONE
     // metadata-pair revision bump at sync, instead of one per call.
     let mut fs = fresh_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let path = Path::new("/log").unwrap();
 
     // Materialize the file first as a CTZ-backed file (past
@@ -101,8 +101,8 @@ fn batched_writes_amortize_to_one_commit() {
 #[test]
 fn drop_without_sync_discards_writes() {
     let mut fs = fresh_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let path = Path::new("/log").unwrap();
     fs.write_to_path(path, &[b'i'; 200], &mut a, &mut b).unwrap();
 
@@ -126,8 +126,8 @@ fn drop_without_sync_discards_writes() {
 #[test]
 fn read_via_file_handle_matches_read_at_path() {
     let mut fs = fresh_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let path = Path::new("/big").unwrap();
     let payload: alloc::vec::Vec<u8> = (0u32..512).map(|i| (i % 251) as u8).collect();
     fs.write_to_path(path, &payload, &mut a, &mut b).unwrap();
@@ -152,8 +152,8 @@ fn read_via_file_handle_matches_read_at_path() {
 #[test]
 fn seek_then_read_returns_offset_content() {
     let mut fs = fresh_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let path = Path::new("/seek").unwrap();
     let payload: alloc::vec::Vec<u8> = (0u32..400).map(|i| (i % 251) as u8).collect();
     fs.write_to_path(path, &payload, &mut a, &mut b).unwrap();
@@ -169,8 +169,8 @@ fn seek_then_read_returns_offset_content() {
 #[test]
 fn set_len_shrink_drops_tail_bytes() {
     let mut fs = fresh_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let path = Path::new("/shrink").unwrap();
     let payload: alloc::vec::Vec<u8> = (0u32..400).map(|i| (i % 251) as u8).collect();
     fs.write_to_path(path, &payload, &mut a, &mut b).unwrap();
@@ -193,8 +193,8 @@ fn set_len_shrink_drops_tail_bytes() {
 #[test]
 fn set_len_extend_zero_fills() {
     let mut fs = fresh_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let path = Path::new("/extend").unwrap();
     // Start with a small CTZ file.
     fs.write_to_path(path, &[b'a'; 200], &mut a, &mut b).unwrap();
@@ -216,8 +216,8 @@ fn set_len_extend_zero_fills() {
 #[test]
 fn truncate_open_then_rewrite_replaces_content() {
     let mut fs = fresh_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let path = Path::new("/rewrite").unwrap();
     fs.write_to_path(path, &[b'o'; 256], &mut a, &mut b).unwrap();
 
@@ -239,8 +239,8 @@ fn truncate_open_then_rewrite_replaces_content() {
 #[test]
 fn open_missing_without_create_returns_not_found() {
     let mut fs = fresh_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let path = Path::new("/nope").unwrap();
     let r = fs.open(path, OpenOptions::new().read(true), &mut a, &mut b);
     assert_eq!(r.err(), Some(littlefs2_pure::Error::NotFound));
@@ -252,8 +252,8 @@ fn open_inline_without_truncate_rejected() {
     // opened through File without truncate; the path-based API is
     // the right tool. Verify the typed rejection.
     let mut fs = fresh_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let path = Path::new("/small").unwrap();
     fs.write_to_path(path, &[b's'; 32], &mut a, &mut b).unwrap();
     let r = fs.open(path, OpenOptions::new().read(true), &mut a, &mut b);
@@ -266,8 +266,8 @@ fn write_at_non_eof_rejected() {
     // with cursor != size returns OutOfRange rather than silently
     // corrupting.
     let mut fs = fresh_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let path = Path::new("/append-only").unwrap();
     fs.write_to_path(path, &[b'i'; 200], &mut a, &mut b).unwrap();
 
@@ -282,8 +282,8 @@ fn write_at_non_eof_rejected() {
 #[test]
 fn append_mode_forces_writes_to_eof() {
     let mut fs = fresh_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let path = Path::new("/forced-append").unwrap();
     fs.write_to_path(path, &[b'i'; 200], &mut a, &mut b).unwrap();
 
@@ -306,8 +306,8 @@ fn append_mode_forces_writes_to_eof() {
 #[test]
 fn write_session_survives_remount() {
     let mut fs = fresh_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let path = Path::new("/durable").unwrap();
     {
         let mut file = fs

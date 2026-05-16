@@ -93,14 +93,14 @@ fn load(vector_name: &str) -> MemStorage {
 }
 
 fn mount(s: MemStorage) -> Fs<MemStorage> {
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     Fs::mount(s, &mut buf_a, &mut buf_b).expect("mount conformance vector")
 }
 
 fn read_inline<'a>(fs: &mut Fs<MemStorage>, p: &str, scratch: &'a mut [u8]) -> &'a [u8] {
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let r = fs.resolve(Path::new(p).unwrap(), &mut buf_a, &mut buf_b).unwrap();
     assert_eq!(r.struct_type, TagType::InlineStruct);
     let n = r.struct_body.len();
@@ -109,8 +109,8 @@ fn read_inline<'a>(fs: &mut Fs<MemStorage>, p: &str, scratch: &'a mut [u8]) -> &
 }
 
 fn read_ctz_all(fs: &mut Fs<MemStorage>, p: &str) -> Vec<u8> {
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let size = fs.size_of(Path::new(p).unwrap(), &mut buf_a, &mut buf_b).unwrap();
     let mut out = vec![0u8; size as usize];
     let n = fs.read_at_path(Path::new(p).unwrap(), 0, &mut out, &mut buf_a, &mut buf_b).unwrap();
@@ -128,8 +128,8 @@ fn vector_01_empty_format_mounts_clean() {
     assert_eq!(sb.version, littlefs2_pure::DISK_VERSION);
 
     // Root is empty (no user entries).
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let mut count = 0usize;
     fs.list_root(|_| count += 1, &mut a, &mut b).unwrap();
     assert_eq!(count, 0);
@@ -138,8 +138,8 @@ fn vector_01_empty_format_mounts_clean() {
 #[test]
 fn vector_02_single_inline_resolves_and_reads() {
     let mut fs = mount(load("02_single_inline.bin"));
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
 
     // /cfg exists, is a regular file, and resolves to InlineStruct
     // body == "hello, littlefs" (15 bytes).
@@ -158,8 +158,8 @@ fn vector_02_single_inline_resolves_and_reads() {
 #[test]
 fn vector_03_single_ctz_resolves_and_reads() {
     let mut fs = mount(load("03_single_ctz.bin"));
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
 
     // /payload.bin exists as a CTZ-backed regular file with 500 bytes.
     let r = fs.resolve(Path::new("/payload.bin").unwrap(), &mut a, &mut b).unwrap();
@@ -175,8 +175,8 @@ fn vector_03_single_ctz_resolves_and_reads() {
 #[test]
 fn vector_04_nested_dir_resolves_through_dirstruct() {
     let mut fs = mount(load("04_nested_dir.bin"));
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
 
     // /audit is a Directory; /audit/log is a regular file with the
     // expected inline body.
@@ -201,8 +201,8 @@ fn vector_05_hardtail_dir_lists_every_entry() {
     // observable contract this pins is that our reader enumerates every
     // entry, which only holds if it walks the whole HardTail chain.
     let mut fs = mount(load("05_hardtail_dir.bin"));
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
 
     let r = fs.resolve(Path::new("/d").unwrap(), &mut a, &mut b).unwrap();
     assert_eq!(r.struct_type, TagType::DirStruct);
@@ -223,8 +223,8 @@ fn vector_06_inline_ctz_boundary_classified_as_c_wrote_it() {
     // identically, so a future inline-threshold drift on either side is
     // caught.
     let mut fs = mount(load("06_inline_ctz_boundary.bin"));
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
 
     for (name, len) in [("/b128", 128usize), ("/b129", 129usize)] {
         let r = fs.resolve(Path::new(name).unwrap(), &mut a, &mut b).unwrap();
@@ -246,8 +246,8 @@ fn vector_07_deleted_recreated_resolves_to_fresh_body() {
     // resolve the stale 8 byte body; the correct result is the fresh
     // 10 byte one and exactly one live /x.
     let mut fs = mount(load("07_deleted_recreated.bin"));
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
 
     let mut scratch = [0u8; 32];
     let body = read_inline(&mut fs, "/x", &mut scratch);
@@ -265,8 +265,8 @@ fn unformatted_buffer_returns_unformatted() {
     // mount path correctly distinguishes Unformatted (all-0xFF) from
     // a real vector.
     let s = MemStorage::new();
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let err = Fs::mount(s, &mut buf_a, &mut buf_b).unwrap_err();
     assert_eq!(err, Error::Unformatted);
 }

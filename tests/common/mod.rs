@@ -221,6 +221,17 @@ impl Storage for StrictNorStorage {
 /// The implementation deliberately does not enforce NOR flash semantics
 /// (program may only flip `1` to `0`) because the read kernel does not
 /// depend on that constraint. The write kernel landing in Phase 2 will
+/// One zeroed metadata-block buffer sized to the [`MemStorage`]
+/// geometry. The test suite needs a `[u8; MemStorage::BLOCK_SIZE]`
+/// scratch buffer for almost every `Fs` call (the `buf_a`/`buf_b`
+/// pair, plus assorted `scratch`); spelled out, that literal repeated
+/// over 500 times across the suite. Funnel it through one helper so
+/// the geometry is named in exactly one place.
+#[must_use]
+pub fn make_buffer() -> [u8; MemStorage::BLOCK_SIZE] {
+    [0u8; MemStorage::BLOCK_SIZE]
+}
+
 /// upgrade this to a stricter model.
 #[derive(Debug)]
 pub struct MemStorage {

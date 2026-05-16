@@ -56,12 +56,12 @@ fn resolve_chases_hardtail_to_continuation_pair() {
     builder.commit(0).unwrap();
     storage.write_block(0, &builder.finish());
 
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let resolved = fs.resolve(Path::new("/deep.txt").unwrap(), &mut a, &mut b).unwrap();
     assert_eq!(resolved.entry.name, b"deep.txt");
     assert_eq!(resolved.struct_body, b"found via hardtail");
@@ -105,12 +105,12 @@ fn list_root_enumerates_across_hardtail() {
     builder.commit(0).unwrap();
     storage.write_block(0, &builder.finish());
 
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let mut names: Vec<Vec<u8>> = Vec::new();
     let n = fs
         .list_root(
@@ -180,12 +180,12 @@ fn list_dir_enumerates_subdir_across_hardtail() {
     root.commit(0).unwrap();
     storage.write_block(0, &root.finish());
 
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let mut names: Vec<Vec<u8>> = Vec::new();
     let n = fs
         .list_dir(
@@ -236,12 +236,12 @@ fn resolve_does_not_chase_softtail() {
     builder.commit(0).unwrap();
     storage.write_block(0, &builder.finish());
 
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     // SoftTail must NOT be followed; the file should be NotFound.
     let err = fs.resolve(Path::new("/deep.txt").unwrap(), &mut a, &mut b).unwrap_err();
     assert_eq!(err, Error::NotFound);
@@ -300,12 +300,12 @@ fn rmdir_rejects_directory_with_entries_in_hardtail_continuation() {
         struct_type: TagType::InlineStruct,
         struct_body: b"still here",
     }]);
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let err = fs.rmdir(Path::new("/d").unwrap(), &mut a, &mut b).unwrap_err();
     assert_eq!(err, Error::NotEmpty);
 }
@@ -316,12 +316,12 @@ fn rmdir_accepts_directory_with_empty_hardtail_chain() {
     // empty. The directory is genuinely empty across the whole chain,
     // so rmdir must succeed.
     let storage = build_hardtail_dir_image(&[]);
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     fs.rmdir(Path::new("/d").unwrap(), &mut a, &mut b).unwrap();
     assert!(!fs.exists(Path::new("/d").unwrap(), &mut a, &mut b).unwrap());
 }

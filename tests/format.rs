@@ -14,19 +14,19 @@ fn format_then_mount_roundtrips() {
     let mut storage = MemStorage::new();
     // Before format: blocks are all 0xFF; mount must fail.
     {
-        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
         let res = Fs::mount(MemStorage::new(), &mut buf_a, &mut buf_b);
         assert!(res.is_err(), "pristine storage must not mount");
     }
 
     // Format.
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut storage, &mut scratch).unwrap();
 
     // Mount the formatted storage.
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
 
     let expected = Superblock {
@@ -47,7 +47,7 @@ fn format_leaves_block_one_erased() {
     // Pre-dirty block 1 with garbage to confirm format erases it.
     storage.write_block(1, &[0x42u8; MemStorage::BLOCK_SIZE]);
 
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut storage, &mut scratch).unwrap();
 
     // Block 1's bytes should now all be 0xFF (erased).
@@ -70,7 +70,7 @@ fn format_rejects_undersized_scratch() {
 #[test]
 fn format_twice_is_idempotent() {
     let mut storage = MemStorage::new();
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut storage, &mut scratch).unwrap();
     let snapshot1 = storage.data.clone();
 

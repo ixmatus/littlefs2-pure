@@ -12,23 +12,23 @@ use common::MemStorage;
 
 fn make_fs() -> Fs<MemStorage> {
     let mut storage = MemStorage::new();
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut storage, &mut scratch).unwrap();
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap()
 }
 
 fn read_content(fs: &mut Fs<MemStorage>, path: &str) -> Vec<u8> {
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let r = fs.resolve(Path::new(path).unwrap(), &mut buf_a, &mut buf_b).unwrap();
     match r.struct_type {
         TagType::InlineStruct => r.struct_body.to_vec(),
         TagType::CtzStruct => {
             let ctz = CtzStruct::from_bytes(r.struct_body).unwrap();
             let mut out = vec![0u8; ctz.size as usize];
-            let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+            let mut scratch = common::make_buffer();
             fs.read_ctz(&ctz, &mut out, &mut scratch).unwrap();
             out
         }
@@ -39,8 +39,8 @@ fn read_content(fs: &mut Fs<MemStorage>, path: &str) -> Vec<u8> {
 #[test]
 fn append_creates_file_if_missing() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let mut content_scratch = [0u8; 1024];
     fs.append_to_path(
         Path::new("/log").unwrap(),
@@ -56,8 +56,8 @@ fn append_creates_file_if_missing() {
 #[test]
 fn append_inline_grows_inline() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let mut content_scratch = [0u8; 1024];
 
     fs.append_to_path(Path::new("/log").unwrap(), b"AAA", &mut content_scratch, &mut a, &mut b)
@@ -73,8 +73,8 @@ fn append_inline_grows_inline() {
 #[test]
 fn append_promotes_inline_to_ctz() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let mut content_scratch = [0u8; 1024];
 
     fs.append_to_path(Path::new("/log").unwrap(), b"head_", &mut content_scratch, &mut a, &mut b)
@@ -86,8 +86,8 @@ fn append_promotes_inline_to_ctz() {
     fs.append_to_path(Path::new("/log").unwrap(), &chunk, &mut content_scratch, &mut a, &mut b)
         .unwrap();
 
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let r = fs.resolve(Path::new("/log").unwrap(), &mut buf_a, &mut buf_b).unwrap();
     assert_eq!(r.struct_type, TagType::CtzStruct);
 
@@ -100,8 +100,8 @@ fn append_promotes_inline_to_ctz() {
 #[test]
 fn append_ctz_to_ctz_extends_content() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let mut content_scratch = [0u8; 1024];
 
     let v1: Vec<u8> = (0..300).map(|i| (i & 0xff) as u8).collect();
@@ -119,8 +119,8 @@ fn append_ctz_to_ctz_extends_content() {
 #[test]
 fn append_rejects_directory() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let mut content_scratch = [0u8; 1024];
     fs.mkdir(Path::new("/d").unwrap(), &mut a, &mut b).unwrap();
 
@@ -137,8 +137,8 @@ fn append_rejects_undersized_content_scratch_for_inline_path() {
     // (existing_inline + additional). Establish a small inline file
     // first, then trip OutOfRange on the inline-grow append.
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     fs.write_to_path(Path::new("/log").unwrap(), b"AAAA", &mut a, &mut b).unwrap();
     let mut tiny = [0u8; 4];
     let err = fs
@@ -152,8 +152,8 @@ fn append_to_ctz_does_not_consult_content_scratch() {
     // Once the file is in CTZ form, append_to_path is streaming and
     // must not touch content_scratch. Pass an empty slice to confirm.
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let initial: Vec<u8> = (0..300).map(|i| (i & 0xff) as u8).collect();
     fs.write_to_path(Path::new("/log").unwrap(), &initial, &mut a, &mut b).unwrap();
 
@@ -172,16 +172,16 @@ fn ctz_streaming_append_preserves_existing_blocks() {
     // erased or rewritten across an append; only the tail's free
     // region is programmed (and only if it has room).
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     // Write a 4-block CTZ file (well past inline, several blocks).
     let initial: Vec<u8> = (0..800).map(|i| (i & 0xff) as u8).collect();
     fs.write_to_path(Path::new("/log").unwrap(), &initial, &mut a, &mut b).unwrap();
 
     // Snapshot the storage and collect the chain's physical addresses.
     let head = {
-        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
         let r = fs.resolve(Path::new("/log").unwrap(), &mut buf_a, &mut buf_b).unwrap();
         assert_eq!(r.struct_type, TagType::CtzStruct);
         CtzStruct::from_bytes(r.struct_body).unwrap()
@@ -207,8 +207,8 @@ fn ctz_streaming_append_preserves_existing_blocks() {
     // had bytes programmed into its erased region) must still match
     // byte-for-byte.
     let head_after = {
-        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
         let r = fs.resolve(Path::new("/log").unwrap(), &mut buf_a, &mut buf_b).unwrap();
         CtzStruct::from_bytes(r.struct_body).unwrap()
     };
@@ -232,8 +232,8 @@ fn ctz_streaming_append_grows_chain_across_blocks() {
     // Append enough bytes to require allocating new blocks. Sized to
     // fit MemStorage's 8 block / 2 KiB capacity (root pair + chain).
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let initial: Vec<u8> = (0..200).map(|i| (i & 0xff) as u8).collect();
     fs.write_to_path(Path::new("/log").unwrap(), &initial, &mut a, &mut b).unwrap();
 
@@ -252,8 +252,8 @@ fn ctz_streaming_many_small_appends_match_one_large() {
     // The audit-logger workload: many small appends. Resulting bytes
     // must match a single large write.
     let mut fs_streaming = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     // Seed with enough to be CTZ.
     let seed: Vec<u8> = (0..200).map(|i| (i & 0xff) as u8).collect();
     fs_streaming.write_to_path(Path::new("/log").unwrap(), &seed, &mut a, &mut b).unwrap();
@@ -286,8 +286,8 @@ fn read_block(fs: &Fs<MemStorage>, block: u32) -> Vec<u8> {
 #[test]
 fn append_into_subdirectory() {
     let mut fs = make_fs();
-    let mut a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
     let mut content_scratch = [0u8; 1024];
     fs.mkdir(Path::new("/audit").unwrap(), &mut a, &mut b).unwrap();
     fs.append_to_path(
@@ -312,14 +312,14 @@ fn append_into_subdirectory() {
 #[test]
 fn appends_survive_remount() {
     let mut storage = MemStorage::new();
-    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    let mut scratch = common::make_buffer();
     Fs::format(&mut storage, &mut scratch).unwrap();
     {
-        let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
         let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
-        let mut a = [0u8; MemStorage::BLOCK_SIZE];
-        let mut b = [0u8; MemStorage::BLOCK_SIZE];
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
         let mut cs = [0u8; 1024];
         for i in 0..5u32 {
             let entry = format!("e{i};");
@@ -335,8 +335,8 @@ fn appends_survive_remount() {
         storage = fs.into_storage();
     }
     // Remount, read back.
-    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
-    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
     let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
     assert_eq!(read_content(&mut fs, "/log"), b"e0;e1;e2;e3;e4;");
 }
