@@ -158,16 +158,24 @@ jobs:
     # harness runs ~90s on a hosted runner, so the 180s per-harness
     # timeout has headroom.
     #
-    # We do not gate the rest of CI on this job because Kani's
-    # toolchain pinning can lag stable Rust and we'd rather flag
-    # regressions here than block unrelated PRs. Once that pinning
-    # is settled this can move into the required-checks list.
+    # We do not gate the rest of CI on this job: Kani's toolchain
+    # pinning can lag stable Rust, and we would rather flag a
+    # regression here than block unrelated PRs. This is a deliberate,
+    # accepted tradeoff (a proof regression lands non-blocking); the
+    # README hedges accordingly.
+    #
+    # The action and the Kani version are pinned tightly rather than
+    # tracked by floating `@v1` / `kani-version: latest`. A floating
+    # Kani is what silently changed proof-compilation behaviour
+    # before; pinning makes a Kani bump an explicit, reviewed change.
+    # Bump both deliberately when adopting a newer Kani.
     name: cargo kani (formal verification)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: model-checking/kani-github-action@v1
+      - uses: model-checking/kani-github-action@v1.1
         with:
+          kani-version: 0.67.0
           args: >-
             --features kani
             -Z unstable-options
