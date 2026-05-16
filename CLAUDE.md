@@ -78,7 +78,9 @@ The CI matrix should mirror these; CI is not yet authored.
 
 ### Bit accuracy is non negotiable
 
-The on disk format must match the C reference byte for byte. Every tag field, every CRC, every revision counter must produce the same disk image the C reference would. When in doubt, generate a vector with C littlefs and check ours against it.
+Encoding of on disk structures must match the C reference byte for byte. Every tag field, every CRC, every revision counter on a commit this crate writes must produce the same bytes the C reference would for that same structure. This is pinned by the conformance vectors (C writes, we read) and the roundtrip suite (we write, C reads); when in doubt, generate a vector with C littlefs and check ours against it.
+
+The format bootstrap is the one documented exception: `Fs::format` initializes only block A of the root pair at revision 1 and omits the tail area tag, where the C reference pre writes block B at revision 2 as well. Both are valid and interoperate (proven by the conformance and roundtrip gates); they are not byte identical. See `docs/decisions/0008-format-bootstrap-divergence.md`. Structure encoding fidelity remains non negotiable; the count of root pair blocks an empty format pre initializes is not.
 
 ### Storage trait is the only hardware boundary
 
