@@ -73,8 +73,7 @@ fn corrupt_move_state_with_out_of_range_src_id_fails_mount() {
     let mut m_a = [0u8; MemStorage::BLOCK_SIZE];
     let mut m_b = [0u8; MemStorage::BLOCK_SIZE];
     let err = Fs::mount(storage, &mut m_a, &mut m_b)
-        .err()
-        .expect("mount must fail on out-of-range MoveState src_id");
+        .expect_err("mount must fail on out-of-range MoveState src_id");
     assert_eq!(err, littlefs2_pure::Error::Corrupt);
 }
 

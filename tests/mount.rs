@@ -208,8 +208,7 @@ fn mount_rejects_live_dirstruct_pointing_out_of_bounds() {
     let mut m_a = [0u8; MemStorage::BLOCK_SIZE];
     let mut m_b = [0u8; MemStorage::BLOCK_SIZE];
     let err = Fs::mount(storage, &mut m_a, &mut m_b)
-        .err()
-        .expect("mount must reject an out-of-range live DirStruct");
+        .expect_err("mount must reject an out-of-range live DirStruct");
     assert_eq!(err, Error::Corrupt);
 }
 
