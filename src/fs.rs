@@ -75,59 +75,66 @@ const _: () = assert!(
 /// reuses the existing chain blocks in place.
 const MAX_CTZ_WRITE_BLOCKS: usize = 256;
 
-/// Maximum number of metadata pairs the directory-listing path will
-/// chase through HardTails. Bounds the chain length the reader is
-/// willing to follow, mirroring `MAX_QUEUED_PAIRS` in the allocator's
-/// BFS. A directory with more continuation pairs returns
-/// [`Error::OutOfRange`] on enumeration.
-const MAX_DIR_CHAIN: usize = 32;
-
-/// Bounded, cycle-detecting guard for a HardTail chain walk.
+/// Cycle-safe walker for a HardTail chain, in O(1) memory and with no
+/// arbitrary length cap (Brent's algorithm).
 ///
-/// The resolution path (`Fs::resolve`'s final-component loop and the
-/// internal `find_dir_pair`) chases `pair.reader.tail()` until a lookup
-/// hits or a pair has no tail. On a well-formed image the chain is a
-/// short acyclic list. On a corrupt or adversarial image the tail can
+/// Every reader tail-walk (`Fs::resolve`'s final-component loop, the
+/// internal `find_dir_pair`, and `list_pair_chain`) chases
+/// `pair.reader.tail()` until a lookup hits or a pair has no tail. On a
+/// well-formed image the chain is a finite acyclic list; the C
+/// reference legitimately splits a large directory across many
+/// continuation pairs. On a corrupt or adversarial image the tail can
 /// point back into the chain (a self-cycle, or an A -> B -> A loop);
 /// without a guard the walk reads storage forever and never returns.
 ///
-/// `visit` records every pair entered and rejects, with
-/// [`Error::Corrupt`], either a pair already seen (a cycle) or a chain
-/// longer than [`MAX_DIR_CHAIN`] distinct pairs. This mirrors the C
-/// reference, which guards every tail walk (Brent's algorithm,
-/// `lfs.c` `lfs_dir_fetchmatch`) and returns `LFS_ERR_CORRUPT`. The
-/// visited set is a fixed `[Option<BlockPair>; MAX_DIR_CHAIN]`: no
-/// allocation, kernel-safe, and exactly large enough because any chain
-/// reaching `MAX_DIR_CHAIN + 1` distinct pairs is already rejected by
-/// the length bound.
+/// A fixed visited array would either cap the legitimate chain length
+/// (rejecting valid long C-written directories, the original defect) or
+/// allocate. Brent's algorithm detects a cycle with three scalars and
+/// no allocation, and imposes no length ceiling: a valid chain of any
+/// length enumerates, a cyclic chain is rejected with
+/// [`Error::Corrupt`]. This is exactly what the C reference does
+/// (`lfs.c` `lfs_dir_fetchmatch` guards every tail walk and returns
+/// `LFS_ERR_CORRUPT`). See ADR-0009.
 ///
-/// `Error::Corrupt` (not `Error::OutOfRange`, which the already-bounded
-/// enumeration path returns at its cap) is the right code here: the
-/// caller asked to resolve a path and the on-disk chain is malformed,
-/// matching the C oracle's classification. The enumeration cap is a
-/// separate concern tracked under review item R3.
-struct TailGuard {
-    seen: [Option<BlockPair>; MAX_DIR_CHAIN],
-    len: usize,
+/// `Error::Corrupt` (not `Error::OutOfRange`) is the right code: the
+/// on-disk chain is malformed, matching the C oracle's classification.
+///
+/// Usage: construct with the chain start, process `current`, then for
+/// each non-terminal step call [`advance`](Self::advance) with the next
+/// pair before moving to it. A cycle is reported as the moving pointer
+/// catches the periodically-teleported reference; a corrupt cyclic
+/// chain may therefore be processed for O(mu + lambda) steps (bounded
+/// by the device's finite block count) before the error, and any
+/// entries a streaming caller already saw must be discarded on `Err`,
+/// as for every other `Error` return.
+struct BrentTailWalk {
+    /// The reference ("tortoise") the moving pointer is compared
+    /// against; teleported to the current node every `power` steps.
+    saved: BlockPair,
+    /// Steps remaining in the current power-of-two stride.
+    power: u32,
+    /// Steps taken since the last teleport.
+    steps: u32,
 }
 
-impl TailGuard {
-    fn new() -> Self {
-        Self { seen: [None; MAX_DIR_CHAIN], len: 0 }
+impl BrentTailWalk {
+    fn new(start: BlockPair) -> Self {
+        Self { saved: start, power: 1, steps: 0 }
     }
 
-    /// Record `pair` as entered. Returns [`Error::Corrupt`] if `pair`
-    /// was already visited (cycle) or the chain has exceeded
-    /// [`MAX_DIR_CHAIN`] distinct pairs (over-long, treated as corrupt).
-    fn visit(&mut self, pair: BlockPair) -> Result<(), Error> {
-        if self.seen[..self.len].contains(&Some(pair)) {
+    /// Advance to `next` (the tail of the pair just processed). Returns
+    /// [`Error::Corrupt`] if `next` equals the saved reference, which
+    /// for Brent's algorithm means the chain has a cycle.
+    fn advance(&mut self, next: BlockPair) -> Result<(), Error> {
+        if next == self.saved {
             return Err(Error::Corrupt);
         }
-        if self.len >= MAX_DIR_CHAIN {
-            return Err(Error::Corrupt);
+        self.steps += 1;
+        if self.steps == self.power {
+            self.saved = next;
+            self.power = self.power.saturating_mul(2);
+            self.steps = 0;
         }
-        self.seen[self.len] = Some(pair);
-        self.len += 1;
         Ok(())
     }
 }
@@ -2582,9 +2589,17 @@ impl<S: Storage> Fs<S> {
     }
 
     /// Enumerate the directory pair chain starting at `start`, chasing
-    /// HardTails through up to [`MAX_DIR_CHAIN`] pairs. Per-pair splice
-    /// renumbering is applied; ids are pair-local and reset to 0 at
-    /// each pair boundary.
+    /// HardTails for the full length of the chain (Brent's walk, no
+    /// arbitrary cap; a cyclic chain is rejected with
+    /// [`Error::Corrupt`], see [`BrentTailWalk`] and ADR-0009).
+    /// Per-pair splice renumbering is applied; ids are pair-local and
+    /// reset to 0 at each pair boundary.
+    ///
+    /// On `Err` (including a corrupt cyclic chain) the caller must
+    /// discard any entries already passed to `f`: a cycle is detected
+    /// only after the moving pointer catches the reference, so a
+    /// streaming caller may have seen a bounded prefix, possibly with
+    /// repeats, before the error.
     fn list_pair_chain<F>(
         &mut self,
         start: BlockPair,
@@ -2597,7 +2612,8 @@ impl<S: Storage> Fs<S> {
     {
         let mut current = start;
         let mut emitted = 0usize;
-        for _ in 0..MAX_DIR_CHAIN {
+        let mut walk = BrentTailWalk::new(current);
+        loop {
             self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
             self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
             let next = {
@@ -2611,11 +2627,13 @@ impl<S: Storage> Fs<S> {
                 next
             };
             match next {
-                Some(p) => current = p,
+                Some(p) => {
+                    walk.advance(p)?;
+                    current = p;
+                }
                 None => return Ok(emitted),
             }
         }
-        Err(Error::OutOfRange)
     }
 
     /// Check whether an entry exists at the given absolute path.
@@ -3134,11 +3152,11 @@ impl<S: Storage> Fs<S> {
         // Final component: look up in the current pair, chasing HardTails.
         // The matching read leaves buf_a/buf_b populated with that pair's
         // bytes; we return a `ResolvedPath<'b>` borrowing from them. The
-        // guard bounds the walk and rejects a cyclic tail with
-        // `Error::Corrupt` (review item R1) instead of looping forever.
-        let mut guard = TailGuard::new();
+        // Brent's walk: a cyclic tail is rejected with `Error::Corrupt`
+        // (review item R1) and a valid chain of any length resolves
+        // with no arbitrary cap (review item R3, ADR-0009).
+        let mut walk = BrentTailWalk::new(current);
         loop {
-            guard.visit(current)?;
             self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
             self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
             // We need to drop the pair borrow before potentially looping
@@ -3154,6 +3172,7 @@ impl<S: Storage> Fs<S> {
                 }
             };
             if let Some(next) = tail_to_follow {
+                walk.advance(next)?;
                 current = next;
                 continue;
             }
@@ -3188,11 +3207,11 @@ impl<S: Storage> Fs<S> {
         buf_b: &mut [u8],
     ) -> Result<BlockPair, Error> {
         let mut current = dir_pair;
-        // Bound the descent and reject a cyclic HardTail with
-        // `Error::Corrupt` (review item R1) rather than looping forever.
-        let mut guard = TailGuard::new();
+        // Brent's walk: a cyclic HardTail is rejected with
+        // `Error::Corrupt` (review item R1); a valid chain of any length
+        // is descended with no arbitrary cap (review item R3, ADR-0009).
+        let mut walk = BrentTailWalk::new(current);
         loop {
-            guard.visit(current)?;
             self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
             self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
             let pair = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
@@ -3221,6 +3240,7 @@ impl<S: Storage> Fs<S> {
             }
             if pair.reader.is_hard_tail() {
                 if let Some(tail) = pair.reader.tail() {
+                    walk.advance(tail)?;
                     current = tail;
                     continue;
                 }

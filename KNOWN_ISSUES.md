@@ -32,7 +32,7 @@ Open issues against the v1.x line (regressions, ergonomic gaps that surface in r
 - [x] `Fs::format` producing a superblock the C reference can mount, verified bidirectionally via `tests/conformance.rs` and `tests/roundtrip.rs`.
 - [x] Sync semantics. `Fs::sync` exposes the storage layer's sync; every public mutation already syncs as its final step.
 - [x] `remove_from_root`, `remove_at_path`: delete a file by name, splice-correct.
-- [x] `list_root`, `list_dir`: enumerate entries; splice-correct; chase HardTails through up to 32 continuation pairs.
+- [x] `list_root`, `list_dir`: enumerate entries; splice-correct; chase HardTails with a Brent's cycle-safe walk (no arbitrary length cap at this layer; a cyclic chain is rejected `Corrupt`, see ADR-0009). End-to-end the reachable metadata-pair set is bounded by `MAX_QUEUED_PAIRS = 32` at mount; see the limitation note below.
 - [x] `exists`: typed wrapper over `resolve`.
 - [x] `mkdir`, `rmdir` at arbitrary paths.
 - [x] `read_at_path`, `size_of`: offset-aware random read (inline + CTZ).
@@ -81,5 +81,6 @@ Every item that gated v1.0 shipped before the freeze. The list is preserved here
 
 - **LittleFS v1 on-disk format support.** The crate name is `littlefs2-pure` for a reason.
 - **HardTail-chain pair relocation.** Our writer never emits `HardTail` tags (directories cap at `MAX_LIVE_ENTRIES = 256` per pair without splitting). Continuation-pair relocation is unreachable through this kernel; supporting it would require first adding directory splitting and a corresponding `UpdateHardTail` write op. The path is documented in ADR-0005.
+- **Reachable metadata-pair set larger than `MAX_QUEUED_PAIRS = 32`.** `Fs::mount` runs the `accumulate_gstate` move/relocation-recovery sweep, a deduplicating BFS over the directory forest bounded by `MAX_QUEUED_PAIRS = 32` (`src/alloc.rs`). An image whose reachable pair set exceeds 32, including a single directory the C reference split across more than 32 continuation pairs, is rejected at mount with `Error::OutOfRange` before enumeration is reached. The tail-walk layer itself is cycle-safe and cap-free (Brent's, ADR-0009); lifting this end-to-end limit would require an unbounded dedup set in a no-alloc kernel and would enlarge the ADR-0006-pinned Cortex-M0+ stack arrays, so it is a deliberate v1.x constraint, not a defect. Documented in ADR-0009.
 - **Async I/O.** The `Storage` trait is synchronous. A future async wrapper crate is allowed but does not block v1.0.
 - **Multi-threading.** The kernel is single-threaded by construction; users serialize at the boundary.
