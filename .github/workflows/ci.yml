@@ -68,13 +68,19 @@ jobs:
       - run: cargo build --no-default-features
 
   no_default_features:
-    name: cargo build --no-default-features (no_std no_alloc floor)
+    name: cargo build + test --no-default-features (no_std no_alloc floor)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --no-default-features
+      # Building the floor is not the same as exercising it: the
+      # kernel's own unit tests must pass with alloc and std off, or a
+      # no_alloc regression ships green. The integration tests under
+      # tests/ link std unconditionally, so scope this to --lib; the
+      # full suite is the `test` job's responsibility.
+      - run: cargo test --no-default-features --lib
 
   cross_compile:
     name: cross-compile ${{ matrix.target }}
