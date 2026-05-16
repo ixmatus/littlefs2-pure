@@ -8,10 +8,19 @@
 //! # Bit accuracy claim
 //!
 //! [`update`] is required to produce the same `u32` the C reference's
-//! `lfs2_crc` produces for any seed and any byte slice. The unit tests below
-//! check a small set of hand crafted vectors; the property test in
-//! `tests/property_crc.rs` checks the table implementation against a bit by
-//! bit reference over random inputs.
+//! `lfs2_crc` produces for any seed and any byte slice. This is anchored to
+//! an oracle external to this codebase: littlefs's CRC is the standard
+//! reflected CRC-32 (poly `0xEDB88320`), whose published check value is
+//! `CRC32("123456789") = 0xCBF43926` (the "CRC-32/ISO-HDLC" entry in the CRC
+//! RevEng catalogue and Koopman's CRC reference). littlefs stores the raw
+//! running register with no final XOR, so the relation to the catalogue
+//! constant is `!update(INIT, b"123456789") == 0xCBF43926`. The
+//! `external_crc32_check_value` unit test pins exactly that, so a shared
+//! misconception of the variant (which would pass a self-consistency test)
+//! cannot pass unnoticed. The property test in `tests/property_crc.rs`
+//! checks the table implementation against a bit by bit reference over
+//! random inputs; the table/bitwise/associativity tests below guard internal
+//! consistency.
 
 /// The nibble table for the reflected polynomial `0xEDB88320`. This matches
 /// `rtable` in `lfs2_util.h` of the C reference, byte for byte.
@@ -33,12 +42,12 @@ pub const INIT: u32 = 0xFFFFFFFF;
 /// ```
 /// use littlefs2_pure::crc;
 ///
-/// let c = crc::update(crc::INIT, b"littlefs");
-/// // The value below is the LittleFS CRC32 of the 8 byte magic.
-/// // The conformance harness will pin the exact expected value against
-/// // a vector from the C reference; until then, the property test in
-/// // tests/property_crc.rs proves equivalence with the bit by bit reference.
-/// assert_eq!(c, c); // tautology, removed when the C reference vector lands
+/// // External anchor: the published CRC-32 check value is the CRC of the
+/// // nine ASCII bytes "123456789". littlefs stores the raw register with
+/// // no final XOR, so the relation to the catalogue constant 0xCBF43926
+/// // ("CRC-32/ISO-HDLC", CRC RevEng catalogue) is a final complement.
+/// let raw = crc::update(crc::INIT, b"123456789");
+/// assert_eq!(!raw, 0xCBF4_3926);
 /// ```
 #[must_use]
 pub fn update(mut crc: u32, data: &[u8]) -> u32 {
@@ -83,6 +92,23 @@ pub fn update_bitwise(mut crc: u32, data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// External oracle anchor. The check value of the standard reflected
+    /// CRC-32 (poly `0xEDB88320`) is, by definition, `CRC32("123456789")
+    /// = 0xCBF43926`, published in the CRC RevEng catalogue and Koopman's
+    /// CRC reference as "CRC-32/ISO-HDLC". littlefs stores the raw
+    /// register with no final XOR, so the relation is a final complement.
+    /// This pins `update` to a constant produced outside this codebase
+    /// (and outside littlefs's source): a shared misconception of the
+    /// variant would still pass the self-consistency tests below but
+    /// fails here.
+    #[test]
+    fn external_crc32_check_value() {
+        let raw = update(INIT, b"123456789");
+        assert_eq!(!raw, 0xCBF4_3926, "littlefs CRC must be standard reflected CRC-32");
+        // Also pin the raw register littlefs actually stores on disk.
+        assert_eq!(raw, 0x340B_C6D9);
+    }
 
     /// CRC of an empty slice is the seed itself, unchanged.
     #[test]
