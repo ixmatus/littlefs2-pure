@@ -4,6 +4,10 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-05-16
+
+Six-agent correctness review remediation, plus the post-`v1.0.1` advisory-Kani CI repair. No public API changes; the 1.x semver contract is intact. The behavioural changes are on the adversarial-input and power-loss paths (R1/R2/R3); R4 is verification-posture and documentation only. The full review is archived at `docs/reviews/2026-05-15-six-agent-correctness-review.md`.
+
 ### Security
 
 - Every reader `HardTail` walk is now cycle safe with no arbitrary length cap (Brent's algorithm, `BrentTailWalk`, ADR-0009). `Fs::resolve`'s final component loop and the internal `find_dir_pair` previously chased `pair.reader.tail()` with no count cap and no revisit check, so a corrupt or adversarial image whose tail points back into its own chain (a self cycle, or an A to B to A loop) made path resolution, `exists`, and the operations layered on them issue storage reads forever and never return: a liveness failure on the exact untrusted input class the threat model names (review item R1). The directory enumeration path `list_pair_chain` had a separate defect: a fixed 32 pair cap that emitted each pair's entries then returned `OutOfRange`, with no cycle detection, so a cyclic chain spammed duplicate entries before erroring (review item R3). All three call sites now share one O(1) memory Brent's walker: a valid chain of any length is followed, a cyclic chain is rejected with `Error::Corrupt`, matching the C reference. `Fs::mount`'s gstate sweep was already deduped and is unaffected; the end to end reachable pair set is still bounded by `MAX_QUEUED_PAIRS = 32` at mount, a deliberate documented limit (`KNOWN_ISSUES.md`, ADR-0009). Regression reproducers in `tests/`; the `mount_image` fuzz target now also drives the resolution path. From the 2026-05-15 six agent correctness review (items R1 and R3).
