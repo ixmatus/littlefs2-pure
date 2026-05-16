@@ -246,3 +246,82 @@ fn resolve_does_not_chase_softtail() {
     let err = fs.resolve(Path::new("/deep.txt").unwrap(), &mut a, &mut b).unwrap_err();
     assert_eq!(err, Error::NotFound);
 }
+
+/// Build an image where `/d` is a directory whose head pair (2,3) is
+/// empty but HardTail-threads to a continuation pair (4,5). The
+/// continuation holds `cont_entries`.
+fn build_hardtail_dir_image(cont_entries: &[DirEntrySpec<'_>]) -> MemStorage {
+    let mut storage = MemStorage::new();
+
+    // Continuation pair (4,5).
+    let cont = build_directory_block(1, cont_entries, MemStorage::BLOCK_SIZE);
+    storage.write_block(4, &cont);
+
+    // Head pair (2,3): no entries, just a HardTail to (4,5).
+    let tail_to_cont = {
+        let mut t = [0u8; 8];
+        t[0..4].copy_from_slice(&4u32.to_le_bytes());
+        t[4..8].copy_from_slice(&5u32.to_le_bytes());
+        t
+    };
+    let mut head = BlockBuilder::new(MemStorage::BLOCK_SIZE, 1).unwrap();
+    head.tag(Tag::new(true, TagType::HardTail, 0x3FF, 8), &tail_to_cont).unwrap();
+    head.commit(0).unwrap();
+    storage.write_block(2, &head.finish());
+
+    // Root pair (0,1): superblock + DirStruct "d" -> (2,3).
+    let sb_bytes = well_formed_sb().to_bytes();
+    let dir_to_head = {
+        let mut t = [0u8; 8];
+        t[0..4].copy_from_slice(&2u32.to_le_bytes());
+        t[4..8].copy_from_slice(&3u32.to_le_bytes());
+        t
+    };
+    let mut root = BlockBuilder::new(MemStorage::BLOCK_SIZE, 1).unwrap();
+    root.tag(Tag::new(true, TagType::Superblock, 0, 8), MAGIC).unwrap();
+    root.tag(Tag::new(true, TagType::InlineStruct, 0, 24), &sb_bytes).unwrap();
+    root.tag(Tag::new(true, TagType::Create, 1, 0), &[]).unwrap();
+    root.tag(Tag::new(true, TagType::Directory, 1, 1), b"d").unwrap();
+    root.tag(Tag::new(true, TagType::DirStruct, 1, 8), &dir_to_head).unwrap();
+    root.commit(0).unwrap();
+    storage.write_block(0, &root.finish());
+    storage
+}
+
+#[test]
+fn rmdir_rejects_directory_with_entries_in_hardtail_continuation() {
+    // /d's head pair is empty, but a HardTail continuation holds a
+    // live file. rmdir must count across the chain and reject with
+    // NotEmpty rather than orphan the continuation pair.
+    let storage = build_hardtail_dir_image(&[DirEntrySpec {
+        id: 0,
+        name: b"buried.txt",
+        name_type: TagType::RegularFile,
+        struct_type: TagType::InlineStruct,
+        struct_body: b"still here",
+    }]);
+    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let err = fs.rmdir(Path::new("/d").unwrap(), &mut a, &mut b).unwrap_err();
+    assert_eq!(err, Error::NotEmpty);
+}
+
+#[test]
+fn rmdir_accepts_directory_with_empty_hardtail_chain() {
+    // /d's head pair is empty and its HardTail continuation is also
+    // empty. The directory is genuinely empty across the whole chain,
+    // so rmdir must succeed.
+    let storage = build_hardtail_dir_image(&[]);
+    let mut buf_a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut buf_b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    fs.rmdir(Path::new("/d").unwrap(), &mut a, &mut b).unwrap();
+    assert!(!fs.exists(Path::new("/d").unwrap(), &mut a, &mut b).unwrap());
+}

@@ -2440,19 +2440,16 @@ impl<S: Storage> Fs<S> {
             BlockPair::new(BlockAddress::new(a), BlockAddress::new(b))
         };
 
-        // Read the directory's pair and verify it's empty.
-        self.storage.read(dir_pair.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(dir_pair.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        {
-            let dp = MetadataPair::parse(dir_pair.a, &*buf_a, dir_pair.b, &*buf_b)?;
-            let mut live_count = 0usize;
-            crate::dir::live_entries(&dp, |_| {
-                live_count += 1;
-                Ok::<(), Error>(())
-            })?;
-            if live_count > 0 {
-                return Err(Error::NotEmpty);
-            }
+        // Verify the directory is empty. A directory may be threaded
+        // across HardTail continuation pairs; counting only the first
+        // pair would wrongly accept rmdir of a directory whose entries
+        // live in a continuation pair. This writer never emits
+        // HardTail tags, so single-pair directories are the common
+        // case, but an image written by the C reference (or a future
+        // chaining writer) can have them. Walk the whole chain.
+        let live_count = self.list_pair_chain(dir_pair, |_| {}, buf_a, buf_b)?;
+        if live_count > 0 {
+            return Err(Error::NotEmpty);
         }
 
         self.remove_from_pair(parent, leaf.as_bytes(), buf_a, buf_b)
