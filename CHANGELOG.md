@@ -4,6 +4,42 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-05-15
+
+Post v1.0 deep review remediation. No public API changes; the 1.x semver contract is intact. This release closes the review's correctness and adversarial input findings and hardens the verification surface.
+
+### Security
+
+- `recover_pending_move` now rejects a `MoveState` whose decoded `src_id` is past the live entry count, surfacing `Error::Corrupt` instead of committing a bogus `Delete` plus a balancing `MoveState` that would permanently mask the inconsistency. A corrupt or adversarial image can supply such a body.
+- Pair addresses decoded from disk (directory pair pointers, tail links) are bounds checked before dereference: an out of range live `DirStruct` or tail is rejected as `Error::Corrupt`, and the `Storage` trait contract now states explicitly that an implementation must reject out of range accesses rather than index its backing buffer, so a malformed image cannot turn into memory unsafety in the adapter.
+
+### Fixed
+
+- An inline write that would overwrite an existing directory entry is now rejected, mirroring the existing guard on the CTZ write path.
+- `rmdir` emptiness is counted across the whole `HardTail` chain, not just the first pair, so a directory whose entries spill into a continuation pair is no longer wrongly treated as empty.
+
+### Added
+
+- Per vector content pin in the conformance harness: each committed `tests/vectors/*.bin` is checked against its LittleFS CRC32, so a silent regeneration that changes the bytes is caught instead of slipping past the size only check.
+- Three conformance vectors: a dense directory that spans a `HardTail` chain, files straddling the inline/CTZ size region, and a delete then recreate of the same name.
+- Hand encoded spec oracle for the tag layout, plus `RelocateState` and `Unknown` coverage in the tag property generator.
+- `mount_image` fuzz target exercising `Fs::mount` plus a bounded listing on an arbitrary whole device image, and an advisory `fuzz_smoke` CI job that builds and briefly runs every target.
+- `cargo test --no-default-features --lib` now runs in CI, so the no_std no_alloc kernel is tested at its floor, not just built.
+- `tests/bench_ctz_append.rs`, a zero dependency, ignored timing harness for the many small appends path.
+- Review suggested regression tests: `Fs::format` produces a clean, stable, mountable empty filesystem; the wrap aware revision predicate is pinned at the `u32` wrap; the live entry count is stable across compaction.
+
+### Changed
+
+- The metadata plumbing (`MetadataPair`, `MetadataReader`, `TagEntry`, `meta::Commit`, `Fs::read_pair`) is marked `#[doc(hidden)]` with a note that it stays semver covered in 1.x but is a candidate to move to `pub(crate)` in 2.0. Nothing is removed; the tag types stay documented as a deliberate public inspection contract.
+- The test suite funnels block buffer allocation through one `common::make_buffer` helper instead of repeating the geometry literal in hundreds of places.
+- `CLAUDE.md`'s bit accuracy note is narrowed to what is verified: structure encoding is byte faithful and conformance pinned; the format bootstrap may differ from the C reference while remaining semantically conformant.
+
+### Documentation
+
+- ADR-0006 pins the per call scratch stack budget for the Cortex M0+ ship target with portable compile time guards rather than restructuring the buffers in 1.x.
+- ADR-0007 records the bench gated decision not to add a per `File` CTZ chain cache: the O(N^2) chain walk is a bounded sub dominant cost the 256 block cap keeps unobservable, so the cache would trade a measured neutral gain for a stack regression and invalidation risk.
+- ADR-0008 records that `Fs::format` is not byte identical to the C reference's empty format image (both are valid and interoperate) and the decision to treat that bootstrap divergence as accepted for 1.x.
+
 ## [1.0.0] - 2026-05-11
 
 **API frozen.** Every public item ships with the v1.x semver contract. Future additive changes ship as 1.x minor releases; removing or renaming any public item requires a 2.0.
