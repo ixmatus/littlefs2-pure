@@ -51,6 +51,19 @@ use crate::{BlockAddress, ROOT_BLOCK_PAIR};
 /// [`crate::dir::live_entries`] accepts can also be compacted.
 const MAX_LIVE_ENTRIES: usize = crate::dir::MAX_LIVE_ENTRIES;
 
+// Stack budget guard. `gather_live_slots` callers stack a
+// `[SlotOffsets; MAX_LIVE_ENTRIES]` scratch array, and that array is on
+// the frame of `apply_op_to_pair_inner` while it recurses through
+// `propagate_relocation`. The Cortex-M0+ ship target has a small stack,
+// so the per-frame cost of this array is a documented, pinned budget,
+// not an incidental detail. If `SlotOffsets` grows, this fails to
+// compile until docs/decisions/0006-stack-budget.md is revisited.
+const _: () = assert!(
+    core::mem::size_of::<SlotOffsets>() == 10
+        && core::mem::size_of::<[SlotOffsets; MAX_LIVE_ENTRIES]>() == 2560,
+    "SlotOffsets stack budget changed; revisit docs/decisions/0006-stack-budget.md"
+);
+
 /// Maximum chain length a single CTZ write can produce.
 ///
 /// At 4 KiB blocks this caps a single full-rewrite CTZ write at ~1 MiB;
@@ -106,6 +119,19 @@ impl SlotOffsets {
 /// tags. Returns the number of live entries.
 ///
 /// `active_is_a` selects which of `buf_a`/`buf_b` is the source.
+///
+/// # Stack budget
+///
+/// `slots` is a `[SlotOffsets; MAX_LIVE_ENTRIES]` (256 * 10 = 2560
+/// bytes). It is not allocated here but every caller stacks it as a
+/// local before the call, and one such caller is
+/// [`Fs::apply_op_to_pair_inner`], which holds that 2.5 KiB frame while
+/// it recurses through [`Fs::propagate_relocation`] back into itself
+/// during wear-levelling relocation. On the Cortex-M0+ ship target this
+/// is a deliberate, pinned budget rather than an accident; the static
+/// assertion near [`MAX_LIVE_ENTRIES`] fails the build if `SlotOffsets`
+/// grows, and `docs/decisions/0006-stack-budget.md` records the full
+/// accounting and the recursion-depth bound.
 fn gather_live_slots(
     pair: &MetadataPair<'_>,
     active_is_a: bool,

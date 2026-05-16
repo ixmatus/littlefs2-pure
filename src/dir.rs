@@ -253,6 +253,29 @@ impl LookupSlot<'_> {
     const EMPTY: Self = Self { name: None, kind: None, struct_data: None };
 }
 
+// Stack budget guard. `lookup` stacks a `[LookupSlot; MAX_LIVE_ENTRIES]`
+// scratch array as a local; at 48 bytes per slot that is the dominant
+// contributor to its frame (~12 KiB). `lookup` is called from the
+// resolve/rename/rmdir paths in `fs`, so on the Cortex-M0+ ship target
+// this peak is a documented, pinned budget. If `LookupSlot` grows, this
+// fails to compile until docs/decisions/0006-stack-budget.md is
+// revisited.
+// Portable budget guard. `LookupSlot` carries pointers, so its byte
+// size is pointer-width dependent (24 bytes on the 32-bit
+// `thumbv6m-none-eabi` ship target, 48 on a 64-bit host). Pinning an
+// absolute count would be wrong on one or the other, so instead bound
+// the slot by the sum of its three documented fields plus one word of
+// slack: a fourth field cannot be added without tripping this, on any
+// target. See docs/decisions/0006-stack-budget.md.
+const _: () = assert!(
+    core::mem::size_of::<LookupSlot<'static>>()
+        <= core::mem::size_of::<Option<&[u8]>>()
+            + core::mem::size_of::<Option<(TagType, &[u8])>>()
+            + core::mem::size_of::<Option<EntryKind>>()
+            + core::mem::size_of::<usize>(),
+    "LookupSlot grew past its three documented fields; revisit docs/decisions/0006-stack-budget.md"
+);
+
 /// Look up a directory entry by name within a single metadata pair.
 ///
 /// Walks the tag stream applying splice (Create / Delete) renumbering,
@@ -266,6 +289,19 @@ impl LookupSlot<'_> {
 /// Single pair only. Does not chase HardTail tags into adjacent pairs;
 /// callers wanting that should walk the chain themselves (or use
 /// [`crate::Fs::resolve`] which does).
+///
+/// # Stack budget
+///
+/// This function stacks a `[LookupSlot; MAX_LIVE_ENTRIES]` local, which
+/// dominates its frame. `LookupSlot` carries pointers, so its size is
+/// pointer-width dependent: 24 bytes on the 32-bit
+/// `thumbv6m-none-eabi` ship target (a 6144-byte / 6 KiB array) and
+/// 48 bytes on a 64-bit host (12 KiB). It is called from the resolve,
+/// rename, and rmdir paths in [`crate::fs`], so on the Cortex M0+ ship
+/// target this 6 KiB peak is a deliberate, pinned budget. The portable
+/// static assertion above fails the build if `LookupSlot` gains a
+/// field; `docs/decisions/0006-stack-budget.md` records the accounting
+/// and why a caller-supplied buffer was not adopted in 1.x.
 #[must_use]
 pub fn lookup<'a>(pair: &MetadataPair<'a>, name: &[u8]) -> Option<Resolved<'a>> {
     let mut slots: [LookupSlot<'a>; MAX_LIVE_ENTRIES] = [LookupSlot::EMPTY; MAX_LIVE_ENTRIES];
