@@ -19,8 +19,24 @@ use core::result::Result;
 /// The hardware abstraction for a LittleFS backing store.
 ///
 /// All offsets and sizes are in bytes. The block coordinate `(block, off)`
-/// addresses byte `block * BLOCK_SIZE + off`. The trait does no bounds
-/// checking; callers in the kernel enforce all geometry invariants.
+/// addresses byte `block * BLOCK_SIZE + off`.
+///
+/// # Out-of-range addresses
+///
+/// An implementation **must** return [`Self::Error`] (never read or
+/// write out-of-bounds memory, never panic) for any
+/// [`read`](Self::read), [`program`](Self::program), or
+/// [`erase`](Self::erase) whose `block` is `>= BLOCK_COUNT` or whose
+/// `(block, off, len)` extent runs past the device. The kernel aligns
+/// and range-checks every call it originates, but block addresses
+/// decoded from on-disk structures (directory pair pointers, CTZ skip
+/// pointers, tail links) can be arbitrary in a corrupt or adversarial
+/// image. The kernel defensively rejects out-of-range pair addresses
+/// before dereferencing them, but it relies on this trait contract as
+/// the final backstop: an implementation that indexes a backing buffer
+/// without its own bounds check turns a malformed image into memory
+/// unsafety in the adapter. The reference [`crate::NorAlignedStorage`]
+/// and all test adapters honor this.
 ///
 /// # Geometry invariants
 ///

@@ -149,6 +149,71 @@ fn mount_returns_corrupt_for_programmed_but_invalid_pair() {
 }
 
 #[test]
+fn mount_rejects_live_dirstruct_pointing_out_of_bounds() {
+    // Adversarial image: a live DirStruct whose pair address is past
+    // BLOCK_COUNT. The mount-time gstate walk must reject with
+    // Error::Corrupt rather than hand the out-of-range address to
+    // Storage::read and accumulate a bogus recovery gstate.
+    use littlefs2_pure::meta::{Commit, MetadataPair};
+    use littlefs2_pure::storage::Storage;
+    use littlefs2_pure::tag::{Tag, TagType};
+    use littlefs2_pure::{Path, ROOT_BLOCK_PAIR};
+
+    let mut storage = MemStorage::new();
+    let mut scratch = [0u8; MemStorage::BLOCK_SIZE];
+    Fs::format(&mut storage, &mut scratch).unwrap();
+    let mut a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut b = [0u8; MemStorage::BLOCK_SIZE];
+    let mut fs = Fs::mount(storage, &mut a, &mut b).unwrap();
+    fs.mkdir(Path::new("/d").unwrap(), &mut a, &mut b).unwrap();
+    let mut storage = fs.into_storage();
+
+    let mut ba = [0u8; MemStorage::BLOCK_SIZE];
+    let mut bb = [0u8; MemStorage::BLOCK_SIZE];
+    storage.read(ROOT_BLOCK_PAIR.a.as_u32(), 0, &mut ba).unwrap();
+    storage.read(ROOT_BLOCK_PAIR.b.as_u32(), 0, &mut bb).unwrap();
+    let (active_addr, committed_end, next_ptag, active_is_a, dir_id) = {
+        let pair = MetadataPair::parse(ROOT_BLOCK_PAIR.a, &ba, ROOT_BLOCK_PAIR.b, &bb).unwrap();
+        let mut id = None;
+        for e in pair.reader.iter_tags() {
+            if e.tag.tag_type() == TagType::DirStruct {
+                id = Some(e.tag.id());
+            }
+        }
+        (
+            pair.active_block,
+            pair.reader.committed_end(),
+            pair.reader.next_ptag(),
+            pair.active_block == ROOT_BLOCK_PAIR.a,
+            id.expect("/d has a DirStruct tag"),
+        )
+    };
+
+    // Re-emit a DirStruct at /d's id with an out-of-range pair; the
+    // latest-tag-wins reader makes this the live struct for /d.
+    let mut oob = [0u8; 8];
+    oob[0..4].copy_from_slice(&9999u32.to_le_bytes());
+    oob[4..8].copy_from_slice(&9998u32.to_le_bytes());
+    let active_buf: &mut [u8] = if active_is_a { &mut ba } else { &mut bb };
+    let new_end = {
+        let mut commit = Commit::new_appending(active_buf, committed_end, next_ptag).unwrap();
+        commit.tag(Tag::new(true, TagType::DirStruct, dir_id, 8), &oob).unwrap();
+        commit.finish_padded(0, MemStorage::PROG_SIZE, MemStorage::BLOCK_SIZE).unwrap();
+        commit.bytes_written()
+    };
+    storage
+        .program(active_addr.as_u32(), committed_end as u32, &active_buf[committed_end..new_end])
+        .unwrap();
+
+    let mut m_a = [0u8; MemStorage::BLOCK_SIZE];
+    let mut m_b = [0u8; MemStorage::BLOCK_SIZE];
+    let err = Fs::mount(storage, &mut m_a, &mut m_b)
+        .err()
+        .expect("mount must reject an out-of-range live DirStruct");
+    assert_eq!(err, Error::Corrupt);
+}
+
+#[test]
 fn fs_exposes_storage_via_accessors() {
     let mut storage = MemStorage::new();
     storage.write_block(0, &build_superblock_block(&well_formed_sb(), MemStorage::BLOCK_SIZE));

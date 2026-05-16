@@ -545,6 +545,12 @@ fn accumulate_gstate<S: Storage>(
         // and don't multiplex into the live-entries view; enqueue the
         // latest tail just like the read-side resolver does.
         if let Some(tail_pair) = pair.reader.tail() {
+            // A live tail pointing outside the device is genuine
+            // corruption; proceeding would yield an incomplete gstate
+            // and silently mis-recover.
+            if !pair_in_bounds::<S>(tail_pair) {
+                return Err(Error::Corrupt);
+            }
             if !queue[..tail].contains(&tail_pair) {
                 if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                     return Err(Error::OutOfRange);
@@ -562,6 +568,12 @@ fn accumulate_gstate<S: Storage>(
                 let a = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
                 let b = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
                 let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
+                // A live DirStruct pointing outside the device is
+                // genuine corruption; reject rather than read garbage
+                // and mis-accumulate the recovery gstate.
+                if !pair_in_bounds::<S>(child) {
+                    return Err(Error::Corrupt);
+                }
                 if !queue[..tail].contains(&child) {
                     if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                         return Err(Error::OutOfRange);
@@ -673,6 +685,19 @@ fn should_relocate(
     new_revision % m == 0
 }
 
+/// True when both blocks of a metadata-pair address decoded from disk
+/// fall inside the device geometry. A `DirStruct` / tail body in a
+/// corrupt or adversarial image can encode any 32-bit value; the
+/// kernel must validate before handing the address to
+/// [`Storage::read`] (whose contract requires it to error on
+/// out-of-range, but which the kernel does not depend on for its own
+/// correctness). Out-of-range pair addresses are never legitimately
+/// reachable, so callers skip or reject them.
+#[inline]
+fn pair_in_bounds<S: Storage>(pair: BlockPair) -> bool {
+    pair.a.as_u32() < S::BLOCK_COUNT && pair.b.as_u32() < S::BLOCK_COUNT
+}
+
 /// BFS-walk the metadata-pair forest from `root` and return the
 /// `(parent_pair, id)` of the entry whose `DirStruct` body matches
 /// `target`. Returns `Ok(None)` if `target` is not referenced by any
@@ -741,7 +766,10 @@ fn find_parent_in_tree<S: Storage>(
                     if child == target {
                         return Ok(Some((pair_addr, entry.tag.id())));
                     }
-                    if !queue[..tail].contains(&child) {
+                    // An out-of-range DirStruct body cannot be the
+                    // target (a real allocated pair) and must never be
+                    // dereferenced; skip it rather than enqueue.
+                    if pair_in_bounds::<S>(child) && !queue[..tail].contains(&child) {
                         if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                             return Err(Error::OutOfRange);
                         }
@@ -765,7 +793,7 @@ fn find_parent_in_tree<S: Storage>(
                         entry.body[7],
                     ]);
                     let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
-                    if !queue[..tail].contains(&child) {
+                    if pair_in_bounds::<S>(child) && !queue[..tail].contains(&child) {
                         if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                             return Err(Error::OutOfRange);
                         }
