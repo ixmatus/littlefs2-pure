@@ -28,7 +28,17 @@ use crate::meta::MetadataReader;
 /// stubbed harnesses below. CBMC treats the return value as
 /// arbitrary, which is sound for proving panic-freedom (the reader
 /// must reject *every* path).
+///
+/// `#[allow(dead_code)]`: this function is referenced only through
+/// the `#[kani::stub(crate::crc::update, crc_update_stub)]`
+/// attribute, which rustc's own dead-code pass does not see as a
+/// use. Under CI's `RUSTFLAGS=-D warnings` the false-positive
+/// `dead_code` lint became a hard compile error, which is why the
+/// kani job failed from the moment it was added in v0.3.1 (locally
+/// `cargo kani` only warns, so it went unnoticed). The stub is used;
+/// the lint is blind to the attribute, not the call.
 #[cfg(kani)]
+#[allow(dead_code)]
 fn crc_update_stub(_seed: u32, _data: &[u8]) -> u32 {
     kani::any()
 }
