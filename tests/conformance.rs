@@ -30,10 +30,31 @@
 
 use littlefs2_pure::ctz::CtzStruct;
 use littlefs2_pure::tag::TagType;
-use littlefs2_pure::{Error, Fs, Path};
+use littlefs2_pure::{crc, Error, Fs, Path};
 
 mod common;
 use common::MemStorage;
+
+/// Per-vector content pin: the LittleFS CRC32 ([`crc::compute`]) of the
+/// full image bytes.
+///
+/// This is a regeneration tripwire, not an adversarial integrity check.
+/// The vectors are produced by the C reference and committed at rest in a
+/// trusted repository; the failure this guards against is a silent
+/// `make -C tools/gen_vectors vectors` that changes the bytes while the
+/// only existing check (file size) still passes, so the conformance
+/// assertions quietly start exercising a different image. A CRC32 over
+/// 2 KiB is ample to catch accidental drift; it is deliberately not a
+/// cryptographic hash because the threat model is mistake, not malice.
+///
+/// When a vector legitimately changes, regenerate it and update the
+/// expected value here in the same commit as the new `.bin`.
+const VECTOR_CRCS: &[(&str, u32)] = &[
+    ("01_empty_format.bin", 0xd225_bb0e),
+    ("02_single_inline.bin", 0xeab2_c5e3),
+    ("03_single_ctz.bin", 0x14c7_2253),
+    ("04_nested_dir.bin", 0x0886_0052),
+];
 
 /// Load a vector file's bytes into a fresh `MemStorage`. Panics on
 /// I/O error (these files are committed; a missing one is a setup
@@ -45,6 +66,17 @@ fn load(vector_name: &str) -> MemStorage {
         bytes.len(),
         MemStorage::BLOCK_SIZE * MemStorage::BLOCK_COUNT as usize,
         "vector {vector_name} is the wrong size; regenerate with `make -C tools/gen_vectors vectors`"
+    );
+    let expected = VECTOR_CRCS
+        .iter()
+        .find(|(n, _)| *n == vector_name)
+        .unwrap_or_else(|| panic!("no CRC pin for vector {vector_name}; add one to VECTOR_CRCS"))
+        .1;
+    let actual = crc::compute(&bytes);
+    assert_eq!(
+        actual, expected,
+        "vector {vector_name} content changed (CRC {actual:#010x} != pinned {expected:#010x}); \
+         if this was an intentional regeneration, update VECTOR_CRCS in the same commit"
     );
     let mut s = MemStorage::new();
     s.data.copy_from_slice(&bytes);
