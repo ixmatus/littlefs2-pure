@@ -120,8 +120,12 @@ impl<'a> Path<'a> {
         }
         // Trim a single leading slash for traversal; trailing slash is
         // rejected because it implies an empty trailing component.
+        // `working` cannot be empty here: `s` is non-empty and the
+        // only `s` that strips to "" is "/", already returned above,
+        // so the `is_empty` arm was dead. An empty component anywhere
+        // else is caught by the split loop below.
         let working = s.strip_prefix('/').unwrap_or(s);
-        if working.is_empty() || working.ends_with('/') {
+        if working.ends_with('/') {
             return Err(Error::InvalidPath);
         }
         for component in working.split('/') {
