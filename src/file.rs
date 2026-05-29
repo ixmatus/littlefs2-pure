@@ -494,16 +494,21 @@ impl<S: Storage> File<'_, S> {
                 self.pos = self.size;
                 let mut remaining = new_size - self.size;
                 // Zero-fill is a sequence of streaming writes from a
-                // stack-resident zero buffer. The loop iteration
-                // boundary closes the buf_a / buf_b borrows between
-                // calls so we can hand them back to stream_ctz_extend
-                // each time.
-                let zeros = [0u8; 64];
+                // shared read-only zero buffer (`static`, so it costs no
+                // stack). The loop iteration boundary closes the buf_a /
+                // buf_b borrows between calls so we can hand them back to
+                // stream_ctz_extend each time. The buffer is sized well
+                // past a typical block so each `stream_ctz_extend` call
+                // advances multiple blocks per chain re-walk rather than
+                // one ~64-byte slice, cutting the call count (and the
+                // per-call chain walks) on large zero-extends by an order
+                // of magnitude; see `tests/bench_perf_backlog.rs` Bench C.
+                static ZERO_CHUNK: [u8; 1024] = [0u8; 1024];
                 while remaining > 0 {
-                    let chunk = (remaining as usize).min(zeros.len());
+                    let chunk = (remaining as usize).min(ZERO_CHUNK.len());
                     let ctz = CtzStruct { head_block: self.head_block, size: self.size };
                     let (new_head, new_size_local) =
-                        self.fs.stream_ctz_extend(ctz, &zeros[..chunk], buf_a, buf_b)?;
+                        self.fs.stream_ctz_extend(ctz, &ZERO_CHUNK[..chunk], buf_a, buf_b)?;
                     self.head_block = BlockAddress::new(new_head);
                     self.size = new_size_local;
                     remaining -= chunk as u32;
@@ -539,6 +544,10 @@ impl<S: Storage> File<'_, S> {
                 buf_b,
             )?;
         }
+        // This commit may have superseded a prior CTZ chain (overwrite,
+        // truncate-to-zero, or set_len shrink), orphaning its blocks.
+        // Drop the allocator lookahead so they are reclaimed promptly.
+        self.fs.invalidate_alloc_cache();
         self.dirty = false;
         Ok(())
     }

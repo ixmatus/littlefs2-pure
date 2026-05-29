@@ -1,6 +1,7 @@
 # ADR-0007: no per-File CTZ chain cache (bench-gated, negative result)
 
-- **Status**: accepted
+- **Status**: accepted; the append cost it accepted was later addressed
+  without a per-File cache, see ADR-0011
 - **Date**: 2026-05-15
 
 ## Context
