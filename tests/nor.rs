@@ -137,3 +137,26 @@ fn ctz_streaming_append_through_nor_wrapper() {
     assert_eq!(n, all_bytes.len());
     assert_eq!(out, all_bytes);
 }
+
+/// Regression for `lfs-8o1` (2026-05-29 review): two disjoint sub-window
+/// programs into the *same* prog window with no intervening sync must
+/// both survive the eventual flush. The earlier `load_window` re-read the
+/// window from the device when the cache was dirty for that same window,
+/// clobbering the first program's pending bytes.
+#[test]
+fn two_programs_into_one_window_without_sync_both_survive() {
+    let mut s = make_wrapped();
+    s.erase(2).unwrap();
+    // Both writes land in window 0 of block 2; no sync between them.
+    s.program(2, 0, &[0xAA]).unwrap();
+    s.program(2, 1, &[0xBB]).unwrap();
+    s.sync().unwrap();
+
+    let mut buf = [0u8; 2];
+    s.read(2, 0, &mut buf).unwrap();
+    assert_eq!(
+        buf,
+        [0xAA, 0xBB],
+        "the first program's byte must not be clobbered by the second's window load",
+    );
+}

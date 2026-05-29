@@ -481,7 +481,8 @@ impl<S: Storage> File<'_, S> {
                     self.dirty = true;
                     return Ok(());
                 }
-                let new_head = seek_new_head_at(self.fs, self.head_block, self.size, new_size)?;
+                let new_head =
+                    self.fs.shrink_ctz_head(self.head_block, self.size, new_size, buf_a, buf_b)?;
                 self.head_block = new_head;
                 self.size = new_size;
                 self.pos = self.pos.min(self.size);
@@ -493,16 +494,21 @@ impl<S: Storage> File<'_, S> {
                 self.pos = self.size;
                 let mut remaining = new_size - self.size;
                 // Zero-fill is a sequence of streaming writes from a
-                // stack-resident zero buffer. The loop iteration
-                // boundary closes the buf_a / buf_b borrows between
-                // calls so we can hand them back to stream_ctz_extend
-                // each time.
-                let zeros = [0u8; 64];
+                // shared read-only zero buffer (`static`, so it costs no
+                // stack). The loop iteration boundary closes the buf_a /
+                // buf_b borrows between calls so we can hand them back to
+                // stream_ctz_extend each time. The buffer is sized well
+                // past a typical block so each `stream_ctz_extend` call
+                // advances multiple blocks per chain re-walk rather than
+                // one ~64-byte slice, cutting the call count (and the
+                // per-call chain walks) on large zero-extends by an order
+                // of magnitude; see `tests/bench_perf_backlog.rs` Bench C.
+                static ZERO_CHUNK: [u8; 1024] = [0u8; 1024];
                 while remaining > 0 {
-                    let chunk = (remaining as usize).min(zeros.len());
+                    let chunk = (remaining as usize).min(ZERO_CHUNK.len());
                     let ctz = CtzStruct { head_block: self.head_block, size: self.size };
                     let (new_head, new_size_local) =
-                        self.fs.stream_ctz_extend(ctz, &zeros[..chunk], buf_a, buf_b)?;
+                        self.fs.stream_ctz_extend(ctz, &ZERO_CHUNK[..chunk], buf_a, buf_b)?;
                     self.head_block = BlockAddress::new(new_head);
                     self.size = new_size_local;
                     remaining -= chunk as u32;
@@ -538,6 +544,10 @@ impl<S: Storage> File<'_, S> {
                 buf_b,
             )?;
         }
+        // This commit may have superseded a prior CTZ chain (overwrite,
+        // truncate-to-zero, or set_len shrink), orphaning its blocks.
+        // Drop the allocator lookahead so they are reclaimed promptly.
+        self.fs.invalidate_alloc_cache();
         self.dirty = false;
         Ok(())
     }
@@ -557,29 +567,6 @@ impl<S: Storage> Drop for File<'_, S> {
         // and the silently-dropped chain blocks are reclaimable by
         // the next allocator scan, so no corruption occurs.
     }
-}
-
-/// Walk a CTZ chain backward from `head_block` and return the head
-/// block of the truncated chain whose new logical length is
-/// `new_size`. Used by [`File::set_len`] to shrink a file without
-/// rewriting any committed blocks.
-fn seek_new_head_at<S: Storage>(
-    fs: &mut Fs<S>,
-    head_block: BlockAddress,
-    old_size: u32,
-    new_size: u32,
-) -> Result<BlockAddress, Error> {
-    debug_assert!(new_size > 0 && new_size <= old_size);
-    use crate::ctz::{block_count, block_index_at_offset, collect_chain_blocks, MAX_CTZ_BLOCKS};
-    let bs = S::BLOCK_SIZE as u32;
-    let n_old = block_count(old_size, bs);
-    if n_old as usize > MAX_CTZ_BLOCKS {
-        return Err(Error::OutOfRange);
-    }
-    let mut chain = [BlockAddress::NONE; MAX_CTZ_BLOCKS];
-    collect_chain_blocks(fs.storage_mut(), head_block, n_old, &mut chain[..n_old as usize])?;
-    let (new_tail_idx, _) = block_index_at_offset(new_size - 1, bs);
-    Ok(chain[new_tail_idx as usize])
 }
 
 // ---- Internal bridges from File into Fs ----------------------------------

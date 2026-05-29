@@ -26,10 +26,12 @@
 //!   roughly 16 MiB at 4 KiB blocks, or 1 MiB at 256-byte blocks.
 //!   Devices beyond that need a streaming allocator (forward-looking
 //!   enhancement; not currently exercised).
-//! - `MAX_QUEUED_PAIRS = 32`: caps directory tree depth and HardTail
-//!   chain length the scan can traverse in one pass. A directory tree
-//!   with more than 32 leaves visited concurrently returns
-//!   `Error::OutOfRange`.
+//! - `MAX_QUEUED_PAIRS = 32`: caps the total reachable pair set the
+//!   scan enumerates in one pass (a breadth bound, not a nesting-depth
+//!   bound: the flat BFS queue holds one slot per distinct reachable
+//!   metadata pair, including HardTail continuation pairs). A forest
+//!   whose reachable pair set exceeds 32 returns `Error::OutOfRange`.
+//!   Relocation recursion depth is bounded separately at the root.
 
 use crate::block::{BlockAddress, BlockPair};
 use crate::ctz;
@@ -49,7 +51,7 @@ pub const MAX_QUEUED_PAIRS: usize = 32;
 /// Set bits indicate blocks that are reachable from the filesystem
 /// root and therefore must not be reused. Unset bits are free for
 /// allocation.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Bitmap {
     bits: [u8; MAX_TRACKED_BLOCKS / 8],
 }
@@ -446,4 +448,131 @@ pub fn alloc_one_block_with_single_buf<S: Storage>(
         }
     }
     Err(Error::OutOfRange)
+}
+
+// ---- Lookahead-cached allocation (lfs-opt) --------------------------------
+//
+// The scan-based allocator above re-walks the whole reachable forest on
+// every block-allocating write (two block reads per pair plus every CTZ
+// chain), so a populated device pays O(reachable blocks) of flash I/O per
+// allocation. The cached variants below keep the used-block bitmap from
+// the last authoritative scan on the `Fs` and serve subsequent
+// allocations from RAM.
+//
+// Safety rests on the bitmap only ever being an *over-approximation* of
+// in-use blocks: it can mark a freed block as still-used (benign: that
+// block is simply not reused until the next rescan) but it can never mark
+// a live block as free. That invariant holds because (1) every block
+// handed out is marked used before return, so a cache hit cannot return
+// the same block twice; (2) a cache miss or an unsatisfiable request
+// rescans from the authoritative on-disk state and re-applies the
+// caller's `excluded` set, the exact basis the uncached path uses; and
+// (3) the cache is in-RAM only, rebuilt from `None` at every mount. The
+// only failure mode is staleness (freed blocks lingering as used), which
+// the rescan-on-exhaustion path reclaims; invalidating the cache after a
+// free is a promptness optimization, never a correctness requirement.
+
+/// Find `out.len()` free blocks in `used`, treating `excluded` as in-use,
+/// and mark both `excluded` and the chosen blocks into `used`. Pure
+/// in-RAM; no I/O. Returns [`Error::OutOfRange`] if there are not enough
+/// free blocks (after partially marking, which is harmless: the caller
+/// discards or replaces the bitmap).
+fn take_free_blocks(
+    used: &mut Bitmap,
+    excluded: &[BlockAddress],
+    out: &mut [BlockAddress],
+    block_count: u32,
+) -> Result<(), Error> {
+    for &ex in excluded {
+        if !ex.is_none() {
+            used.set(ex.as_u32())?;
+        }
+    }
+    let mut filled = 0usize;
+    let mut b = 0u32;
+    while filled < out.len() && b < block_count {
+        if !used.is_set(b) {
+            out[filled] = BlockAddress::new(b);
+            used.set(b)?;
+            filled += 1;
+        }
+        b += 1;
+    }
+    if filled < out.len() {
+        return Err(Error::OutOfRange);
+    }
+    Ok(())
+}
+
+/// Cache-aware multi-block allocation (two-buffer scan on miss).
+///
+/// On a populated `cache` this serves entirely from RAM, eliminating the
+/// per-allocation forest scan. On a miss, or when the cached
+/// over-approximation cannot satisfy the request (stale freed blocks
+/// still marked), it rescans with [`scan_used_blocks`], applies
+/// `excluded`, refreshes the cache, and retries once. See the module-
+/// level safety note above.
+///
+/// `exclude_chain` names an in-flight CTZ chain `(head, size)` that an
+/// authoritative rescan would not see as reachable (a stateful `File`
+/// whose new blocks are not yet committed to its metadata entry). It is
+/// walked and marked only on the rescan path: on a cache hit the chain's
+/// blocks are already marked, because each was marked when this same
+/// allocator handed it out. This is what lets the streaming append path
+/// drop its O(n) chain collect entirely on the hot path while keeping the
+/// in-flight blocks safe from re-allocation if a rescan does occur.
+#[allow(clippy::too_many_arguments)]
+pub fn alloc_blocks_cached<S: Storage>(
+    storage: &mut S,
+    root: BlockPair,
+    cache: &mut Option<Bitmap>,
+    excluded: &[BlockAddress],
+    exclude_chain: Option<(u32, u32)>,
+    out: &mut [BlockAddress],
+    buf_a: &mut [u8],
+    buf_b: &mut [u8],
+) -> Result<(), Error> {
+    if let Some(bm) = cache.as_mut() {
+        if take_free_blocks(bm, excluded, out, S::BLOCK_COUNT).is_ok() {
+            return Ok(());
+        }
+        // The cached over-approximation could not satisfy the request.
+        // Fall through to an authoritative rescan; any partial marks left
+        // in the old bitmap are discarded when it is replaced below.
+    }
+    let mut fresh = Bitmap::EMPTY;
+    scan_used_blocks(storage, root, &mut fresh, buf_a, buf_b)?;
+    // The rescan only sees committed (root-reachable) blocks, so mark any
+    // in-flight chain the caller still owns before choosing free blocks.
+    if let Some((head, size)) = exclude_chain {
+        walk_ctz_chain(storage, head, size, &mut fresh)?;
+    }
+    take_free_blocks(&mut fresh, excluded, out, S::BLOCK_COUNT)?;
+    *cache = Some(fresh);
+    Ok(())
+}
+
+/// Cache-aware single-block allocation (single-buffer scan on miss).
+///
+/// Companion to [`alloc_blocks_cached`] for the wear-levelling relocation
+/// path, where the second scratch buffer holds the compacted bytes and
+/// only one buffer is free for a rescan. Same over-approximation safety.
+pub fn alloc_one_block_cached_single_buf<S: Storage>(
+    storage: &mut S,
+    root: BlockPair,
+    cache: &mut Option<Bitmap>,
+    excluded: &[BlockAddress],
+    buf: &mut [u8],
+) -> Result<BlockAddress, Error> {
+    let mut out = [BlockAddress::NONE; 1];
+    if let Some(bm) = cache.as_mut() {
+        if take_free_blocks(bm, excluded, &mut out, S::BLOCK_COUNT).is_ok() {
+            return Ok(out[0]);
+        }
+    }
+    let mut fresh = Bitmap::EMPTY;
+    scan_used_with_single_buf(storage, root, &mut fresh, buf)?;
+    take_free_blocks(&mut fresh, excluded, &mut out, S::BLOCK_COUNT)?;
+    *cache = Some(fresh);
+    Ok(out[0])
 }

@@ -189,10 +189,12 @@ pub const MAX_CTZ_BLOCKS: usize = 256;
 /// Read a CTZ backed file's content into `out`.
 ///
 /// `ctz` describes the file's layout (head block and total size).
-/// `scratch` is a per-block work buffer of at least
-/// [`S::BLOCK_SIZE`](Storage::BLOCK_SIZE) bytes; only the first 8 bytes
-/// are touched during the backward walk (to read up to 2 skip pointers
-/// per step).
+/// `scratch` must be at least [`S::BLOCK_SIZE`](Storage::BLOCK_SIZE)
+/// bytes. The current implementation does not read from `scratch`: block
+/// content is read straight into `out` and the backward walk uses its
+/// own internal 8 byte buffer (see [`collect_chain_blocks`]). The
+/// parameter and its length precondition are retained for API stability
+/// on the 1.x line; dropping them is a candidate for 2.0.
 ///
 /// The function reads `min(out.len(), ctz.size)` bytes and returns the
 /// count actually read.
@@ -265,6 +267,57 @@ pub fn collect_chain_blocks<S: Storage>(
         }
     }
     Ok(())
+}
+
+/// Seek from a chain head (the physical address `head` of the block at
+/// logical index `from_index`) to the physical address of the block at a
+/// smaller-or-equal logical `target_index`, following skip pointers.
+///
+/// Reads only skip-pointer headers, in `O(log(from_index - target_index))`
+/// reads, so a caller that needs one specific block's address need not
+/// walk the whole chain with [`collect_chain_blocks`].
+///
+/// This is the descent half of the CTZ skip-list: block `i` stores a
+/// pointer to block `i - 2^k` at header offset `4*k`, for each
+/// `k in 0..=ctz(i)`. From the current block at index `i > target`, the
+/// walk follows the largest available jump `2^k` that does not undershoot
+/// `target` (the largest `k <= ctz(i)` with `2^k <= i - target`); each
+/// hop strictly decreases `i` without passing `target`, so it lands
+/// exactly on `target` after `O(log)` hops. Every dereferenced address is
+/// bounds-checked, so a corrupt or out-of-range pointer is rejected as
+/// [`Error::Corrupt`].
+///
+/// # Errors
+///
+/// - [`Error::OutOfRange`] if `target_index > from_index`.
+/// - [`Error::Corrupt`] if a skip pointer is out of range.
+/// - I/O errors propagate from `storage.read`.
+pub fn seek_block<S: Storage>(
+    storage: &mut S,
+    head: BlockAddress,
+    from_index: u32,
+    target_index: u32,
+) -> Result<BlockAddress, Error> {
+    if target_index > from_index {
+        return Err(Error::OutOfRange);
+    }
+    let mut cur = require_in_bounds::<S>(head)?;
+    let mut idx = from_index;
+    let mut sp = [0u8; 4];
+    while idx > target_index {
+        let gap = idx - target_index;
+        // Available jumps at block `idx` are `2^k` for `k in 0..=ctz(idx)`
+        // (idx > 0 inside this loop). Choose the largest `k` bounded by
+        // both the gap and the block's pointer count.
+        let max_k = idx.trailing_zeros();
+        let gap_k = gap.ilog2(); // floor(log2(gap)); gap >= 1
+        let k = gap_k.min(max_k);
+        storage.read(cur.as_u32(), 4 * k, &mut sp).map_err(|_| Error::Io)?;
+        let ptr = u32::from_le_bytes([sp[0], sp[1], sp[2], sp[3]]);
+        cur = require_in_bounds::<S>(BlockAddress::new(ptr))?;
+        idx -= 1 << k;
+    }
+    Ok(cur)
 }
 
 /// Read up to `out.len()` bytes of a CTZ file starting at byte offset

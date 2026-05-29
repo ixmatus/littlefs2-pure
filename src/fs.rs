@@ -939,9 +939,26 @@ pub struct Fs<S: Storage> {
     storage: S,
     superblock: Superblock,
     root: BlockPair,
+    /// Lookahead cache of in-use blocks (over-approximation) so
+    /// steady-state allocation serves from RAM instead of re-walking the
+    /// reachable forest on every block-allocating write. `None` forces a
+    /// fresh authoritative scan on the next allocation; freed-block churn
+    /// invalidates it for promptness, but correctness never depends on
+    /// invalidation (see `crate::alloc::alloc_blocks_cached`).
+    used_cache: Option<crate::alloc::Bitmap>,
 }
 
 impl<S: Storage> Fs<S> {
+    /// Drop the block-allocator lookahead cache, forcing the next
+    /// allocation to rescan the reachable forest from disk. Called after
+    /// an operation that frees blocks so they are reclaimed promptly
+    /// rather than lingering as over-marked in the cache. Never required
+    /// for correctness (a stale cache is only an over-approximation; see
+    /// [`crate::alloc::alloc_blocks_cached`]); purely a promptness hook.
+    pub(crate) fn invalidate_alloc_cache(&mut self) {
+        self.used_cache = None;
+    }
+
     /// Threshold above which [`Self::write_to_root`] switches from
     /// inline storage (the file content lives inside the metadata pair
     /// as an `InlineStruct` body) to CTZ storage (the file content
@@ -1054,9 +1071,12 @@ impl<S: Storage> Fs<S> {
 
         // Allocate physical blocks for the chain.
         let mut chain = [BlockAddress::NONE; MAX_CTZ_WRITE_BLOCKS];
-        crate::alloc::alloc_blocks(
+        crate::alloc::alloc_blocks_cached(
             &mut self.storage,
             self.root,
+            &mut self.used_cache,
+            &[],
+            None,
             &mut chain[..total_blocks],
             buf_a,
             buf_b,
@@ -1283,6 +1303,9 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
+        // A truncate rewrites the file onto fresh blocks, orphaning the
+        // old chain; invalidate the lookahead cache so it is reclaimed.
+        self.used_cache = None;
         if (new_size as usize) > content_scratch.len() {
             return Err(Error::OutOfRange);
         }
@@ -1459,7 +1482,7 @@ impl<S: Storage> Fs<S> {
         buf_b: &mut [u8],
     ) -> Result<(u32, u32), Error> {
         use crate::ctz::{
-            block_count, block_index_at_offset, collect_chain_blocks, content_bytes_in_block,
+            block_count, block_index_at_offset, content_bytes_in_block, seek_block,
             skip_pointers_in_block,
         };
 
@@ -1470,24 +1493,11 @@ impl<S: Storage> Fs<S> {
             return Err(Error::OutOfRange);
         }
 
-        // Collect the existing chain's physical addresses. The walk
-        // reads only skip-pointer headers (4 or 8 bytes per block), so
-        // it touches very little flash and never reads near the tail's
-        // free region.
-        let mut chain = [BlockAddress::NONE; MAX_CTZ_WRITE_BLOCKS];
-        if n_old > 0 {
-            collect_chain_blocks(
-                &mut self.storage,
-                ctz.head_block,
-                n_old,
-                &mut chain[..n_old as usize],
-            )?;
-        }
-
         // Step 1: pack as much of `data` as fits into the existing tail
-        // block's unused content region. The bytes there are still
-        // 0xFF (never programmed since erase), so the NOR-aligned
-        // wrapper can program through this offset safely.
+        // block's unused content region. The tail block *is* the chain
+        // head, so its address is known without walking the chain. The
+        // free region there is still 0xFF (never programmed since erase),
+        // so the NOR-aligned wrapper can program through this offset.
         let mut data_consumed: usize = 0;
         let mut head_phys = ctz.head_block.as_u32();
         if n_old > 0 {
@@ -1500,7 +1510,7 @@ impl<S: Storage> Fs<S> {
             let room = tail_cap - bytes_used;
             let fill = (room as usize).min(data.len());
             if fill > 0 {
-                let tail_phys = chain[tail_idx as usize].as_u32();
+                let tail_phys = ctz.head_block.as_u32();
                 self.storage
                     .program(tail_phys, header + bytes_used, &data[..fill])
                     .map_err(|_| Error::Io)?;
@@ -1510,31 +1520,35 @@ impl<S: Storage> Fs<S> {
         }
 
         // Step 2: allocate new chain blocks for the remainder. Each new
-        // block stores skip pointers referencing earlier chain entries
-        // (existing or newly allocated) followed by content bytes.
+        // block stores skip pointers to earlier blocks: newly allocated
+        // ones come from `new_blocks`; existing ones are resolved by an
+        // O(log n) `seek_block` from the head rather than a full chain
+        // walk.
         if data_consumed < data.len() {
             let new_total = old_size + data.len() as u32;
             let new_n = block_count(new_total, bs);
             if (new_n as usize) > MAX_CTZ_WRITE_BLOCKS {
                 return Err(Error::OutOfRange);
             }
-            let new_start = n_old as usize;
             let new_count = (new_n - n_old) as usize;
 
-            // Pass the in-flight chain as "excluded" so the allocator
-            // does not hand back a block that already belongs to this
-            // chain. For `append_to_path` the chain is also reachable
-            // from root through the prior commit, so the exclusion is
-            // redundant; for the stateful `File` write path, where
-            // the metadata-pair entry is not updated between writes,
-            // the exclusion is the correctness fix that keeps the
-            // chain blocks from being reallocated under us.
-            let (existing, rest) = chain.split_at_mut(new_start);
-            crate::alloc::alloc_blocks_excluding(
+            // The existing chain may not be committed to its metadata
+            // entry yet (the stateful `File` write path batches writes),
+            // so an authoritative allocator rescan would not see it. Name
+            // it as the in-flight chain to exclude. On the hot cache-hit
+            // path the allocator skips the walk entirely (those blocks
+            // were marked when handed out), so the append no longer pays
+            // an O(n) chain collect; the walk happens only on a rescan.
+            let exclude_chain =
+                if n_old > 0 { Some((ctz.head_block.as_u32(), old_size)) } else { None };
+            let mut new_blocks = [BlockAddress::NONE; MAX_CTZ_WRITE_BLOCKS];
+            crate::alloc::alloc_blocks_cached(
                 &mut self.storage,
                 self.root,
-                existing,
-                &mut rest[..new_count],
+                &mut self.used_cache,
+                &[],
+                exclude_chain,
+                &mut new_blocks[..new_count],
                 buf_a,
                 buf_b,
             )?;
@@ -1549,7 +1563,12 @@ impl<S: Storage> Fs<S> {
                 let ptr_count = skip_pointers_in_block(new_i) as usize;
                 for k in 0..ptr_count {
                     let target_idx = (new_i as usize).checked_sub(1 << k).ok_or(Error::Corrupt)?;
-                    let target_phys = chain[target_idx].as_u32();
+                    let target_phys = if target_idx >= n_old as usize {
+                        new_blocks[target_idx - n_old as usize].as_u32()
+                    } else {
+                        seek_block(&mut self.storage, ctz.head_block, n_old - 1, target_idx as u32)?
+                            .as_u32()
+                    };
                     let off = 4 * k;
                     buf_a[off..off + 4].copy_from_slice(&target_phys.to_le_bytes());
                 }
@@ -1559,17 +1578,104 @@ impl<S: Storage> Fs<S> {
                     .copy_from_slice(&remaining[content_off..content_off + take]);
                 content_off += take;
 
-                let phys = chain[new_i as usize].as_u32();
+                let phys = new_blocks[(new_i - n_old) as usize].as_u32();
                 self.storage.erase(phys).map_err(|_| Error::Io)?;
                 self.storage.program(phys, 0, &buf_a[..S::BLOCK_SIZE]).map_err(|_| Error::Io)?;
             }
-            head_phys = chain[new_n as usize - 1].as_u32();
+            head_phys = new_blocks[new_count - 1].as_u32();
         }
 
         self.storage.sync().map_err(|_| Error::Io)?;
 
         let new_size = old_size + data.len() as u32;
         Ok((head_phys, new_size))
+    }
+
+    /// Compute the new head block for a CTZ file shrunk to `new_size`
+    /// (`0 < new_size <= old_size`), relocating a partial tail block when
+    /// necessary so a later in-place append stays NOR-correct.
+    ///
+    /// A shrink whose new tail block is left exactly full has no stale
+    /// content past `new_size`, so the existing block is reused. A shrink
+    /// that lands mid-block leaves content beyond `new_size` programmed
+    /// (not `0xFF`); reusing that block would make the next
+    /// [`Self::stream_ctz_extend`] fill its tail region in place over
+    /// dirty NOR cells (a `1 -> 0`-only device ANDs the appended bytes
+    /// with the stale content, corrupting them). To prevent that, the
+    /// kept prefix is relocated copy-on-write to a freshly erased block,
+    /// which becomes the new head. The skip-pointer header is copied
+    /// verbatim because it references the unchanged earlier chain blocks.
+    ///
+    /// **Atomicity.** Only a fresh block is written; the old chain and
+    /// the committed metadata are untouched until the caller commits the
+    /// new head at sync. A power loss here leaves the previous file state
+    /// fully readable, and the orphaned fresh block is reclaimed by the
+    /// next allocator scan.
+    pub(crate) fn shrink_ctz_head(
+        &mut self,
+        head_block: BlockAddress,
+        old_size: u32,
+        new_size: u32,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<BlockAddress, Error> {
+        use crate::ctz::{
+            block_count, block_index_at_offset, collect_chain_blocks, content_bytes_in_block,
+            skip_pointers_in_block, MAX_CTZ_BLOCKS,
+        };
+        debug_assert!(new_size > 0 && new_size <= old_size);
+        let bs = S::BLOCK_SIZE as u32;
+        let n_old = block_count(old_size, bs);
+        if n_old as usize > MAX_CTZ_BLOCKS {
+            return Err(Error::OutOfRange);
+        }
+        let mut chain = [BlockAddress::NONE; MAX_CTZ_BLOCKS];
+        collect_chain_blocks(&mut self.storage, head_block, n_old, &mut chain[..n_old as usize])?;
+
+        let (new_tail_idx, abs_off) = block_index_at_offset(new_size - 1, bs);
+        let header = 4 * skip_pointers_in_block(new_tail_idx);
+        let tail_cap = content_bytes_in_block(new_tail_idx, bs);
+        let bytes_used = abs_off + 1 - header;
+        let old_tail = chain[new_tail_idx as usize];
+        if bytes_used == tail_cap {
+            // New tail is exactly full: no stale content past new_size,
+            // so the next append allocates fresh blocks and the existing
+            // block can be reused unchanged.
+            return Ok(old_tail);
+        }
+
+        // Partial tail: relocate the kept prefix onto a freshly erased
+        // block. Exclude the whole existing chain so the allocator never
+        // hands back a block this (possibly not-yet-committed) file still
+        // uses.
+        let mut fresh = [BlockAddress::NONE; 1];
+        crate::alloc::alloc_blocks_cached(
+            &mut self.storage,
+            self.root,
+            &mut self.used_cache,
+            &chain[..n_old as usize],
+            None,
+            &mut fresh,
+            buf_a,
+            buf_b,
+        )?;
+        let fresh_addr = fresh[0];
+
+        // Build the relocated block: header + kept content from the old
+        // tail, the remainder of the block left erased.
+        self.storage
+            .read(old_tail.as_u32(), 0, &mut buf_a[..S::BLOCK_SIZE])
+            .map_err(|_| Error::Io)?;
+        let keep = (header + bytes_used) as usize;
+        for byte in &mut buf_a[keep..S::BLOCK_SIZE] {
+            *byte = 0xFF;
+        }
+        self.storage.erase(fresh_addr.as_u32()).map_err(|_| Error::Io)?;
+        self.storage
+            .program(fresh_addr.as_u32(), 0, &buf_a[..S::BLOCK_SIZE])
+            .map_err(|_| Error::Io)?;
+        self.storage.sync().map_err(|_| Error::Io)?;
+        Ok(fresh_addr)
     }
 
     /// Emit an `UpdateCtz` commit on `pair_addr` pointing entry `id` at
@@ -1660,7 +1766,16 @@ impl<S: Storage> Fs<S> {
 
         // Allocate two blocks for the new directory's metadata pair.
         let mut new_blocks = [BlockAddress::NONE; 2];
-        crate::alloc::alloc_blocks(&mut self.storage, self.root, &mut new_blocks, buf_a, buf_b)?;
+        crate::alloc::alloc_blocks_cached(
+            &mut self.storage,
+            self.root,
+            &mut self.used_cache,
+            &[],
+            None,
+            &mut new_blocks,
+            buf_a,
+            buf_b,
+        )?;
         let new_dir = BlockPair::new(new_blocks[0], new_blocks[1]);
 
         // Initialize: erase both blocks, then write an empty commit
@@ -1881,6 +1996,9 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
+        // Rename may overwrite an existing target (freeing its blocks);
+        // invalidate the lookahead so those blocks are reclaimable.
+        self.used_cache = None;
         let (old_parent, old_leaf) = self.resolve_parent(old_path, buf_a, buf_b)?;
         let (new_parent, new_leaf) = self.resolve_parent(new_path, buf_a, buf_b)?;
         if old_parent != new_parent {
@@ -1964,6 +2082,9 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
+        // Rename may overwrite an existing target (freeing its blocks) and
+        // moves struct bodies between pairs; invalidate the lookahead.
+        self.used_cache = None;
         let (old_parent, old_leaf) = self.resolve_parent(old_path, buf_a, buf_b)?;
         let (new_parent, new_leaf) = self.resolve_parent(new_path, buf_a, buf_b)?;
 
@@ -2160,6 +2281,7 @@ impl<S: Storage> Fs<S> {
         let committed_end;
         let next_ptag;
         let old_revision;
+        let active_erased;
         let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
         let count: usize;
         let pair_existing_ms: [u8; crate::gstate::MOVE_STATE_BODY_SIZE];
@@ -2172,6 +2294,7 @@ impl<S: Storage> Fs<S> {
             committed_end = pair.reader.committed_end();
             next_ptag = pair.reader.next_ptag();
             old_revision = pair.reader.revision();
+            active_erased = pair.reader.erased();
             pair_existing_ms = scan_pair_move_state(&pair);
             pair_existing_rs = scan_pair_relocate_state(&pair);
             count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
@@ -2182,7 +2305,16 @@ impl<S: Storage> Fs<S> {
         let extra_rs_dsize =
             extra_relocate_state.map_or(0, |_| 4 + crate::gstate::RELOCATE_STATE_BODY_SIZE);
         let dsize = op_dsize_of(op) + extra_ms_dsize + extra_rs_dsize;
-        if committed_end + dsize <= S::BLOCK_SIZE {
+        // Append in place only when the active block reports its next
+        // window as erased (the FCRC matched the on-disk bytes) and that
+        // window is prog-aligned. A non-erased window means a torn write
+        // contaminated the cells past `committed_end`; appending there
+        // would program over dirty NOR cells, so fall through to the
+        // compact path, which rewrites onto a freshly erased block.
+        let can_append = active_erased
+            && committed_end % S::PROG_SIZE == 0
+            && committed_end + dsize <= S::BLOCK_SIZE;
+        if can_append {
             let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
             let new_end = {
                 let mut commit =
@@ -2333,16 +2465,18 @@ impl<S: Storage> Fs<S> {
                 ex_len += 1;
             }
             let fresh = if active_is_a {
-                crate::alloc::alloc_one_block_with_single_buf(
+                crate::alloc::alloc_one_block_cached_single_buf(
                     &mut self.storage,
                     self.root,
+                    &mut self.used_cache,
                     &excluded[..ex_len],
                     buf_b,
                 )?
             } else {
-                crate::alloc::alloc_one_block_with_single_buf(
+                crate::alloc::alloc_one_block_cached_single_buf(
                     &mut self.storage,
                     self.root,
+                    &mut self.used_cache,
                     &excluded[..ex_len],
                     buf_a,
                 )?
@@ -2540,9 +2674,12 @@ impl<S: Storage> Fs<S> {
 
     /// List the entries in the directory at `path`, calling `f` for
     /// each. Skips the superblock (root only). Applies splice
-    /// renumbering. Chases HardTail-threaded continuation pairs through
-    /// up to 32 pairs; directories with deeper chains return
-    /// [`Error::OutOfRange`].
+    /// renumbering. Chases HardTail-threaded continuation pairs for the
+    /// full length of the chain with a Brent's cycle-safe walk (no
+    /// arbitrary cap; a cyclic chain is rejected with [`Error::Corrupt`],
+    /// see ADR-0009). The end-to-end reachable-pair limit
+    /// (`MAX_QUEUED_PAIRS = 32`) lives in the mount-time gstate sweep,
+    /// not here.
     pub fn list_dir<F>(
         &mut self,
         path: crate::path::Path<'_>,
@@ -2687,6 +2824,10 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
+        // A removal frees the entry's CTZ chain or child pair; drop the
+        // lookahead cache so those blocks are reclaimed on the next
+        // allocation rather than lingering as over-marked.
+        self.used_cache = None;
         if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
             return Err(Error::GeometryMismatch);
         }
@@ -2850,23 +2991,32 @@ impl<S: Storage> Fs<S> {
         };
         let sb_body = sb.to_bytes();
 
-        let mut commit = crate::meta::Commit::new(scratch, 1)?;
-        commit
-            .tag(crate::tag::Tag::new(true, crate::tag::TagType::Superblock, 0, 8), crate::MAGIC)?;
-        commit.tag(
-            crate::tag::Tag::new(
-                true,
-                crate::tag::TagType::InlineStruct,
-                0,
-                Superblock::SIZE as u16,
-            ),
-            &sb_body,
-        )?;
-        commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
+        let new_end = {
+            let mut commit = crate::meta::Commit::new(scratch, 1)?;
+            commit.tag(
+                crate::tag::Tag::new(true, crate::tag::TagType::Superblock, 0, 8),
+                crate::MAGIC,
+            )?;
+            commit.tag(
+                crate::tag::Tag::new(
+                    true,
+                    crate::tag::TagType::InlineStruct,
+                    0,
+                    Superblock::SIZE as u16,
+                ),
+                &sb_body,
+            )?;
+            commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
+            commit.bytes_written()
+        };
 
         // Erase + program block 0 with the committed superblock pair.
+        // Program only the committed prefix, matching every other commit
+        // path (`&buf[..new_end]`); the erase already left the trailing
+        // bytes at 0xFF, so the on-disk result is identical and no prog
+        // cycles are spent on the all-0xFF tail.
         storage.erase(0).map_err(|_| Error::Io)?;
-        storage.program(0, 0, scratch).map_err(|_| Error::Io)?;
+        storage.program(0, 0, &scratch[..new_end]).map_err(|_| Error::Io)?;
         // Erase block 1 to leave it as a fresh alternate.
         storage.erase(1).map_err(|_| Error::Io)?;
         storage.sync().map_err(|_| Error::Io)?;
@@ -2948,7 +3098,7 @@ impl<S: Storage> Fs<S> {
         // go out of scope releases the borrow. Reuse `block_a_buf`
         // and `block_b_buf` for the gstate sweep below.
         let _ = pair;
-        let mut fs = Self { storage, superblock: sb, root: ROOT_BLOCK_PAIR };
+        let mut fs = Self { storage, superblock: sb, root: ROOT_BLOCK_PAIR, used_cache: None };
 
         // Atomic-move-state recovery: walk every reachable metadata
         // pair, XOR-accumulate `MoveState` tag bodies into a single

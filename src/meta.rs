@@ -96,6 +96,17 @@ pub struct MetadataReader<'a> {
     /// directory thread, no entries in the next pair). Meaningless when
     /// `tail` is `None`.
     is_hard_tail: bool,
+    /// `true` if the block's next prog-aligned window is still in its
+    /// erased state, so a new commit may be appended in place after
+    /// [`Self::committed_end`]. Mirrors `lfs_mdir::erased` in the C
+    /// reference: it is set only when the last verified commit carried
+    /// an FCRC and that FCRC matches the bytes currently on disk in the
+    /// following window. A torn write into that window (a power loss
+    /// *inside* the program after a CCRC-valid commit) clears it, which
+    /// forces the next writer to compact onto a freshly erased block
+    /// rather than append into dirty cells. It never causes a durable
+    /// commit to be discarded; see [`Self::new`].
+    erased: bool,
 }
 
 impl<'a> MetadataReader<'a> {
@@ -124,19 +135,18 @@ impl<'a> MetadataReader<'a> {
 
         // Forward-CRC (FCRC) state. After a commit's CCRC verifies, the
         // C reference recomputes the CRC of the next prog-aligned
-        // window and rejects the commit if it does not match the FCRC
-        // the commit recorded for that window's (erased) state. This
-        // closes the intra-program torn-write hole the CCRC alone
-        // cannot: a power loss *inside* the program that follows a
-        // valid commit. Only the *last* verified commit needs the
-        // check: any earlier commit is followed by a CCRC-valid
-        // commit, which itself proves the writer programmed past it
-        // without a torn write, so at most a single one-commit
-        // rollback is ever required.
+        // window and compares it against the FCRC the commit recorded
+        // for that window's (erased) state. A mismatch means the
+        // following window was contaminated by a torn write (a power
+        // loss *inside* the program after this CCRC-valid commit). The
+        // commit itself is fully durable and is kept; only the
+        // *erased* flag is cleared, which tells the next writer to
+        // compact onto a freshly erased block instead of appending into
+        // the dirty window. Only the *last* verified commit's FCRC is
+        // consulted: any earlier commit is followed by a CCRC-valid
+        // commit, which proves its own window was programmed cleanly.
         let mut pending_fcrc: Option<(usize, u32)> = None;
         let mut last_fcrc: Option<(usize, u32)> = None;
-        let mut prev_committed_end: usize = 0;
-        let mut prev_next_ptag: u32 = 0xFFFF_FFFF;
 
         loop {
             off += Tag::from_bits(ptag).dsize();
@@ -186,11 +196,9 @@ impl<'a> MetadataReader<'a> {
                     // CRC mismatch: this commit is not durable.
                     break;
                 }
-                // Commit verified. Remember the prior boundary so a
-                // failed forward check on *this* commit can roll back
-                // exactly one level, then advance.
-                prev_committed_end = committed_end;
-                prev_next_ptag = next_ptag;
+                // Commit verified. Advance the committed boundary; a
+                // CCRC-valid commit is durable and is never rolled
+                // back (matches the C reference).
                 committed_end = off + tag.dsize();
                 // Apply the parity flip to the running XOR base.
                 let chunk = tag.ccrc_chunk().unwrap_or(0);
@@ -224,31 +232,34 @@ impl<'a> MetadataReader<'a> {
             }
         }
 
-        // Forward-CRC check on the last verified commit. If it carried
-        // an FCRC, the next prog window must still read as the erased
-        // state the writer recorded; a mismatch means a torn write
-        // landed there after the commit (a power loss inside the
-        // following program), so the commit is not durable and is
-        // rolled back one level. An out-of-range or unreadable window
-        // is treated the same way: do not trust a commit whose forward
-        // window cannot be verified.
+        // Forward-CRC check on the last verified commit. The committed
+        // region is never rolled back here: a commit whose CCRC verified
+        // is durable regardless of what follows it (matches the C
+        // reference, `lfs_dir_fetchmatch`, where `dir->off` is fixed once
+        // a CCRC verifies and the FCRC only governs `dir->erased`). The
+        // FCRC's sole effect is to decide whether the next prog-aligned
+        // window is still erased, so a new commit may be appended in
+        // place. A mismatch means a torn write landed there after the
+        // commit; the window is dirty and the next writer must compact
+        // onto a freshly erased block. An out-of-range or unreadable
+        // window is treated as not erased, conservatively forcing a
+        // compact. With no FCRC, erased stays false (matches the C
+        // reference for >= lfs2.1 disks).
+        let mut erased = false;
         if let Some((sz, expected)) = last_fcrc {
             let end = committed_end;
             let actual = end
                 .checked_add(sz)
                 .filter(|&w| w <= block.len())
                 .map(|w| crc::update(crc::INIT, &block[end..w]));
-            if actual != Some(expected) {
-                committed_end = prev_committed_end;
-                next_ptag = prev_next_ptag;
-            }
+            erased = actual == Some(expected);
         }
 
         // Second pass to extract Tail info from the committed region.
         // Latest Tail tag wins (commits in order; later supersedes).
         let (tail, is_hard_tail) = scan_for_tail(block, committed_end);
 
-        Ok(Self { block, revision, committed_end, next_ptag, tail, is_hard_tail })
+        Ok(Self { block, revision, committed_end, next_ptag, tail, is_hard_tail, erased })
     }
 
     /// The on disk revision counter.
@@ -268,6 +279,23 @@ impl<'a> MetadataReader<'a> {
     #[must_use]
     pub fn has_commits(&self) -> bool {
         self.committed_end > 0
+    }
+
+    /// `true` if the prog-aligned window following [`Self::committed_end`]
+    /// is still in its erased state, so a writer may append a new commit
+    /// in place rather than compacting onto a freshly erased block.
+    ///
+    /// This is the reader-side half of the FCRC contract: it is `true`
+    /// only when the last verified commit carried an FCRC and that FCRC
+    /// matches the bytes currently on disk in the following window. A
+    /// torn write into that window (a power loss inside the program after
+    /// a CCRC-valid commit) yields `false`, as does the absence of an
+    /// FCRC or an out-of-range window. It never affects which commits are
+    /// durable; see [`Self::new`]. The writer additionally requires
+    /// `committed_end` to be prog-aligned before trusting this.
+    #[must_use]
+    pub fn erased(&self) -> bool {
+        self.erased
     }
 
     /// The XOR base for the next (uncommitted) tag, after the post CCRC
