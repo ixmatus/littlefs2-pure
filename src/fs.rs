@@ -1572,6 +1572,91 @@ impl<S: Storage> Fs<S> {
         Ok((head_phys, new_size))
     }
 
+    /// Compute the new head block for a CTZ file shrunk to `new_size`
+    /// (`0 < new_size <= old_size`), relocating a partial tail block when
+    /// necessary so a later in-place append stays NOR-correct.
+    ///
+    /// A shrink whose new tail block is left exactly full has no stale
+    /// content past `new_size`, so the existing block is reused. A shrink
+    /// that lands mid-block leaves content beyond `new_size` programmed
+    /// (not `0xFF`); reusing that block would make the next
+    /// [`Self::stream_ctz_extend`] fill its tail region in place over
+    /// dirty NOR cells (a `1 -> 0`-only device ANDs the appended bytes
+    /// with the stale content, corrupting them). To prevent that, the
+    /// kept prefix is relocated copy-on-write to a freshly erased block,
+    /// which becomes the new head. The skip-pointer header is copied
+    /// verbatim because it references the unchanged earlier chain blocks.
+    ///
+    /// **Atomicity.** Only a fresh block is written; the old chain and
+    /// the committed metadata are untouched until the caller commits the
+    /// new head at sync. A power loss here leaves the previous file state
+    /// fully readable, and the orphaned fresh block is reclaimed by the
+    /// next allocator scan.
+    pub(crate) fn shrink_ctz_head(
+        &mut self,
+        head_block: BlockAddress,
+        old_size: u32,
+        new_size: u32,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<BlockAddress, Error> {
+        use crate::ctz::{
+            block_count, block_index_at_offset, collect_chain_blocks, content_bytes_in_block,
+            skip_pointers_in_block, MAX_CTZ_BLOCKS,
+        };
+        debug_assert!(new_size > 0 && new_size <= old_size);
+        let bs = S::BLOCK_SIZE as u32;
+        let n_old = block_count(old_size, bs);
+        if n_old as usize > MAX_CTZ_BLOCKS {
+            return Err(Error::OutOfRange);
+        }
+        let mut chain = [BlockAddress::NONE; MAX_CTZ_BLOCKS];
+        collect_chain_blocks(&mut self.storage, head_block, n_old, &mut chain[..n_old as usize])?;
+
+        let (new_tail_idx, abs_off) = block_index_at_offset(new_size - 1, bs);
+        let header = 4 * skip_pointers_in_block(new_tail_idx);
+        let tail_cap = content_bytes_in_block(new_tail_idx, bs);
+        let bytes_used = abs_off + 1 - header;
+        let old_tail = chain[new_tail_idx as usize];
+        if bytes_used == tail_cap {
+            // New tail is exactly full: no stale content past new_size,
+            // so the next append allocates fresh blocks and the existing
+            // block can be reused unchanged.
+            return Ok(old_tail);
+        }
+
+        // Partial tail: relocate the kept prefix onto a freshly erased
+        // block. Exclude the whole existing chain so the allocator never
+        // hands back a block this (possibly not-yet-committed) file still
+        // uses.
+        let mut fresh = [BlockAddress::NONE; 1];
+        crate::alloc::alloc_blocks_excluding(
+            &mut self.storage,
+            self.root,
+            &chain[..n_old as usize],
+            &mut fresh,
+            buf_a,
+            buf_b,
+        )?;
+        let fresh_addr = fresh[0];
+
+        // Build the relocated block: header + kept content from the old
+        // tail, the remainder of the block left erased.
+        self.storage
+            .read(old_tail.as_u32(), 0, &mut buf_a[..S::BLOCK_SIZE])
+            .map_err(|_| Error::Io)?;
+        let keep = (header + bytes_used) as usize;
+        for byte in &mut buf_a[keep..S::BLOCK_SIZE] {
+            *byte = 0xFF;
+        }
+        self.storage.erase(fresh_addr.as_u32()).map_err(|_| Error::Io)?;
+        self.storage
+            .program(fresh_addr.as_u32(), 0, &buf_a[..S::BLOCK_SIZE])
+            .map_err(|_| Error::Io)?;
+        self.storage.sync().map_err(|_| Error::Io)?;
+        Ok(fresh_addr)
+    }
+
     /// Emit an `UpdateCtz` commit on `pair_addr` pointing entry `id` at
     /// `(head_block, total_size)`. Dispatches through the standard
     /// append-or-compact machinery used by every other write op.

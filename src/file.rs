@@ -481,7 +481,8 @@ impl<S: Storage> File<'_, S> {
                     self.dirty = true;
                     return Ok(());
                 }
-                let new_head = seek_new_head_at(self.fs, self.head_block, self.size, new_size)?;
+                let new_head =
+                    self.fs.shrink_ctz_head(self.head_block, self.size, new_size, buf_a, buf_b)?;
                 self.head_block = new_head;
                 self.size = new_size;
                 self.pos = self.pos.min(self.size);
@@ -557,29 +558,6 @@ impl<S: Storage> Drop for File<'_, S> {
         // and the silently-dropped chain blocks are reclaimable by
         // the next allocator scan, so no corruption occurs.
     }
-}
-
-/// Walk a CTZ chain backward from `head_block` and return the head
-/// block of the truncated chain whose new logical length is
-/// `new_size`. Used by [`File::set_len`] to shrink a file without
-/// rewriting any committed blocks.
-fn seek_new_head_at<S: Storage>(
-    fs: &mut Fs<S>,
-    head_block: BlockAddress,
-    old_size: u32,
-    new_size: u32,
-) -> Result<BlockAddress, Error> {
-    debug_assert!(new_size > 0 && new_size <= old_size);
-    use crate::ctz::{block_count, block_index_at_offset, collect_chain_blocks, MAX_CTZ_BLOCKS};
-    let bs = S::BLOCK_SIZE as u32;
-    let n_old = block_count(old_size, bs);
-    if n_old as usize > MAX_CTZ_BLOCKS {
-        return Err(Error::OutOfRange);
-    }
-    let mut chain = [BlockAddress::NONE; MAX_CTZ_BLOCKS];
-    collect_chain_blocks(fs.storage_mut(), head_block, n_old, &mut chain[..n_old as usize])?;
-    let (new_tail_idx, _) = block_index_at_offset(new_size - 1, bs);
-    Ok(chain[new_tail_idx as usize])
 }
 
 // ---- Internal bridges from File into Fs ----------------------------------
