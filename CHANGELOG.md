@@ -4,7 +4,9 @@ All notable changes to `littlefs2-pure` land here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
-Remediation of the 2026-05-29 multi-agent review. No public API changes; the 1.x semver contract is intact. Two genuine correctness bugs on the power-loss and NOR write paths are fixed, plus one latent storage-adapter bug and a set of documentation-fidelity corrections. The FCRC fix corrects a prior remediation (v1.0.2 item R2) that itself introduced a data-loss divergence from the C reference.
+## [1.1.0] - 2026-05-29
+
+Remediation of the 2026-05-29 multi-agent review. Additive public API only (new `ctz::seek_block`, `alloc::alloc_blocks_cached` / `alloc::alloc_one_block_cached_single_buf`, `MetadataReader::erased`, and a `Debug` impl on `alloc::Bitmap`); no breaking changes, so the 1.x semver contract holds and this is a minor bump. Two genuine correctness bugs on the power-loss and NOR write paths are fixed, plus one latent storage-adapter bug, a set of documentation-fidelity corrections, and the allocation/append performance backlog. The FCRC fix corrects a prior remediation (v1.0.2 item R2) that itself introduced a data-loss divergence from the C reference.
 
 ### Fixed
 
