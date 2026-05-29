@@ -108,14 +108,20 @@ impl<S: Storage> NorAlignedStorage<S> {
     }
 
     fn load_window(&mut self, block: u32, window_off: u32) -> Result<(), S::Error> {
-        if self.cached_block == Some(block) && self.cached_off == window_off && !self.dirty {
-            return Ok(()); // already loaded
+        // Already holding this exact window: keep it as-is. Critically,
+        // this returns even when the cache is dirty, so a second program
+        // into the same window merges onto the pending bytes rather than
+        // clobbering them with a stale re-read from the device. Two
+        // disjoint sub-window programs with no intervening sync (a legal
+        // sequence: NOR permits multiple 1 -> 0 programs within a page)
+        // must both survive the eventual flush.
+        if self.cached_block == Some(block) && self.cached_off == window_off {
+            return Ok(());
         }
-        if self.cached_block != Some(block) || self.cached_off != window_off {
-            self.flush()?;
-        }
-        // Read the current window contents (will be 0xFF if never
+        // Switching to a different window: flush any pending bytes first,
+        // then load the new window's current contents (0xFF if never
         // programmed since erase, the typical case).
+        self.flush()?;
         self.inner.read(block, window_off, &mut self.cache[..S::PROG_SIZE])?;
         self.cached_block = Some(block);
         self.cached_off = window_off;
