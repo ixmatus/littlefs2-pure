@@ -2160,6 +2160,7 @@ impl<S: Storage> Fs<S> {
         let committed_end;
         let next_ptag;
         let old_revision;
+        let active_erased;
         let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
         let count: usize;
         let pair_existing_ms: [u8; crate::gstate::MOVE_STATE_BODY_SIZE];
@@ -2172,6 +2173,7 @@ impl<S: Storage> Fs<S> {
             committed_end = pair.reader.committed_end();
             next_ptag = pair.reader.next_ptag();
             old_revision = pair.reader.revision();
+            active_erased = pair.reader.erased();
             pair_existing_ms = scan_pair_move_state(&pair);
             pair_existing_rs = scan_pair_relocate_state(&pair);
             count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
@@ -2182,7 +2184,16 @@ impl<S: Storage> Fs<S> {
         let extra_rs_dsize =
             extra_relocate_state.map_or(0, |_| 4 + crate::gstate::RELOCATE_STATE_BODY_SIZE);
         let dsize = op_dsize_of(op) + extra_ms_dsize + extra_rs_dsize;
-        if committed_end + dsize <= S::BLOCK_SIZE {
+        // Append in place only when the active block reports its next
+        // window as erased (the FCRC matched the on-disk bytes) and that
+        // window is prog-aligned. A non-erased window means a torn write
+        // contaminated the cells past `committed_end`; appending there
+        // would program over dirty NOR cells, so fall through to the
+        // compact path, which rewrites onto a freshly erased block.
+        let can_append = active_erased
+            && committed_end % S::PROG_SIZE == 0
+            && committed_end + dsize <= S::BLOCK_SIZE;
+        if can_append {
             let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
             let new_end = {
                 let mut commit =
