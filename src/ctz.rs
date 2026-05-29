@@ -189,10 +189,12 @@ pub const MAX_CTZ_BLOCKS: usize = 256;
 /// Read a CTZ backed file's content into `out`.
 ///
 /// `ctz` describes the file's layout (head block and total size).
-/// `scratch` is a per-block work buffer of at least
-/// [`S::BLOCK_SIZE`](Storage::BLOCK_SIZE) bytes; only the first 8 bytes
-/// are touched during the backward walk (to read up to 2 skip pointers
-/// per step).
+/// `scratch` must be at least [`S::BLOCK_SIZE`](Storage::BLOCK_SIZE)
+/// bytes. The current implementation does not read from `scratch`: block
+/// content is read straight into `out` and the backward walk uses its
+/// own internal 8 byte buffer (see [`collect_chain_blocks`]). The
+/// parameter and its length precondition are retained for API stability
+/// on the 1.x line; dropping them is a candidate for 2.0.
 ///
 /// The function reads `min(out.len(), ctz.size)` bytes and returns the
 /// count actually read.

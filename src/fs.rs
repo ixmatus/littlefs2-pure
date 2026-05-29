@@ -2636,9 +2636,12 @@ impl<S: Storage> Fs<S> {
 
     /// List the entries in the directory at `path`, calling `f` for
     /// each. Skips the superblock (root only). Applies splice
-    /// renumbering. Chases HardTail-threaded continuation pairs through
-    /// up to 32 pairs; directories with deeper chains return
-    /// [`Error::OutOfRange`].
+    /// renumbering. Chases HardTail-threaded continuation pairs for the
+    /// full length of the chain with a Brent's cycle-safe walk (no
+    /// arbitrary cap; a cyclic chain is rejected with [`Error::Corrupt`],
+    /// see ADR-0009). The end-to-end reachable-pair limit
+    /// (`MAX_QUEUED_PAIRS = 32`) lives in the mount-time gstate sweep,
+    /// not here.
     pub fn list_dir<F>(
         &mut self,
         path: crate::path::Path<'_>,
@@ -2946,23 +2949,32 @@ impl<S: Storage> Fs<S> {
         };
         let sb_body = sb.to_bytes();
 
-        let mut commit = crate::meta::Commit::new(scratch, 1)?;
-        commit
-            .tag(crate::tag::Tag::new(true, crate::tag::TagType::Superblock, 0, 8), crate::MAGIC)?;
-        commit.tag(
-            crate::tag::Tag::new(
-                true,
-                crate::tag::TagType::InlineStruct,
-                0,
-                Superblock::SIZE as u16,
-            ),
-            &sb_body,
-        )?;
-        commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
+        let new_end = {
+            let mut commit = crate::meta::Commit::new(scratch, 1)?;
+            commit.tag(
+                crate::tag::Tag::new(true, crate::tag::TagType::Superblock, 0, 8),
+                crate::MAGIC,
+            )?;
+            commit.tag(
+                crate::tag::Tag::new(
+                    true,
+                    crate::tag::TagType::InlineStruct,
+                    0,
+                    Superblock::SIZE as u16,
+                ),
+                &sb_body,
+            )?;
+            commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
+            commit.bytes_written()
+        };
 
         // Erase + program block 0 with the committed superblock pair.
+        // Program only the committed prefix, matching every other commit
+        // path (`&buf[..new_end]`); the erase already left the trailing
+        // bytes at 0xFF, so the on-disk result is identical and no prog
+        // cycles are spent on the all-0xFF tail.
         storage.erase(0).map_err(|_| Error::Io)?;
-        storage.program(0, 0, scratch).map_err(|_| Error::Io)?;
+        storage.program(0, 0, &scratch[..new_end]).map_err(|_| Error::Io)?;
         // Erase block 1 to leave it as a fresh alternate.
         storage.erase(1).map_err(|_| Error::Io)?;
         storage.sync().map_err(|_| Error::Io)?;

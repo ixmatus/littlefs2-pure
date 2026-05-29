@@ -135,6 +135,24 @@ practice and not exercised.
   user-visible loss; the relocation just doesn't happen this
   cycle and the predicate will fire again at the next
   `BLOCK_CYCLES` boundary.
+- After a *successful* relocation whose parent update took the
+  in-place append branch, the orphaned old alternate block is not
+  reclaimed promptly. The parent's superseded `DirStruct(id ->
+  old_pair)` tag stays in its commit log until the parent next
+  compacts, and `alloc::scan_used_blocks` enumerates the parent
+  via the raw committed tag stream (not the splice-correct
+  latest-wins view that `accumulate_gstate` uses), so it re-marks
+  the old alternate as in-use until that compaction. This is a
+  benign over-approximation, not a leak that grows unboundedly:
+  the allocator stays self-consistent (the block is held, never
+  double-handed-out), the read resolver is latest-wins so
+  `old_pair` never resolves live, and the worst edge (a stale
+  enqueue exhausting `MAX_QUEUED_PAIRS`) degrades to a clean
+  `Error::OutOfRange`. Promptly reclaiming the block would require
+  teaching the safety-critical reachability scan a latest-wins
+  `DirStruct` view; the deferred reclaim is the conservative
+  choice and is recorded here rather than changing that scan. See
+  review item `lfs-7ts` (2026-05-29).
 - `find_parent_in_tree` is O(reachable pairs) per relocation. With
   `MAX_QUEUED_PAIRS = 32` the worst case is a 32-pair walk per
   parent update; for typical workloads (under a dozen
