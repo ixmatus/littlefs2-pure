@@ -221,26 +221,23 @@ fn metadata_plain_compact_survives_worn_alternate() {
 }
 
 /// A worn block hit while a metadata pair *commits* (compacts onto its
-/// alternate, or splits onto it) should be relocated past: the pair
-/// migrates to a fresh block, the parent's `DirStruct` is updated, and the
-/// operation completes. Distinct from the CTZ data/append paths above,
-/// which relocate file blocks, not metadata pairs.
+/// alternate, or splits onto it) is relocated past: the pair migrates to a
+/// fresh block, the parent's `DirStruct` is updated, and the operation
+/// completes. Distinct from the CTZ data/append paths above, which relocate
+/// file blocks, not metadata pairs.
 ///
-/// `#[ignore]`d: this is the remaining `lfs-23f` target. It is harder than
-/// the CTZ paths because the failure cannot reuse wear-levelling
-/// relocation as-is. Wear-levelling writes the compacted bytes to the
-/// **alternate first** (the in-place durability anchor) and only then
-/// copies to a fresh block, balancing a 3-way `RelocateState` for crash
-/// recovery. When the *alternate* is the worn block, that alternate-first
-/// step is precisely what fails, so a failure-driven relocation must
-/// commit directly to a fresh block — a different crash-safety model and
-/// `RelocateState` balance than `compact_and_program`'s wear path. The
-/// append-path case (a worn *active* block) must additionally fall back
-/// from the in-place append to a relocating compact. The root pair `{0,1}`
-/// cannot relocate, so a worn root block stays fatal (to be documented).
-/// Remove the ignore when failure-driven metadata relocation lands.
+/// Twenty-four entries overflow a 256-byte block, so `/d` must split across
+/// a `HardTail` continuation. The first overflow (write 5) is a plain
+/// compaction onto the worn alternate (block 3), which relocates `/d` onto a
+/// fresh block and drops block 3 from the pair. The later split therefore
+/// lands on good blocks: once relocated, block 3 is no longer one of `/d`'s
+/// blocks, and `scan_used_blocks`' raw-tag over-approximation keeps the
+/// parent's superseded `DirStruct(/d -> {2,3})` marking block 3 as used
+/// until the root next compacts, so the allocator does not re-hand it out as
+/// a continuation block. A split that lands *directly* onto a worn block
+/// (larger entries, so the first overflow splits before any plain
+/// compaction can evict the worn half) is covered separately.
 #[test]
-#[ignore = "lfs-23f: failure-driven metadata-pair relocation not yet implemented"]
 fn metadata_commit_survives_a_bad_block_via_relocation() {
     // After format the root is {0,1}; `mkdir /d` takes the next two free
     // blocks {2,3}, writing its init commit to block 2 (the active half)
