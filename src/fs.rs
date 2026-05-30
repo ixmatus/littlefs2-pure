@@ -2828,6 +2828,30 @@ impl<S: Storage> Fs<S> {
         let total = count + usize::from(op_adds_entry(op));
         let split = compute_split_index::<S>(slots, count, op, 0, total);
         if split > 0 && pair_addr != self.root {
+            // Bound the reachable-pair count before splitting. The split
+            // adds exactly one reachable pair (the continuation); the
+            // mount-time walks (allocator scan, gstate accumulation,
+            // deorphan) enumerate the forest into fixed `MAX_QUEUED_PAIRS`
+            // arrays (ADR-0006), so a forest of more than `MAX_QUEUED_PAIRS`
+            // reachable pairs is unmountable. Refuse the split when the tree
+            // is already at the budget — otherwise the writer would produce
+            // an image its own mount cannot read. This is the clean
+            // `OutOfRange` a deeply-split directory hits; nothing is written.
+            //
+            // `collect_live_tree_pairs` clobbers both scratch buffers, so
+            // re-read the active block afterward to restore the bytes
+            // `slots` reference before building the split commits.
+            {
+                let mut tree = [BlockPair::new(BlockAddress::NONE, BlockAddress::NONE);
+                    crate::alloc::MAX_QUEUED_PAIRS];
+                let reachable =
+                    collect_live_tree_pairs(&mut self.storage, self.root, &mut tree, buf_a, buf_b)?;
+                if reachable >= crate::alloc::MAX_QUEUED_PAIRS {
+                    return Err(Error::OutOfRange);
+                }
+                let source_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
+                self.storage.read(active_addr.as_u32(), 0, source_buf).map_err(|_| Error::Io)?;
+            }
             // Overflow → split. Wear-levelling relocation is a hint, not a
             // correctness requirement; defer it to the next commit rather
             // than fold a relocation's fresh allocation and parent update
