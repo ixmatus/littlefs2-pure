@@ -582,12 +582,16 @@ fn build_compact_commit(
     // (SoftTail = next directory in the filesystem list, HardTail = this
     // directory's continuation) would be silently dropped. `None` means
     // the pair has no tail (the common case until threading lands).
+    // A NONE-sentinel pair means "no tail" (the thread end after an
+    // un-thread); emit nothing so the rebuilt block drops the link.
     if let Some((pair, is_hard)) = tail {
-        let mut body = [0u8; 8];
-        body[0..4].copy_from_slice(&pair.a.as_u32().to_le_bytes());
-        body[4..8].copy_from_slice(&pair.b.as_u32().to_le_bytes());
-        let tag_type = if is_hard { TagType::HardTail } else { TagType::SoftTail };
-        commit.tag(crate::tag::Tag::new(true, tag_type, crate::tag::ID_NONE, 8), &body)?;
+        if !pair.a.is_none() {
+            let mut body = [0u8; 8];
+            body[0..4].copy_from_slice(&pair.a.as_u32().to_le_bytes());
+            body[4..8].copy_from_slice(&pair.b.as_u32().to_le_bytes());
+            let tag_type = if is_hard { TagType::HardTail } else { TagType::SoftTail };
+            commit.tag(crate::tag::Tag::new(true, tag_type, crate::tag::ID_NONE, 8), &body)?;
+        }
     }
     commit.finish_padded(0, prog_size, block_size)?;
     Ok(commit.bytes_written())
@@ -2395,6 +2399,12 @@ impl<S: Storage> Fs<S> {
         // re-emit it; an in-place append keeps the existing tail tag and
         // only emits when the tail actually changes.
         let effective_tail = new_tail.or(current_tail);
+        // A `new_tail` whose pair is the NONE sentinel means "clear the
+        // tail" (un-threading the global-list end so the predecessor
+        // becomes the new end). The tail tag is sticky, so an in-place
+        // append cannot drop it; force a compaction, which rebuilds the
+        // block without re-emitting any tail tag.
+        let clear_tail = matches!(new_tail, Some((p, _)) if p.a.is_none());
 
         let extra_ms_dsize =
             extra_move_state.map_or(0, |_| 4 + crate::gstate::MOVE_STATE_BODY_SIZE);
@@ -2412,7 +2422,8 @@ impl<S: Storage> Fs<S> {
         // compact path, which rewrites onto a freshly erased block.
         let can_append = active_erased
             && committed_end % S::PROG_SIZE == 0
-            && committed_end + dsize <= S::BLOCK_SIZE;
+            && committed_end + dsize <= S::BLOCK_SIZE
+            && !clear_tail;
         if can_append {
             let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
             let new_end = {
@@ -2816,7 +2827,43 @@ impl<S: Storage> Fs<S> {
             return Err(Error::NotEmpty);
         }
 
-        self.remove_from_pair(parent, leaf.as_bytes(), buf_a, buf_b)
+        // Read the removed directory's own tail (its successor in the
+        // global metadata-pair list) so the thread predecessor can be
+        // re-pointed past it.
+        self.storage.read(dir_pair.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(dir_pair.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let dir_tail: Option<(BlockPair, bool)> = {
+            let p = MetadataPair::parse(dir_pair.a, &*buf_a, dir_pair.b, &*buf_b)?;
+            p.reader.tail().map(|t| (t, p.reader.is_hard_tail()))
+        };
+
+        // Remove the entry from the parent (drops the directory from the
+        // tree). Then un-thread it: re-point the thread predecessor's tail
+        // past the removed pair so the global list stays consistent for
+        // the C reference. A crash between the two leaves the pair in the
+        // thread but not the tree (an orphan), which mount-time deorphan
+        // recovery must reconcile; that recovery is the remaining
+        // lfs-xmx slice (ADR-0012).
+        self.remove_from_pair(parent, leaf.as_bytes(), buf_a, buf_b)?;
+        if let Some((pred_pair, _is_hard)) =
+            find_thread_predecessor(&mut self.storage, self.root, dir_pair, buf_a, buf_b)?
+        {
+            // Re-point past the removed dir: to its successor, or clear
+            // the tail (NONE sentinel) if it was the list end.
+            let new_tail =
+                dir_tail.or(Some((BlockPair::new(BlockAddress::NONE, BlockAddress::NONE), false)));
+            self.apply_op_to_pair_inner(
+                pred_pair,
+                &WriteOp::Noop,
+                None,
+                None,
+                new_tail,
+                &[],
+                buf_a,
+                buf_b,
+            )?;
+        }
+        Ok(())
     }
 
     /// List the entries in the directory at `path`, calling `f` for

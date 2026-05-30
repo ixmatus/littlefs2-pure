@@ -112,3 +112,31 @@ fn directories_are_threaded_into_the_global_list() {
         "the global tail-threaded list must reach the subdirectories (found {pairs_via_tail} tail links)",
     );
 }
+
+/// rmdir must un-thread the removed directory so its blocks are reclaimed.
+/// Without un-threading, the thread predecessor's tail keeps pointing at
+/// the removed pair, the allocator follows it and marks those blocks
+/// used forever, and a mkdir/rmdir loop exhausts the device. With
+/// un-threading, the loop runs indefinitely on a tiny device.
+#[test]
+fn mkdir_rmdir_churn_reclaims_blocks() {
+    let mut storage = Dev::new(); // 64 blocks
+    let mut sb = buf();
+    Fs::format(&mut storage, &mut sb).unwrap();
+    let mut ba = buf();
+    let mut bb = buf();
+    let mut fs = Fs::mount(storage, &mut ba, &mut bb).unwrap();
+    let mut a = buf();
+    let mut b = buf();
+
+    // Each dir consumes 2 blocks; 300 iterations is far more than the
+    // device holds, so it only succeeds if every rmdir reclaims.
+    for i in 0..300u32 {
+        let name = format!("/d{}", i % 4);
+        fs.mkdir(Path::new(&name).unwrap(), &mut a, &mut b).unwrap_or_else(|e| {
+            panic!("mkdir at iter {i} (a leak would exhaust the device): {e:?}")
+        });
+        fs.rmdir(Path::new(&name).unwrap(), &mut a, &mut b)
+            .unwrap_or_else(|e| panic!("rmdir at iter {i}: {e:?}"));
+    }
+}
