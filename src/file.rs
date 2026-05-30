@@ -256,9 +256,15 @@ impl<S: Storage> Fs<S> {
             return Err(Error::InvalidPath);
         }
 
-        // Classify the existing entry.
-        self.storage_mut().read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage_mut().read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        // Classify the existing entry. The file's entry may live in any
+        // pair of the parent's HardTail chain; `owner` is that pair (the
+        // chain's last pair when the entry is absent, where a create
+        // lands). The file handle caches `owner` so write-backs target
+        // the entry's actual pair, not the chain's first pair.
+        let owner = match self.seek_entry_in_chain(parent, name, buf_a, buf_b)? {
+            crate::fs::ChainSeek::Found { pair, .. } => pair,
+            crate::fs::ChainSeek::Absent { last_pair, .. } => last_pair,
+        };
         #[derive(Clone, Copy)]
         enum Existing {
             Missing,
@@ -266,7 +272,7 @@ impl<S: Storage> Fs<S> {
             Ctz { id: u16, ctz: CtzStruct },
         }
         let existing: Existing = {
-            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
+            let p = MetadataPair::parse(owner.a, &*buf_a, owner.b, &*buf_b)?;
             match dir::lookup(&p, name) {
                 None => Existing::Missing,
                 Some(r) => {
@@ -287,15 +293,17 @@ impl<S: Storage> Fs<S> {
             }
         };
 
-        let (id, mut head_block, mut size) = match existing {
+        let (file_parent, id, mut head_block, mut size) = match existing {
             Existing::Missing => {
                 if !options.create {
                     return Err(Error::NotFound);
                 }
                 // Materialize an empty inline entry; the first write
-                // promotes it to CTZ via sync.
-                let new_id = self.create_empty_entry_for_file(parent, name, buf_a, buf_b)?;
-                (new_id, BlockAddress::NONE, 0u32)
+                // promotes it to CTZ via sync. The create resolves which
+                // pair of the chain the entry landed in.
+                let (entry_pair, new_id) =
+                    self.create_empty_entry_for_file(parent, name, buf_a, buf_b)?;
+                (entry_pair, new_id, BlockAddress::NONE, 0u32)
             }
             Existing::Inline { id, size } => {
                 // Inline files only work through File when truncating
@@ -303,9 +311,9 @@ impl<S: Storage> Fs<S> {
                 if !options.truncate {
                     return Err(Error::OutOfRange);
                 }
-                (id, BlockAddress::NONE, size as u32)
+                (owner, id, BlockAddress::NONE, size as u32)
             }
-            Existing::Ctz { id, ctz } => (id, ctz.head_block, ctz.size),
+            Existing::Ctz { id, ctz } => (owner, id, ctz.head_block, ctz.size),
         };
 
         // Apply truncate. The orphaned blocks (if any) are reclaimed
@@ -320,7 +328,7 @@ impl<S: Storage> Fs<S> {
         // Initial cursor: end-of-file for append; otherwise start.
         let pos = if options.append { size } else { 0 };
 
-        Ok(File { fs: self, parent, id, pos, head_block, size, dirty, options })
+        Ok(File { fs: self, parent: file_parent, id, pos, head_block, size, dirty, options })
     }
 }
 
@@ -593,15 +601,17 @@ impl<S: Storage> Fs<S> {
         name: &[u8],
         buf_a: &mut [u8],
         buf_b: &mut [u8],
-    ) -> Result<u16, Error> {
-        // Materialize a new entry with an empty inline body. The
-        // first sync replaces it with a CtzStruct.
+    ) -> Result<(BlockPair, u16), Error> {
+        // Materialize a new entry with an empty inline body. The first
+        // sync replaces it with a CtzStruct. The entry is committed to
+        // the last pair of the parent's HardTail chain; re-seek the chain
+        // to learn which pair it landed in and its local id, since the
+        // file handle must cache the entry's actual owning pair.
         self.write_inline_to_pair_for_file(parent, name, &[], buf_a, buf_b)?;
-        self.storage_mut().read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage_mut().read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
-        let r = dir::lookup(&p, name).ok_or(Error::Corrupt)?;
-        Ok(r.entry.id)
+        match self.seek_entry_in_chain(parent, name, buf_a, buf_b)? {
+            crate::fs::ChainSeek::Found { pair, id, .. } => Ok((pair, id)),
+            crate::fs::ChainSeek::Absent { .. } => Err(Error::Corrupt),
+        }
     }
 
     pub(crate) fn write_inline_to_pair_for_file(

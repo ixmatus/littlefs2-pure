@@ -327,6 +327,21 @@ pub(crate) enum WriteOp<'a> {
     Noop,
 }
 
+/// Outcome of walking a directory's HardTail chain looking for an entry
+/// by name (see [`Fs::seek_entry_in_chain`]). A directory may span
+/// several metadata pairs linked by `HardTail` tags; a name lives in one
+/// of them, and a new entry is appended to the last pair of the chain.
+pub(crate) enum ChainSeek {
+    /// `name` lives in `pair` at local id `id` with kind `kind`. The
+    /// scratch buffers hold `pair` on return, so the caller can re-parse
+    /// it (e.g. to copy a STRUCT body) without another read.
+    Found { pair: BlockPair, id: u16, kind: crate::dir::EntryKind },
+    /// `name` is absent from the whole chain. A create targets
+    /// `last_pair`, whose live-entry count is `count` (the local id a new
+    /// entry would take). The scratch buffers hold `last_pair` on return.
+    Absent { last_pair: BlockPair, count: usize },
+}
+
 /// Emit the tags for a [`WriteOp`] to an in-progress commit.
 fn emit_op(commit: &mut crate::meta::Commit<'_>, op: &WriteOp<'_>) -> Result<(), Error> {
     use crate::tag::{Tag, TagType};
@@ -1209,24 +1224,22 @@ impl<S: Storage> Fs<S> {
         if name.is_empty() || name.len() > 0x3FF {
             return Err(Error::InvalidPath);
         }
-        // Pre-check: detect whether the entry exists, and reject if it
-        // exists as a Directory (overwriting a directory with a file
-        // is destructive and not supported here; use rmdir + write
-        // separately).
-        let existing_id: Option<u16> = {
-            self.storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-            self.storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-            let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
-            match crate::dir::lookup(&pair, name) {
-                Some(r) => {
-                    if r.entry.kind != crate::dir::EntryKind::RegularFile {
+        // Pre-check: detect whether the entry exists anywhere in the
+        // directory's HardTail chain, and reject if it exists as a
+        // Directory (overwriting a directory with a file is destructive
+        // and not supported here; use rmdir + write separately). `target`
+        // is the pair to commit to: the owning pair for an update, the
+        // chain's last pair (with room) for a create.
+        let (target, existing_id): (BlockPair, Option<u16>) =
+            match self.seek_entry_in_chain(pair_addr, name, buf_a, buf_b)? {
+                ChainSeek::Found { pair, id, kind } => {
+                    if kind != crate::dir::EntryKind::RegularFile {
                         return Err(Error::AlreadyExists);
                     }
-                    Some(r.entry.id)
+                    (pair, Some(id))
                 }
-                None => None,
-            }
-        };
+                ChainSeek::Absent { last_pair, .. } => (last_pair, None),
+            };
 
         let bs = S::BLOCK_SIZE as u32;
         let total_blocks_u32 = block_count(content.len() as u32, bs);
@@ -1280,11 +1293,11 @@ impl<S: Storage> Fs<S> {
         // Append the metadata commit.
         // buf_a was consumed for chain bytes; re-read the target pair
         // just to learn the live-entry count for the new id.
-        self.storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        self.storage.read(target.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(target.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
         let count: usize = {
-            let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
-            let active_is_a = pair.active_block == pair_addr.a;
+            let pair = MetadataPair::parse(target.a, &*buf_a, target.b, &*buf_b)?;
+            let active_is_a = pair.active_block == target.a;
             let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
             gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?
         };
@@ -1308,7 +1321,7 @@ impl<S: Storage> Fs<S> {
         // Pass the just-allocated chain as inflight so the wear-level
         // relocation (if it fires) won't reallocate a chain block.
         self.apply_op_to_pair_inner(
-            pair_addr,
+            target,
             &op,
             None,
             None,
@@ -1554,9 +1567,15 @@ impl<S: Storage> Fs<S> {
             return Err(Error::InvalidPath);
         }
 
-        // Read the parent pair once and classify the existing entry.
-        self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        // Position on the pair that owns the entry within the parent's
+        // HardTail chain (the last pair when the name is absent), and
+        // classify the existing entry. `owner` carries the owning pair so
+        // the CTZ-append commit targets it rather than the chain's first
+        // pair.
+        let owner = match self.seek_entry_in_chain(parent, name, buf_a, buf_b)? {
+            ChainSeek::Found { pair, .. } => pair,
+            ChainSeek::Absent { last_pair, .. } => last_pair,
+        };
 
         // Inline body is copied out so we can drop the pair borrow.
         // Up to INLINE_MAX + 1 covers a freshly transitioned entry; we
@@ -1568,7 +1587,7 @@ impl<S: Storage> Fs<S> {
             Ctz { ctz: crate::ctz::CtzStruct, id: u16 },
         }
         let layout = {
-            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
+            let p = MetadataPair::parse(owner.a, &*buf_a, owner.b, &*buf_b)?;
             match crate::dir::lookup(&p, name) {
                 None => Layout::Missing,
                 Some(r) => {
@@ -1606,7 +1625,7 @@ impl<S: Storage> Fs<S> {
                 self.write_to_path(path, &content_scratch[..total], buf_a, buf_b)
             }
             Layout::Ctz { ctz, id } => {
-                self.append_ctz_streaming(parent, id, ctz, additional, buf_a, buf_b)
+                self.append_ctz_streaming(owner, id, ctz, additional, buf_a, buf_b)
             }
         }
     }
@@ -1919,21 +1938,23 @@ impl<S: Storage> Fs<S> {
             return Err(Error::InvalidPath);
         }
 
-        // Verify the name doesn't already exist in the parent, and read
-        // the parent's current tail. The new directory is inserted into
-        // the global metadata-pair list immediately after the parent: the
-        // new dir inherits the parent's current tail, then the parent's
-        // tail is re-pointed at the new dir (matches `lfs_mkdir_`).
-        self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        let parent_tail: Option<(BlockPair, bool)>;
-        {
-            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
-            if crate::dir::lookup(&p, dir_name_bytes).is_some() {
-                return Err(Error::AlreadyExists);
-            }
-            parent_tail = p.reader.tail().map(|t| (t, p.reader.is_hard_tail()));
-        }
+        // Find the pair to commit the new entry to: the last pair of the
+        // parent's HardTail chain (the one with room). Reject a name that
+        // already exists anywhere in the chain. The new directory is
+        // inserted into the global metadata-pair list immediately after
+        // that pair: it inherits the pair's current tail (a SoftTail to
+        // the next directory, since the last pair of a chain has no
+        // HardTail), then the pair's tail is re-pointed at the new dir
+        // (matches `lfs_mkdir_`). For a single-pair directory this pair
+        // is the parent itself.
+        let target = match self.seek_entry_in_chain(parent, dir_name_bytes, buf_a, buf_b)? {
+            ChainSeek::Found { .. } => return Err(Error::AlreadyExists),
+            ChainSeek::Absent { last_pair, .. } => last_pair,
+        };
+        let parent_tail: Option<(BlockPair, bool)> = {
+            let p = MetadataPair::parse(target.a, &*buf_a, target.b, &*buf_b)?;
+            p.reader.tail().map(|t| (t, p.reader.is_hard_tail()))
+        };
 
         // Allocate two blocks for the new directory's metadata pair.
         let mut new_blocks = [BlockAddress::NONE; 2];
@@ -1981,15 +2002,15 @@ impl<S: Storage> Fs<S> {
         self.storage.program(new_dir.a.as_u32(), 0, &buf_a[..new_end]).map_err(|_| Error::Io)?;
         self.storage.sync().map_err(|_| Error::Io)?;
 
-        // Re-read the parent to compute the new id from the live count,
-        // then append the CreateDir commit. Pass the just-allocated
+        // Re-read the target pair to compute the new id from the live
+        // count, then append the CreateDir commit. Pass the just-allocated
         // new_dir blocks as inflight so wear-level relocation (if it
         // fires) won't reallocate them.
-        self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        self.storage.read(target.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(target.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
         let count: usize = {
-            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
-            let active_is_a = p.active_block == parent.a;
+            let p = MetadataPair::parse(target.a, &*buf_a, target.b, &*buf_b)?;
+            let active_is_a = p.active_block == target.a;
             let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
             gather_live_slots(&p, active_is_a, buf_a, buf_b, &mut slots)?
         };
@@ -1998,11 +2019,11 @@ impl<S: Storage> Fs<S> {
             return Err(Error::OutOfRange);
         }
         let op = WriteOp::CreateDir { id: new_id, name: dir_name_bytes, dir_pair: new_dir };
-        // Re-point the parent's tail at the new dir (SoftTail), inserting
-        // it into the global list right after the parent. Rides the same
-        // atomic commit as the DirStruct.
+        // Re-point the target pair's tail at the new dir (SoftTail),
+        // inserting it into the global list right after the parent. Rides
+        // the same atomic commit as the DirStruct.
         self.apply_op_to_pair_inner(
-            parent,
+            target,
             &op,
             None,
             None,
@@ -2043,18 +2064,14 @@ impl<S: Storage> Fs<S> {
     ) -> Result<(), Error> {
         let (parent, leaf) = self.resolve_parent(path, buf_a, buf_b)?;
         // Reject directories: removing a directory entry without
-        // checking emptiness would orphan its content. Use rmdir.
-        self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        {
-            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
-            match crate::dir::lookup(&p, leaf.as_bytes()) {
-                Some(r) if r.entry.kind == crate::dir::EntryKind::Directory => {
-                    return Err(Error::AlreadyExists);
-                }
-                Some(_) => {}
-                None => return Err(Error::NotFound),
+        // checking emptiness would orphan its content. Use rmdir. The
+        // entry may live in any pair of the parent's HardTail chain.
+        match self.seek_entry_in_chain(parent, leaf.as_bytes(), buf_a, buf_b)? {
+            ChainSeek::Found { kind: crate::dir::EntryKind::Directory, .. } => {
+                return Err(Error::AlreadyExists);
             }
+            ChainSeek::Found { .. } => {}
+            ChainSeek::Absent { .. } => return Err(Error::NotFound),
         }
         self.remove_from_pair(parent, leaf.as_bytes(), buf_a, buf_b)
     }
@@ -2088,14 +2105,12 @@ impl<S: Storage> Fs<S> {
             return Err(Error::OutOfRange);
         }
         let (parent, leaf) = self.resolve_parent(path, buf_a, buf_b)?;
-        self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        let id = {
-            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
-            crate::dir::lookup(&p, leaf.as_bytes()).ok_or(Error::NotFound)?.entry.id
+        let (target, id) = match self.seek_entry_in_chain(parent, leaf.as_bytes(), buf_a, buf_b)? {
+            ChainSeek::Found { pair, id, .. } => (pair, id),
+            ChainSeek::Absent { .. } => return Err(Error::NotFound),
         };
         let op = WriteOp::SetAttr { id, attr_id, value };
-        self.apply_op_to_pair(parent, &op, buf_a, buf_b)
+        self.apply_op_to_pair(target, &op, buf_a, buf_b)
     }
 
     /// Remove a user attribute from the entry at `path`. Idempotent:
@@ -2114,14 +2129,12 @@ impl<S: Storage> Fs<S> {
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
         let (parent, leaf) = self.resolve_parent(path, buf_a, buf_b)?;
-        self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        let id = {
-            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
-            crate::dir::lookup(&p, leaf.as_bytes()).ok_or(Error::NotFound)?.entry.id
+        let (target, id) = match self.seek_entry_in_chain(parent, leaf.as_bytes(), buf_a, buf_b)? {
+            ChainSeek::Found { pair, id, .. } => (pair, id),
+            ChainSeek::Absent { .. } => return Err(Error::NotFound),
         };
         let op = WriteOp::RemoveAttr { id, attr_id };
-        self.apply_op_to_pair(parent, &op, buf_a, buf_b)
+        self.apply_op_to_pair(target, &op, buf_a, buf_b)
     }
 
     /// Read the most recently committed value of user attribute
@@ -2213,20 +2226,19 @@ impl<S: Storage> Fs<S> {
             return Ok(()); // no-op
         }
 
-        // Resolve old entry; reject collision with a different entry.
-        self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        let (old_id, kind);
+        // Resolve the old entry across the parent's HardTail chain; reject
+        // if the new name already exists anywhere in the chain. Distinct
+        // names (guaranteed above) resolve to distinct entries, so any
+        // existing new name is a genuine collision.
+        let (old_pair, old_id, kind) =
+            match self.seek_entry_in_chain(parent, old_leaf_bytes, buf_a, buf_b)? {
+                ChainSeek::Found { pair, id, kind } => (pair, id, kind),
+                ChainSeek::Absent { .. } => return Err(Error::NotFound),
+            };
+        if let ChainSeek::Found { .. } =
+            self.seek_entry_in_chain(parent, new_leaf_bytes, buf_a, buf_b)?
         {
-            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
-            let old_res = crate::dir::lookup(&p, old_leaf_bytes).ok_or(Error::NotFound)?;
-            old_id = old_res.entry.id;
-            kind = old_res.entry.kind;
-            if let Some(collision) = crate::dir::lookup(&p, new_leaf_bytes) {
-                if collision.entry.id != old_id {
-                    return Err(Error::AlreadyExists);
-                }
-            }
+            return Err(Error::AlreadyExists);
         }
 
         let name_type = match kind {
@@ -2234,7 +2246,7 @@ impl<S: Storage> Fs<S> {
             crate::dir::EntryKind::Directory => crate::tag::TagType::Directory,
         };
         let op = WriteOp::RenameInPlace { id: old_id, name_type, new_name: new_leaf_bytes };
-        self.apply_op_to_pair(parent, &op, buf_a, buf_b)
+        self.apply_op_to_pair(old_pair, &op, buf_a, buf_b)
     }
 
     /// Rename an entry across directories (or in place).
@@ -2300,17 +2312,21 @@ impl<S: Storage> Fs<S> {
             return Err(Error::InvalidPath);
         }
 
-        // Look up the source entry; copy its struct body to a stack
-        // buffer so the destination commit can borrow it after we
-        // release the source pair's parse.
-        self.storage.read(old_parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(old_parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        // Position on the source entry's owning pair within the source
+        // parent's HardTail chain, then copy its struct body to a stack
+        // buffer so the destination commit can borrow it after we release
+        // the source pair's parse. `src_owner` is the pair the source
+        // Delete (and its MoveState body) must target.
+        let src_owner = match self.seek_entry_in_chain(old_parent, old_leaf_bytes, buf_a, buf_b)? {
+            ChainSeek::Found { pair, .. } => pair,
+            ChainSeek::Absent { .. } => return Err(Error::NotFound),
+        };
         let mut src_body = [0u8; 1024];
         let src_id;
         let src_struct_type;
         let src_body_len;
         {
-            let p = MetadataPair::parse(old_parent.a, &*buf_a, old_parent.b, &*buf_b)?;
+            let p = MetadataPair::parse(src_owner.a, &*buf_a, src_owner.b, &*buf_b)?;
             let r = crate::dir::lookup(&p, old_leaf_bytes).ok_or(Error::NotFound)?;
             let n = r.struct_body.len();
             if n > src_body.len() {
@@ -2322,25 +2338,20 @@ impl<S: Storage> Fs<S> {
             src_body_len = n;
         }
 
-        // Reject if the destination already exists; compute the new
-        // entry id from the destination pair's live count.
-        self.storage.read(new_parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(new_parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        let new_id: u16;
-        {
-            let p = MetadataPair::parse(new_parent.a, &*buf_a, new_parent.b, &*buf_b)?;
-            if crate::dir::lookup(&p, new_leaf_bytes).is_some() {
-                return Err(Error::AlreadyExists);
-            }
-            let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
-            let active_is_a = p.active_block == new_parent.a;
-            let count = gather_live_slots(&p, active_is_a, buf_a, buf_b, &mut slots)?;
-            let id = u16::try_from(count).map_err(|_| Error::OutOfRange)?;
-            if id == crate::tag::ID_NONE {
-                return Err(Error::OutOfRange);
-            }
-            new_id = id;
-        }
+        // Reject if the destination already exists anywhere in the
+        // destination parent's chain; compute the new entry id from the
+        // destination chain's last pair (the one the Create targets).
+        let (dst_last, new_id): (BlockPair, u16) =
+            match self.seek_entry_in_chain(new_parent, new_leaf_bytes, buf_a, buf_b)? {
+                ChainSeek::Found { .. } => return Err(Error::AlreadyExists),
+                ChainSeek::Absent { last_pair, count } => {
+                    let id = u16::try_from(count).map_err(|_| Error::OutOfRange)?;
+                    if id == crate::tag::ID_NONE {
+                        return Err(Error::OutOfRange);
+                    }
+                    (last_pair, id)
+                }
+            };
 
         // Build the Create op for the destination, preserving the
         // source's struct shape.
@@ -2383,16 +2394,13 @@ impl<S: Storage> Fs<S> {
         // MoveState body so they XOR to zero once both land. A crash
         // between step 1 and step 2 leaves the gstate non-zero, which
         // mount-time recovery decodes and completes.
-        let move_body = crate::gstate::build_move_body(old_parent, src_id);
+        // The MoveState body identifies the source entry by its owning
+        // pair so mount-time recovery completes the Delete at the right
+        // pair when the source spans a HardTail chain.
+        let move_body = crate::gstate::build_move_body(src_owner, src_id);
+        self.apply_op_to_pair_with_movestate(dst_last, &create_op, Some(move_body), buf_a, buf_b)?;
         self.apply_op_to_pair_with_movestate(
-            new_parent,
-            &create_op,
-            Some(move_body),
-            buf_a,
-            buf_b,
-        )?;
-        self.apply_op_to_pair_with_movestate(
-            old_parent,
+            src_owner,
             &WriteOp::Remove { id: src_id },
             Some(move_body),
             buf_a,
@@ -2894,15 +2902,22 @@ impl<S: Storage> Fs<S> {
     ) -> Result<(), Error> {
         let (parent, leaf) = self.resolve_parent(path, buf_a, buf_b)?;
 
-        // Resolve the entry; validate it's a Directory; grab its pair.
-        self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        let dir_pair = {
-            let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
-            let resolved = crate::dir::lookup(&p, leaf.as_bytes()).ok_or(Error::NotFound)?;
-            if resolved.entry.kind != crate::dir::EntryKind::Directory {
-                return Err(Error::AlreadyExists);
+        // Resolve the entry across the parent's HardTail chain; validate
+        // it's a Directory; grab its pair. `owner` is the pair that holds
+        // the subdirectory entry (the parent's first pair for a
+        // single-pair directory).
+        let owner = match self.seek_entry_in_chain(parent, leaf.as_bytes(), buf_a, buf_b)? {
+            ChainSeek::Found { pair, kind, .. } => {
+                if kind != crate::dir::EntryKind::Directory {
+                    return Err(Error::AlreadyExists);
+                }
+                pair
             }
+            ChainSeek::Absent { .. } => return Err(Error::NotFound),
+        };
+        let dir_pair = {
+            let p = MetadataPair::parse(owner.a, &*buf_a, owner.b, &*buf_b)?;
+            let resolved = crate::dir::lookup(&p, leaf.as_bytes()).ok_or(Error::NotFound)?;
             if resolved.struct_type != crate::tag::TagType::DirStruct
                 || resolved.struct_body.len() != 8
             {
@@ -3118,10 +3133,12 @@ impl<S: Storage> Fs<S> {
         self.remove_from_pair(self.root, name, buf_a, buf_b)
     }
 
-    /// Internal: remove an entry by name from the given metadata pair.
+    /// Internal: remove an entry by name from the directory whose first
+    /// metadata pair is `first_pair`, chasing HardTail continuation pairs
+    /// to the pair that owns the entry.
     fn remove_from_pair(
         &mut self,
-        pair_addr: BlockPair,
+        first_pair: BlockPair,
         name: &[u8],
         buf_a: &mut [u8],
         buf_b: &mut [u8],
@@ -3137,16 +3154,15 @@ impl<S: Storage> Fs<S> {
             return Err(Error::InvalidPath);
         }
 
-        // Look up the target id, then dispatch through the standard
-        // apply path so the compact-or-append decision (and any
-        // wear-levelling that fires) flows through one code path.
-        self.storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        let target_id = {
-            let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
-            crate::dir::lookup(&pair, name).ok_or(Error::NotFound)?.entry.id
+        // Resolve the entry across the directory's chain, then dispatch
+        // the Remove to its owning pair through the standard apply path so
+        // the compact-or-append decision (and any wear-levelling that
+        // fires) flows through one code path.
+        let (target, target_id) = match self.seek_entry_in_chain(first_pair, name, buf_a, buf_b)? {
+            ChainSeek::Found { pair, id, .. } => (pair, id),
+            ChainSeek::Absent { .. } => return Err(Error::NotFound),
         };
-        self.apply_op_to_pair(pair_addr, &WriteOp::Remove { id: target_id }, buf_a, buf_b)
+        self.apply_op_to_pair(target, &WriteOp::Remove { id: target_id }, buf_a, buf_b)
     }
 
     /// List the regular file and subdirectory names at the filesystem
@@ -3215,40 +3231,28 @@ impl<S: Storage> Fs<S> {
             return Err(Error::InvalidPath);
         }
 
-        // Look up existing entry (if any) and the next free id. Reject
-        // overwrite of a Directory: the Update path would substitute an
-        // InlineStruct over the existing DirStruct slot during compaction,
-        // orphaning the directory's children pair. Mirrors the matching
-        // check in `write_ctz_to_pair`.
-        self.storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        let (existing_id, count): (Option<u16>, usize) = {
-            let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
-            let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
-            let active_is_a = pair.active_block == pair_addr.a;
-            let n = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
-            let existing = match crate::dir::lookup(&pair, name) {
-                Some(r) => {
-                    if r.entry.kind != crate::dir::EntryKind::RegularFile {
-                        return Err(Error::AlreadyExists);
-                    }
-                    Some(r.entry.id)
+        // Look up the existing entry (if any) across the directory's
+        // HardTail chain, or find the last pair (with room) for a create.
+        // Reject overwrite of a Directory: the Update path would
+        // substitute an InlineStruct over the existing DirStruct slot
+        // during compaction, orphaning the directory's children pair.
+        // Mirrors the matching check in `write_ctz_to_pair`.
+        let (target, op) = match self.seek_entry_in_chain(pair_addr, name, buf_a, buf_b)? {
+            ChainSeek::Found { pair, id, kind } => {
+                if kind != crate::dir::EntryKind::RegularFile {
+                    return Err(Error::AlreadyExists);
                 }
-                None => None,
-            };
-            (existing, n)
-        };
-
-        let op = if let Some(id) = existing_id {
-            WriteOp::Update { id, content }
-        } else {
-            let new_id = u16::try_from(count).map_err(|_| Error::OutOfRange)?;
-            if new_id == crate::tag::ID_NONE {
-                return Err(Error::OutOfRange);
+                (pair, WriteOp::Update { id, content })
             }
-            WriteOp::Create { id: new_id, name, content }
+            ChainSeek::Absent { last_pair, count } => {
+                let new_id = u16::try_from(count).map_err(|_| Error::OutOfRange)?;
+                if new_id == crate::tag::ID_NONE {
+                    return Err(Error::OutOfRange);
+                }
+                (last_pair, WriteOp::Create { id: new_id, name, content })
+            }
         };
-        self.apply_op_to_pair(pair_addr, &op, buf_a, buf_b)
+        self.apply_op_to_pair(target, &op, buf_a, buf_b)
     }
 
     /// Format the storage device with a fresh, empty LittleFS v2
@@ -3723,6 +3727,71 @@ impl<S: Storage> Fs<S> {
                 struct_type: resolved.struct_type,
                 struct_body: resolved.struct_body,
             });
+        }
+    }
+
+    /// Resolve `name` within the directory whose first metadata pair is
+    /// `first`, chasing `HardTail` continuation pairs. Mirrors the C
+    /// reference's `lfs_dir_find_`: a split directory's entries span
+    /// several pairs, so the name may live in any pair of the chain and a
+    /// new entry is appended to the last pair (the one with room).
+    ///
+    /// Returns [`ChainSeek::Found`] with the owning pair, the entry's
+    /// local id, and its kind when the name resolves; otherwise
+    /// [`ChainSeek::Absent`] with the chain's last pair and its live
+    /// entry count. On return the scratch buffers hold the pair named in
+    /// the result (the owning pair for `Found`, the last pair for
+    /// `Absent`), so the caller can re-parse it without another read.
+    ///
+    /// Cycle-safe: a malformed self-referential HardTail chain is
+    /// rejected with [`Error::Corrupt`] via the same Brent's walk the
+    /// reader uses (ADR-0009). For a single-pair directory (every
+    /// directory this writer produced before `lfs-cvh`) the chain is one
+    /// pair, so this reads `first`, looks it up, and returns — identical
+    /// to the prior single-pair behavior.
+    pub(crate) fn seek_entry_in_chain(
+        &mut self,
+        first: BlockPair,
+        name: &[u8],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<ChainSeek, Error> {
+        let mut current = first;
+        let mut walk = BrentTailWalk::new(current);
+        loop {
+            self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+            self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            let next: Option<BlockPair>;
+            let hit: Option<(u16, crate::dir::EntryKind)>;
+            let count: usize;
+            {
+                let pair = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
+                hit = crate::dir::lookup(&pair, name).map(|r| (r.entry.id, r.entry.kind));
+                // Only a HardTail continues this directory; a SoftTail is
+                // the next directory in the global thread, not part of
+                // this chain.
+                next = if pair.reader.is_hard_tail() { pair.reader.tail() } else { None };
+                // Live count of the (potential) last pair, needed only
+                // for the Absent result; cheap to compute regardless.
+                let active_is_a = pair.active_block == current.a;
+                let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+                count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
+            }
+            if let Some((id, kind)) = hit {
+                // Buffers already hold `current` (the owning pair).
+                return Ok(ChainSeek::Found { pair: current, id, kind });
+            }
+            match next {
+                Some(t) => {
+                    walk.advance(t)?;
+                    current = t;
+                    // Loop re-reads the next pair on the next iteration.
+                }
+                None => {
+                    // Buffers hold `current` (the last pair of the chain).
+                    return Ok(ChainSeek::Absent { last_pair: current, count });
+                }
+            }
         }
     }
 
