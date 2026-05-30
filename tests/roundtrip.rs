@@ -17,6 +17,8 @@
 //! - `nested`:    `/audit/log = "entry-0001;"`
 //! - `split_dir`: `/d/f00`..`/d/f13`, a directory split across a HardTail
 //!   continuation, proving the C reference reads a crate-written chain
+//! - `split_root`: `/f00`..`/f11`, the root pair `{0,1}` split across a
+//!   HardTail continuation, proving the C reference chases the root's tail
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -158,5 +160,32 @@ fn roundtrip_split_dir() {
     }
     let img = dump_image(&storage, "split_dir");
     invoke_verifier(&verifier, &img, "split_dir");
+    let _ = std::fs::remove_file(&img);
+}
+
+#[test]
+fn roundtrip_split_root() {
+    let Some(verifier) = require_verifier() else { return };
+    let mut storage = MemStorage::new();
+    let mut scratch = common::make_buffer();
+    Fs::format(&mut storage, &mut scratch).unwrap();
+    {
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
+        let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
+        // 12 small inline files at the root overflow the superblock pair, so
+        // the root `{0,1}` splits across a HardTail continuation. The C
+        // reference must keep `{0,1}` as the superblock anchor and chase its
+        // tail to find every entry.
+        for i in 0..12 {
+            let name = format!("/f{i:02}");
+            fs.write_to_path(Path::new(&name).unwrap(), b"v", &mut a, &mut b).unwrap();
+        }
+        storage = fs.into_storage();
+    }
+    let img = dump_image(&storage, "split_root");
+    invoke_verifier(&verifier, &img, "split_root");
     let _ = std::fs::remove_file(&img);
 }

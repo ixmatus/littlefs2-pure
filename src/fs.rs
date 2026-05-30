@@ -2826,14 +2826,16 @@ impl<S: Storage> Fs<S> {
         // a later increment (lfs-cvh.5); until then a root overflow keeps
         // its prior `Error::OutOfRange` behavior via the normal path.
         // The compacted live set exceeds half a block, so a split would
-        // distribute it. Splitting is skipped for the root pair `{0, 1}`
-        // (it cannot relocate, and growing it permanently dedicates blocks
-        // to a continuation chain that cannot be reclaimed, so it needs the
-        // superblock-expansion fullness guard; lfs-cvh.5), and degrades
-        // gracefully when it cannot proceed.
+        // distribute it. The root pair `{0, 1}` splits like any other
+        // directory — its superblock entry at id 0 always falls in the
+        // lower half, so `{0, 1}` stays the mount anchor with a HardTail to
+        // the continuation, and it never relocates (the lower-half commit
+        // keeps its address) — but with an extra fullness guard below,
+        // because a root continuation chain cannot be reclaimed. Splitting
+        // degrades gracefully when it cannot proceed.
         let total = count + usize::from(op_adds_entry(op));
         let split = compute_split_index::<S>(slots, count, op, 0, total);
-        let mut do_split = split > 0 && pair_addr != self.root;
+        let mut do_split = split > 0;
         if do_split {
             // Bound the reachable-pair count before splitting. The split
             // adds exactly one reachable pair (the continuation); the
@@ -2855,6 +2857,25 @@ impl<S: Storage> Fs<S> {
             let source_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
             self.storage.read(active_addr.as_u32(), 0, source_buf).map_err(|_| Error::Io)?;
             if reachable >= crate::alloc::MAX_QUEUED_PAIRS {
+                do_split = false;
+            }
+        }
+        if do_split && pair_addr == self.root {
+            // Superblock-expansion fullness guard (the C reference's
+            // `lfs_dir_splittingcompact` check). The root cannot be
+            // un-split, so a root continuation pair is dedicated forever;
+            // growing the chain when the device is nearly full would
+            // permanently consume the last free blocks and starve future
+            // writes. Do not split the root once free space drops to an
+            // eighth of the device — degrade to a single-block compaction
+            // (a root overflow then keeps its prior `OutOfRange`).
+            // `scan_used_blocks` clobbers both buffers; restore the source.
+            let mut used = crate::alloc::Bitmap::EMPTY;
+            crate::alloc::scan_used_blocks(&mut self.storage, self.root, &mut used, buf_a, buf_b)?;
+            let source_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
+            self.storage.read(active_addr.as_u32(), 0, source_buf).map_err(|_| Error::Io)?;
+            let free = (0..S::BLOCK_COUNT).filter(|&blk| !used.is_set(blk)).count();
+            if free <= (S::BLOCK_COUNT as usize) / 8 {
                 do_split = false;
             }
         }

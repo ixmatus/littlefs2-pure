@@ -12,6 +12,9 @@
 //   split_dir - expect `/d/f00`..`/d/f13`, each body == "x" (a directory
 //               this crate split across a HardTail continuation; the C
 //               reference must chase the chain to find every entry)
+//   split_root- expect `/f00`..`/f11`, each body == "v" (the ROOT pair
+//               {0,1} split across a HardTail continuation; {0,1} stays the
+//               superblock anchor and the C reference chases its tail)
 //
 // Geometry mirrors `tests/common::MemStorage`:
 //   block_size  = 256
@@ -169,6 +172,15 @@ int main(int argc, char **argv) {
             char path[16];
             snprintf(path, sizeof path, "/d/f%02d", i);
             rc = verify_file(&lfs, path, (const uint8_t *)"x", 1);
+        }
+    } else if (strcmp(argv[2], "split_root") == 0) {
+        // The root pair {0,1} split; every entry must resolve, including
+        // those the writer placed in the root's HardTail continuation.
+        rc = 0;
+        for (int i = 0; i < 12 && rc == 0; i++) {
+            char path[16];
+            snprintf(path, sizeof path, "/f%02d", i);
+            rc = verify_file(&lfs, path, (const uint8_t *)"v", 1);
         }
     } else {
         fprintf(stderr, "verify_image: unknown scenario %s\n", argv[2]);
