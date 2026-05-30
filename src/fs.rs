@@ -75,6 +75,12 @@ const _: () = assert!(
 /// reuses the existing chain blocks in place.
 const MAX_CTZ_WRITE_BLOCKS: usize = 256;
 
+/// Maximum distinct bad blocks a single CTZ write will relocate past
+/// before giving up with [`Error::Io`]. A worn block is excluded from the
+/// write's allocation and the chain is rebuilt; this bounds the retries so
+/// a wholly-failing device terminates rather than looping.
+const MAX_BAD_BLOCK_RETRIES: usize = 8;
+
 /// Cycle-safe walker for a HardTail chain, in O(1) memory and with no
 /// arbitrary length cap (Brent's algorithm).
 ///
@@ -405,6 +411,7 @@ fn build_compact_commit(
     block_size: usize,
     move_state: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
     relocate_state: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
+    tail: Option<(BlockPair, bool)>,
 ) -> Result<usize, Error> {
     use crate::tag::TagType;
 
@@ -576,6 +583,22 @@ fn build_compact_commit(
             )?;
         }
     }
+    // Re-emit the pair's tail tag. Compaction rebuilds the block from
+    // live entries, so without this the metadata-pair global thread link
+    // (SoftTail = next directory in the filesystem list, HardTail = this
+    // directory's continuation) would be silently dropped. `None` means
+    // the pair has no tail (the common case until threading lands).
+    // A NONE-sentinel pair means "no tail" (the thread end after an
+    // un-thread); emit nothing so the rebuilt block drops the link.
+    if let Some((pair, is_hard)) = tail {
+        if !pair.a.is_none() {
+            let mut body = [0u8; 8];
+            body[0..4].copy_from_slice(&pair.a.as_u32().to_le_bytes());
+            body[4..8].copy_from_slice(&pair.b.as_u32().to_le_bytes());
+            let tag_type = if is_hard { TagType::HardTail } else { TagType::SoftTail };
+            commit.tag(crate::tag::Tag::new(true, tag_type, crate::tag::ID_NONE, 8), &body)?;
+        }
+    }
     commit.finish_padded(0, prog_size, block_size)?;
     Ok(commit.bytes_written())
 }
@@ -669,6 +692,75 @@ fn accumulate_gstate<S: Storage>(
     }
 
     Ok(gstate)
+}
+
+/// BFS the directory tree from `root`, following only live
+/// (splice-correct) `DirStruct` children and `HardTail` continuations,
+/// and collect every reachable metadata pair into `out`. Returns the
+/// count.
+///
+/// This is the *tree*, deliberately distinct from the global metadata
+/// thread: `SoftTail` links (the global list) are NOT followed, so a pair
+/// reachable only via the thread (a crash-orphaned half-removed directory)
+/// is absent from the result. The mount-time deorphan sweep uses that
+/// distinction. `HardTail` continuations ARE part of the tree (the same
+/// directory's entries continue there), so they are followed; the live
+/// `DirStruct` view (not raw `iter_tags`) ensures a directory whose entry
+/// has already been deleted is not counted as live.
+fn collect_live_tree_pairs<S: Storage>(
+    storage: &mut S,
+    root: BlockPair,
+    out: &mut [BlockPair; crate::alloc::MAX_QUEUED_PAIRS],
+    buf_a: &mut [u8],
+    buf_b: &mut [u8],
+) -> Result<usize, Error> {
+    out[0] = root;
+    let mut tail = 1usize;
+    let mut head = 0usize;
+    while head < tail {
+        let pair_addr = out[head];
+        head += 1;
+        storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
+        let active_is_a = pair.active_block == pair_addr.a;
+        // A HardTail continues this directory's own pair chain (part of
+        // the tree); a SoftTail is the global list (not the tree).
+        if pair.reader.is_hard_tail() {
+            if let Some(cont) = pair.reader.tail() {
+                if pair_in_bounds::<S>(cont) && !out[..tail].contains(&cont) {
+                    if tail >= crate::alloc::MAX_QUEUED_PAIRS {
+                        return Err(Error::OutOfRange);
+                    }
+                    out[tail] = cont;
+                    tail += 1;
+                }
+            }
+        }
+        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+        let count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
+        let source_buf: &[u8] = if active_is_a { &*buf_a } else { &*buf_b };
+        for slot in slots.iter().take(count) {
+            if slot.struct_kind == 2 && slot.struct_len == 8 {
+                let start = slot.struct_off as usize;
+                let body = &source_buf[start..start + 8];
+                let a = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let b = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
+                if !pair_in_bounds::<S>(child) {
+                    return Err(Error::Corrupt);
+                }
+                if !out[..tail].contains(&child) {
+                    if tail >= crate::alloc::MAX_QUEUED_PAIRS {
+                        return Err(Error::OutOfRange);
+                    }
+                    out[tail] = child;
+                    tail += 1;
+                }
+            }
+        }
+    }
+    Ok(tail)
 }
 
 /// Scan a metadata pair's committed tag stream for `MoveState` tags
@@ -781,6 +873,45 @@ fn pair_in_bounds<S: Storage>(pair: BlockPair) -> bool {
     pair.a.as_u32() < S::BLOCK_COUNT && pair.b.as_u32() < S::BLOCK_COUNT
 }
 
+/// Walk the global metadata-pair thread from `root` (following each
+/// pair's tail) and return the pair whose tail references `target`, with
+/// whether that tail is a HardTail. Returns `Ok(None)` if `target` is the
+/// root or no pair's tail references it.
+///
+/// This is the thread-predecessor lookup the C reference calls
+/// `lfs_fs_pred`. It is needed when a threaded pair changes address
+/// (wear-levelling relocation) or is removed: the predecessor's tail must
+/// be re-pointed so the global list stays consistent for the C
+/// reference's allocator and traverse. Bounded and cycle-safe at
+/// [`crate::alloc::MAX_QUEUED_PAIRS`] hops.
+fn find_thread_predecessor<S: Storage>(
+    storage: &mut S,
+    root: BlockPair,
+    target: BlockPair,
+    buf_a: &mut [u8],
+    buf_b: &mut [u8],
+) -> Result<Option<(BlockPair, bool)>, Error> {
+    let mut cur = root;
+    let mut steps = 0usize;
+    loop {
+        steps += 1;
+        if steps > crate::alloc::MAX_QUEUED_PAIRS {
+            return Err(Error::OutOfRange);
+        }
+        storage.read(cur.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        storage.read(cur.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let (tail, is_hard) = {
+            let p = MetadataPair::parse(cur.a, &*buf_a, cur.b, &*buf_b)?;
+            (p.reader.tail(), p.reader.is_hard_tail())
+        };
+        match tail {
+            Some(t) if t == target => return Ok(Some((cur, is_hard))),
+            Some(t) => cur = t,
+            None => return Ok(None),
+        }
+    }
+}
+
 /// BFS-walk the metadata-pair forest from `root` and return the
 /// `(parent_pair, id)` of the entry whose `DirStruct` body matches
 /// `target`. Returns `Ok(None)` if `target` is not referenced by any
@@ -790,12 +921,13 @@ fn pair_in_bounds<S: Storage>(pair: BlockPair) -> bool {
 /// whose `DirStruct` entry must be flipped to the new pair address
 /// after a child pair migrates to fresh blocks.
 ///
-/// Only `DirStruct` references are matched. Pairs reached via
-/// `HardTail` / `SoftTail` continuations are walked (so the BFS
-/// covers the full reachable forest) but are not themselves
-/// candidates: this writer never emits tail tags during compaction,
-/// so any relocated pair has its predecessor's `DirStruct` to
-/// update, not a tail tag.
+/// Only `DirStruct` references are matched: this finds the *tree*
+/// parent whose entry must be flipped to the new address. The relocated
+/// pair's *thread* predecessor (whose tail also references it) is found
+/// separately by [`find_thread_predecessor`] and updated by
+/// `propagate_relocation`. Pairs reached via `HardTail` / `SoftTail`
+/// continuations are walked (so the BFS covers the full reachable
+/// forest) but are not themselves DirStruct candidates.
 ///
 /// Bounded at [`crate::alloc::MAX_QUEUED_PAIRS`] visited pairs, the
 /// same budget as the allocator's BFS. Deeper trees return
@@ -1021,6 +1153,45 @@ impl<S: Storage> Fs<S> {
         self.write_ctz_to_pair(self.root, name, content, buf_a, buf_b)
     }
 
+    /// Build the CTZ chain blocks for `content` into the physical blocks
+    /// in `chain`: for each block write its skip pointers and content
+    /// slice, then erase + program it. On the first block whose erase or
+    /// program fails (a worn/bad block), returns `Err(phys)` with that
+    /// block's physical address so the caller can exclude it and rebuild
+    /// past it. `chain.len()` is the block count.
+    fn try_build_ctz_chain(
+        &mut self,
+        chain: &[BlockAddress],
+        content: &[u8],
+        buf_a: &mut [u8],
+    ) -> Result<(), u32> {
+        use crate::ctz::skip_pointers_in_block;
+        let mut content_off = 0usize;
+        for (i, block) in chain.iter().enumerate() {
+            let i32 = i as u32;
+            let header = 4 * skip_pointers_in_block(i32) as usize;
+            for b in buf_a.iter_mut() {
+                *b = 0xFF;
+            }
+            let pointer_count = skip_pointers_in_block(i32) as usize;
+            for k in 0..pointer_count {
+                let target_idx = i - (1 << k);
+                let target_phys = chain[target_idx].as_u32();
+                let off = 4 * k;
+                buf_a[off..off + 4].copy_from_slice(&target_phys.to_le_bytes());
+            }
+            let block_capacity = S::BLOCK_SIZE - header;
+            let take = block_capacity.min(content.len() - content_off);
+            buf_a[header..header + take].copy_from_slice(&content[content_off..content_off + take]);
+            content_off += take;
+
+            let phys = block.as_u32();
+            self.storage.erase(phys).map_err(|_| phys)?;
+            self.storage.program(phys, 0, &buf_a[..S::BLOCK_SIZE]).map_err(|_| phys)?;
+        }
+        Ok(())
+    }
+
     /// Internal: write a CTZ-backed file to the given metadata pair.
     fn write_ctz_to_pair(
         &mut self,
@@ -1030,7 +1201,7 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
-        use crate::ctz::{block_count, skip_pointers_in_block};
+        use crate::ctz::block_count;
 
         if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
             return Err(Error::GeometryMismatch);
@@ -1069,47 +1240,40 @@ impl<S: Storage> Fs<S> {
             return Err(Error::OutOfRange);
         }
 
-        // Allocate physical blocks for the chain.
+        // Allocate and build the chain, relocating past any block whose
+        // erase/program fails (a worn/bad block). The C reference handles
+        // bad blocks on demand rather than with a persistent bad-block
+        // list, so a failed block is simply excluded from this write's
+        // allocation and the chain is rebuilt; the block stays free and is
+        // re-relocated if a later write hits it again. Bounded retries
+        // guard against a wholly-bad device.
         let mut chain = [BlockAddress::NONE; MAX_CTZ_WRITE_BLOCKS];
-        crate::alloc::alloc_blocks_cached(
-            &mut self.storage,
-            self.root,
-            &mut self.used_cache,
-            &[],
-            None,
-            &mut chain[..total_blocks],
-            buf_a,
-            buf_b,
-        )?;
-
-        // Build each chain block in `buf_a`, erase + program it.
-        let mut content_off = 0usize;
-        for i in 0..total_blocks {
-            let i32 = i as u32;
-            let header = 4 * skip_pointers_in_block(i32) as usize;
-            // Fill block with 0xFF (erased state).
-            for b in buf_a.iter_mut() {
-                *b = 0xFF;
+        let mut excluded = [BlockAddress::NONE; MAX_BAD_BLOCK_RETRIES];
+        let mut ex_len = 0usize;
+        loop {
+            crate::alloc::alloc_blocks_cached(
+                &mut self.storage,
+                self.root,
+                &mut self.used_cache,
+                &excluded[..ex_len],
+                None,
+                &mut chain[..total_blocks],
+                buf_a,
+                buf_b,
+            )?;
+            match self.try_build_ctz_chain(&chain[..total_blocks], content, buf_a) {
+                Ok(()) => break,
+                Err(bad_phys) => {
+                    if ex_len >= MAX_BAD_BLOCK_RETRIES {
+                        return Err(Error::Io);
+                    }
+                    // Exclude the bad block and re-scan so it is not handed
+                    // back, then rebuild the whole chain.
+                    excluded[ex_len] = BlockAddress::new(bad_phys);
+                    ex_len += 1;
+                    self.used_cache = None;
+                }
             }
-            // Skip pointers: block i has ctz(i)+1 pointers addressing
-            // blocks i - 2^k for k = 0..=ctz(i). Each pointer is the
-            // physical address of that chain index.
-            let pointer_count = skip_pointers_in_block(i32) as usize;
-            for k in 0..pointer_count {
-                let target_idx = i - (1 << k);
-                let target_phys = chain[target_idx].as_u32();
-                let off = 4 * k;
-                buf_a[off..off + 4].copy_from_slice(&target_phys.to_le_bytes());
-            }
-            // Content slice.
-            let block_capacity = S::BLOCK_SIZE - header;
-            let take = block_capacity.min(content.len() - content_off);
-            buf_a[header..header + take].copy_from_slice(&content[content_off..content_off + take]);
-            content_off += take;
-
-            let phys = chain[i].as_u32();
-            self.storage.erase(phys).map_err(|_| Error::Io)?;
-            self.storage.program(phys, 0, &buf_a[..S::BLOCK_SIZE]).map_err(|_| Error::Io)?;
         }
         self.storage.sync().map_err(|_| Error::Io)?;
 
@@ -1146,6 +1310,7 @@ impl<S: Storage> Fs<S> {
         self.apply_op_to_pair_inner(
             pair_addr,
             &op,
+            None,
             None,
             None,
             &chain[..total_blocks],
@@ -1754,14 +1919,20 @@ impl<S: Storage> Fs<S> {
             return Err(Error::InvalidPath);
         }
 
-        // Verify the name doesn't already exist in the parent.
+        // Verify the name doesn't already exist in the parent, and read
+        // the parent's current tail. The new directory is inserted into
+        // the global metadata-pair list immediately after the parent: the
+        // new dir inherits the parent's current tail, then the parent's
+        // tail is re-pointed at the new dir (matches `lfs_mkdir_`).
         self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
         self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let parent_tail: Option<(BlockPair, bool)>;
         {
             let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
             if crate::dir::lookup(&p, dir_name_bytes).is_some() {
                 return Err(Error::AlreadyExists);
             }
+            parent_tail = p.reader.tail().map(|t| (t, p.reader.is_hard_tail()));
         }
 
         // Allocate two blocks for the new directory's metadata pair.
@@ -1788,6 +1959,22 @@ impl<S: Storage> Fs<S> {
         }
         let new_end = {
             let mut commit = crate::meta::Commit::new(&mut buf_a[..S::BLOCK_SIZE], 1)?;
+            // The new directory takes the parent's old place in the global
+            // list: its tail points where the parent's tail did (null if
+            // the parent was the list end). Crash-safe: until the parent's
+            // commit below lands, the new dir is referenced by nothing and
+            // is reclaimed as an orphan, so this link is never reachable.
+            if let Some((tail_pair, is_hard)) = parent_tail {
+                let mut body = [0u8; 8];
+                body[0..4].copy_from_slice(&tail_pair.a.as_u32().to_le_bytes());
+                body[4..8].copy_from_slice(&tail_pair.b.as_u32().to_le_bytes());
+                let tag_type = if is_hard {
+                    crate::tag::TagType::HardTail
+                } else {
+                    crate::tag::TagType::SoftTail
+                };
+                commit.tag(crate::tag::Tag::new(true, tag_type, crate::tag::ID_NONE, 8), &body)?;
+            }
             commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
             commit.bytes_written()
         };
@@ -1811,7 +1998,19 @@ impl<S: Storage> Fs<S> {
             return Err(Error::OutOfRange);
         }
         let op = WriteOp::CreateDir { id: new_id, name: dir_name_bytes, dir_pair: new_dir };
-        self.apply_op_to_pair_inner(parent, &op, None, None, &new_blocks, buf_a, buf_b)
+        // Re-point the parent's tail at the new dir (SoftTail), inserting
+        // it into the global list right after the parent. Rides the same
+        // atomic commit as the DirStruct.
+        self.apply_op_to_pair_inner(
+            parent,
+            &op,
+            None,
+            None,
+            Some((new_dir, false)),
+            &new_blocks,
+            buf_a,
+            buf_b,
+        )
     }
 
     /// Write or update a file at `path` (path-based variant of
@@ -2252,7 +2451,7 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
-        self.apply_op_to_pair_inner(pair_addr, op, extra_move_state, None, &[], buf_a, buf_b)
+        self.apply_op_to_pair_inner(pair_addr, op, extra_move_state, None, None, &[], buf_a, buf_b)
     }
 
     /// Inner form of [`Self::apply_op_to_pair_with_movestate`] that
@@ -2268,6 +2467,7 @@ impl<S: Storage> Fs<S> {
         op: &WriteOp<'_>,
         extra_move_state: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
         extra_relocate_state: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
+        new_tail: Option<(BlockPair, bool)>,
         inflight: &[BlockAddress],
         buf_a: &mut [u8],
         buf_b: &mut [u8],
@@ -2286,6 +2486,7 @@ impl<S: Storage> Fs<S> {
         let count: usize;
         let pair_existing_ms: [u8; crate::gstate::MOVE_STATE_BODY_SIZE];
         let pair_existing_rs: [u8; crate::gstate::RELOCATE_STATE_BODY_SIZE];
+        let current_tail: Option<(BlockPair, bool)>;
         {
             let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
             active_addr = pair.active_block;
@@ -2297,14 +2498,30 @@ impl<S: Storage> Fs<S> {
             active_erased = pair.reader.erased();
             pair_existing_ms = scan_pair_move_state(&pair);
             pair_existing_rs = scan_pair_relocate_state(&pair);
+            current_tail = pair.reader.tail().map(|t| (t, pair.reader.is_hard_tail()));
             count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
         }
+        // The effective tail for this commit: an explicit `new_tail`
+        // override (mkdir threading, rmdir un-threading) wins; otherwise
+        // preserve whatever the pair already threads. Compaction must
+        // re-emit it; an in-place append keeps the existing tail tag and
+        // only emits when the tail actually changes.
+        let effective_tail = new_tail.or(current_tail);
+        // A `new_tail` whose pair is the NONE sentinel means "clear the
+        // tail" (un-threading the global-list end so the predecessor
+        // becomes the new end). The tail tag is sticky, so an in-place
+        // append cannot drop it; force a compaction, which rebuilds the
+        // block without re-emitting any tail tag.
+        let clear_tail = matches!(new_tail, Some((p, _)) if p.a.is_none());
 
         let extra_ms_dsize =
             extra_move_state.map_or(0, |_| 4 + crate::gstate::MOVE_STATE_BODY_SIZE);
         let extra_rs_dsize =
             extra_relocate_state.map_or(0, |_| 4 + crate::gstate::RELOCATE_STATE_BODY_SIZE);
-        let dsize = op_dsize_of(op) + extra_ms_dsize + extra_rs_dsize;
+        // A tail change on the append path emits one 4-byte tag + 8-byte
+        // pair body; reserve that so `can_append` does not overflow.
+        let extra_tail_dsize = new_tail.map_or(0, |_| 4 + 8);
+        let dsize = op_dsize_of(op) + extra_ms_dsize + extra_rs_dsize + extra_tail_dsize;
         // Append in place only when the active block reports its next
         // window as erased (the FCRC matched the on-disk bytes) and that
         // window is prog-aligned. A non-erased window means a torn write
@@ -2313,7 +2530,8 @@ impl<S: Storage> Fs<S> {
         // compact path, which rewrites onto a freshly erased block.
         let can_append = active_erased
             && committed_end % S::PROG_SIZE == 0
-            && committed_end + dsize <= S::BLOCK_SIZE;
+            && committed_end + dsize <= S::BLOCK_SIZE
+            && !clear_tail;
         if can_append {
             let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
             let new_end = {
@@ -2341,6 +2559,21 @@ impl<S: Storage> Fs<S> {
                         ),
                         &body,
                     )?;
+                }
+                // Only an explicit tail change needs emitting on the
+                // append path; the pair's prior tail tag persists in the
+                // block (latest-wins) when `new_tail` is None.
+                if let Some((tail_pair, is_hard)) = new_tail {
+                    let mut body = [0u8; 8];
+                    body[0..4].copy_from_slice(&tail_pair.a.as_u32().to_le_bytes());
+                    body[4..8].copy_from_slice(&tail_pair.b.as_u32().to_le_bytes());
+                    let tag_type = if is_hard {
+                        crate::tag::TagType::HardTail
+                    } else {
+                        crate::tag::TagType::SoftTail
+                    };
+                    commit
+                        .tag(crate::tag::Tag::new(true, tag_type, crate::tag::ID_NONE, 8), &body)?;
                 }
                 commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
                 commit.bytes_written()
@@ -2387,6 +2620,7 @@ impl<S: Storage> Fs<S> {
                 op,
                 ms_arg,
                 rs_arg,
+                effective_tail,
                 inflight,
                 buf_a,
                 buf_b,
@@ -2432,6 +2666,7 @@ impl<S: Storage> Fs<S> {
         op: &WriteOp<'_>,
         ms_arg: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
         rs_arg: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
+        tail: Option<(BlockPair, bool)>,
         inflight: &[BlockAddress],
         buf_a: &mut [u8],
         buf_b: &mut [u8],
@@ -2523,6 +2758,7 @@ impl<S: Storage> Fs<S> {
                 S::BLOCK_SIZE,
                 ms_arg,
                 combined_rs,
+                tail,
             )?
         } else {
             build_compact_commit(
@@ -2536,6 +2772,7 @@ impl<S: Storage> Fs<S> {
                 S::BLOCK_SIZE,
                 ms_arg,
                 combined_rs,
+                tail,
             )?
         };
 
@@ -2603,15 +2840,44 @@ impl<S: Storage> Fs<S> {
         }
         next_inflight[next_len] = fresh;
         next_len += 1;
+        // The relocated pair changed address, so its thread predecessor's
+        // tail must be re-pointed at `new_pair` to keep the global
+        // metadata-pair list consistent (the C reference's allocator and
+        // traverse follow it). When the predecessor IS the parent (the
+        // common case for a directory's first/only child), fold the tail
+        // update into the parent's DirStruct commit so it lands
+        // atomically; otherwise it is a separate commit on the
+        // predecessor.
+        let pred = find_thread_predecessor(&mut self.storage, self.root, old_pair, buf_a, buf_b)?;
+        let parent_new_tail = match pred {
+            Some((p, is_hard)) if p == parent_pair => Some((new_pair, is_hard)),
+            _ => None,
+        };
         self.apply_op_to_pair_inner(
             parent_pair,
             &op,
             None,
             Some(relocate_body),
+            parent_new_tail,
             &next_inflight[..next_len],
             buf_a,
             buf_b,
-        )
+        )?;
+        if let Some((pred_pair, is_hard)) = pred {
+            if pred_pair != parent_pair {
+                self.apply_op_to_pair_inner(
+                    pred_pair,
+                    &WriteOp::Noop,
+                    None,
+                    None,
+                    Some((new_pair, is_hard)),
+                    &[],
+                    buf_a,
+                    buf_b,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Remove an empty directory at `path`.
@@ -2669,7 +2935,43 @@ impl<S: Storage> Fs<S> {
             return Err(Error::NotEmpty);
         }
 
-        self.remove_from_pair(parent, leaf.as_bytes(), buf_a, buf_b)
+        // Read the removed directory's own tail (its successor in the
+        // global metadata-pair list) so the thread predecessor can be
+        // re-pointed past it.
+        self.storage.read(dir_pair.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(dir_pair.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let dir_tail: Option<(BlockPair, bool)> = {
+            let p = MetadataPair::parse(dir_pair.a, &*buf_a, dir_pair.b, &*buf_b)?;
+            p.reader.tail().map(|t| (t, p.reader.is_hard_tail()))
+        };
+
+        // Remove the entry from the parent (drops the directory from the
+        // tree). Then un-thread it: re-point the thread predecessor's tail
+        // past the removed pair so the global list stays consistent for
+        // the C reference. A crash between the two leaves the pair in the
+        // thread but not the tree (an orphan), which mount-time deorphan
+        // recovery must reconcile; that recovery is the remaining
+        // lfs-xmx slice (ADR-0012).
+        self.remove_from_pair(parent, leaf.as_bytes(), buf_a, buf_b)?;
+        if let Some((pred_pair, _is_hard)) =
+            find_thread_predecessor(&mut self.storage, self.root, dir_pair, buf_a, buf_b)?
+        {
+            // Re-point past the removed dir: to its successor, or clear
+            // the tail (NONE sentinel) if it was the list end.
+            let new_tail =
+                dir_tail.or(Some((BlockPair::new(BlockAddress::NONE, BlockAddress::NONE), false)));
+            self.apply_op_to_pair_inner(
+                pred_pair,
+                &WriteOp::Noop,
+                None,
+                None,
+                new_tail,
+                &[],
+                buf_a,
+                buf_b,
+            )?;
+        }
+        Ok(())
     }
 
     /// List the entries in the directory at `path`, calling `f` for
@@ -3113,7 +3415,90 @@ impl<S: Storage> Fs<S> {
         if let Some((old_pair, new_pair)) = gstate.pending_relocation() {
             fs.recover_pending_relocation(old_pair, new_pair, block_a_buf, block_b_buf)?;
         }
+        // Deorphan sweep: drop any pair left in the global thread but not
+        // the live tree by an interrupted rmdir un-thread or
+        // sibling-predecessor relocation. A no-op on a healthy filesystem.
+        fs.deorphan_sweep(block_a_buf, block_b_buf)?;
         Ok(fs)
+    }
+
+    /// Walk the global metadata-pair thread and drop any pair that is in
+    /// the thread but not a live tree directory (a crash orphan from an
+    /// interrupted `rmdir` un-thread or sibling-predecessor relocation).
+    /// Re-points the orphan's predecessor past it so the C reference's
+    /// allocator/traverse stop following a stale link and the orphan's
+    /// blocks are reclaimed. Idempotent; a no-op when every threaded pair
+    /// is a live directory (the healthy case, including C-written images).
+    fn deorphan_sweep(&mut self, buf_a: &mut [u8], buf_b: &mut [u8]) -> Result<(), Error> {
+        let mut tree = [BlockPair::new(BlockAddress::NONE, BlockAddress::NONE);
+            crate::alloc::MAX_QUEUED_PAIRS];
+        let tree_count =
+            collect_live_tree_pairs(&mut self.storage, self.root, &mut tree, buf_a, buf_b)?;
+
+        // Track the pairs advanced through so a cyclic thread (a corrupt
+        // image) terminates the sweep without error: mount must stay
+        // cycle-safe (the resolution path rejects the cycle as Corrupt
+        // later), matching `accumulate_gstate`'s deduped walk. The `steps`
+        // backstop also breaks rather than erroring.
+        let mut cur = self.root;
+        let mut visited = [BlockPair::new(BlockAddress::NONE, BlockAddress::NONE);
+            crate::alloc::MAX_QUEUED_PAIRS];
+        visited[0] = self.root;
+        let mut visited_count = 1usize;
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            if steps > 4 * crate::alloc::MAX_QUEUED_PAIRS {
+                break;
+            }
+            self.storage.read(cur.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+            self.storage.read(cur.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            let next = {
+                let p = MetadataPair::parse(cur.a, &*buf_a, cur.b, &*buf_b)?;
+                p.reader.tail()
+            };
+            let Some(next) = next else {
+                break;
+            };
+            if tree[..tree_count].contains(&next) {
+                // A live threaded directory; advance, but stop on a cycle
+                // (leave the corrupt thread as-is for the resolution path
+                // to reject).
+                if visited[..visited_count].contains(&next) {
+                    break;
+                }
+                if visited_count < crate::alloc::MAX_QUEUED_PAIRS {
+                    visited[visited_count] = next;
+                    visited_count += 1;
+                }
+                cur = next;
+                continue;
+            }
+            // `next` is threaded but not a live tree pair: a crash orphan.
+            // Re-point `cur` past it (to the orphan's own successor, or
+            // clear if it was the list end), then re-check `cur` for
+            // consecutive orphans without advancing.
+            self.storage.read(next.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+            self.storage.read(next.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            let orphan_tail = {
+                let p = MetadataPair::parse(next.a, &*buf_a, next.b, &*buf_b)?;
+                p.reader.tail().map(|t| (t, p.reader.is_hard_tail()))
+            };
+            let new_tail = orphan_tail
+                .or(Some((BlockPair::new(BlockAddress::NONE, BlockAddress::NONE), false)));
+            self.apply_op_to_pair_inner(
+                cur,
+                &WriteOp::Noop,
+                None,
+                None,
+                new_tail,
+                &[],
+                buf_a,
+                buf_b,
+            )?;
+            self.used_cache = None; // the orphan's blocks are now free
+        }
+        Ok(())
     }
 
     /// Complete a cross-directory rename whose destination commit
@@ -3175,6 +3560,7 @@ impl<S: Storage> Fs<S> {
             &WriteOp::Noop,
             None,
             Some(balance),
+            None,
             &[],
             buf_a,
             buf_b,
