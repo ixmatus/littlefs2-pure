@@ -70,7 +70,6 @@ fn buf() -> [u8; Dev::BLOCK_SIZE] {
 }
 
 #[test]
-#[ignore = "target for lfs-xmx: remove ignore when SoftTail global-list threading lands"]
 fn directories_are_threaded_into_the_global_list() {
     let mut storage = Dev::new();
     let mut sb = buf();

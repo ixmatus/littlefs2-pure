@@ -794,6 +794,45 @@ fn pair_in_bounds<S: Storage>(pair: BlockPair) -> bool {
     pair.a.as_u32() < S::BLOCK_COUNT && pair.b.as_u32() < S::BLOCK_COUNT
 }
 
+/// Walk the global metadata-pair thread from `root` (following each
+/// pair's tail) and return the pair whose tail references `target`, with
+/// whether that tail is a HardTail. Returns `Ok(None)` if `target` is the
+/// root or no pair's tail references it.
+///
+/// This is the thread-predecessor lookup the C reference calls
+/// `lfs_fs_pred`. It is needed when a threaded pair changes address
+/// (wear-levelling relocation) or is removed: the predecessor's tail must
+/// be re-pointed so the global list stays consistent for the C
+/// reference's allocator and traverse. Bounded and cycle-safe at
+/// [`crate::alloc::MAX_QUEUED_PAIRS`] hops.
+fn find_thread_predecessor<S: Storage>(
+    storage: &mut S,
+    root: BlockPair,
+    target: BlockPair,
+    buf_a: &mut [u8],
+    buf_b: &mut [u8],
+) -> Result<Option<(BlockPair, bool)>, Error> {
+    let mut cur = root;
+    let mut steps = 0usize;
+    loop {
+        steps += 1;
+        if steps > crate::alloc::MAX_QUEUED_PAIRS {
+            return Err(Error::OutOfRange);
+        }
+        storage.read(cur.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        storage.read(cur.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let (tail, is_hard) = {
+            let p = MetadataPair::parse(cur.a, &*buf_a, cur.b, &*buf_b)?;
+            (p.reader.tail(), p.reader.is_hard_tail())
+        };
+        match tail {
+            Some(t) if t == target => return Ok(Some((cur, is_hard))),
+            Some(t) => cur = t,
+            None => return Ok(None),
+        }
+    }
+}
+
 /// BFS-walk the metadata-pair forest from `root` and return the
 /// `(parent_pair, id)` of the entry whose `DirStruct` body matches
 /// `target`. Returns `Ok(None)` if `target` is not referenced by any
@@ -1768,14 +1807,20 @@ impl<S: Storage> Fs<S> {
             return Err(Error::InvalidPath);
         }
 
-        // Verify the name doesn't already exist in the parent.
+        // Verify the name doesn't already exist in the parent, and read
+        // the parent's current tail. The new directory is inserted into
+        // the global metadata-pair list immediately after the parent: the
+        // new dir inherits the parent's current tail, then the parent's
+        // tail is re-pointed at the new dir (matches `lfs_mkdir_`).
         self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
         self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let parent_tail: Option<(BlockPair, bool)>;
         {
             let p = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
             if crate::dir::lookup(&p, dir_name_bytes).is_some() {
                 return Err(Error::AlreadyExists);
             }
+            parent_tail = p.reader.tail().map(|t| (t, p.reader.is_hard_tail()));
         }
 
         // Allocate two blocks for the new directory's metadata pair.
@@ -1802,6 +1847,22 @@ impl<S: Storage> Fs<S> {
         }
         let new_end = {
             let mut commit = crate::meta::Commit::new(&mut buf_a[..S::BLOCK_SIZE], 1)?;
+            // The new directory takes the parent's old place in the global
+            // list: its tail points where the parent's tail did (null if
+            // the parent was the list end). Crash-safe: until the parent's
+            // commit below lands, the new dir is referenced by nothing and
+            // is reclaimed as an orphan, so this link is never reachable.
+            if let Some((tail_pair, is_hard)) = parent_tail {
+                let mut body = [0u8; 8];
+                body[0..4].copy_from_slice(&tail_pair.a.as_u32().to_le_bytes());
+                body[4..8].copy_from_slice(&tail_pair.b.as_u32().to_le_bytes());
+                let tag_type = if is_hard {
+                    crate::tag::TagType::HardTail
+                } else {
+                    crate::tag::TagType::SoftTail
+                };
+                commit.tag(crate::tag::Tag::new(true, tag_type, crate::tag::ID_NONE, 8), &body)?;
+            }
             commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
             commit.bytes_written()
         };
@@ -1825,7 +1886,19 @@ impl<S: Storage> Fs<S> {
             return Err(Error::OutOfRange);
         }
         let op = WriteOp::CreateDir { id: new_id, name: dir_name_bytes, dir_pair: new_dir };
-        self.apply_op_to_pair_inner(parent, &op, None, None, None, &new_blocks, buf_a, buf_b)
+        // Re-point the parent's tail at the new dir (SoftTail), inserting
+        // it into the global list right after the parent. Rides the same
+        // atomic commit as the DirStruct.
+        self.apply_op_to_pair_inner(
+            parent,
+            &op,
+            None,
+            None,
+            Some((new_dir, false)),
+            &new_blocks,
+            buf_a,
+            buf_b,
+        )
     }
 
     /// Write or update a file at `path` (path-based variant of
@@ -2648,16 +2721,44 @@ impl<S: Storage> Fs<S> {
         }
         next_inflight[next_len] = fresh;
         next_len += 1;
+        // The relocated pair changed address, so its thread predecessor's
+        // tail must be re-pointed at `new_pair` to keep the global
+        // metadata-pair list consistent (the C reference's allocator and
+        // traverse follow it). When the predecessor IS the parent (the
+        // common case for a directory's first/only child), fold the tail
+        // update into the parent's DirStruct commit so it lands
+        // atomically; otherwise it is a separate commit on the
+        // predecessor.
+        let pred = find_thread_predecessor(&mut self.storage, self.root, old_pair, buf_a, buf_b)?;
+        let parent_new_tail = match pred {
+            Some((p, is_hard)) if p == parent_pair => Some((new_pair, is_hard)),
+            _ => None,
+        };
         self.apply_op_to_pair_inner(
             parent_pair,
             &op,
             None,
             Some(relocate_body),
-            None,
+            parent_new_tail,
             &next_inflight[..next_len],
             buf_a,
             buf_b,
-        )
+        )?;
+        if let Some((pred_pair, is_hard)) = pred {
+            if pred_pair != parent_pair {
+                self.apply_op_to_pair_inner(
+                    pred_pair,
+                    &WriteOp::Noop,
+                    None,
+                    None,
+                    Some((new_pair, is_hard)),
+                    &[],
+                    buf_a,
+                    buf_b,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Remove an empty directory at `path`.
