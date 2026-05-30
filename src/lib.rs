@@ -8,22 +8,23 @@
 //!
 //! # Status
 //!
-//! **v1.0 — API frozen.** The kernel implements the complete v2 surface:
-//! mount, format, full path resolution with HardTail chasing, inline and
-//! CTZ file read and write, streaming append via the stateful [`File`]
-//! handle, directory create / remove / rename, user attributes, atomic
-//! cross-directory rename with mount-time gstate recovery, and
-//! compact-time inter-pair wear levelling with mount-time orphan
-//! recovery. Bit accuracy against the C reference is verified in both
-//! directions (Rust reads images written by C, C reads images written
-//! by Rust); the round-trip and conformance harnesses gate every CI
-//! run.
+//! **v1.2.0: API stable; the LittleFS v2 write surface is complete.** The
+//! kernel reads and writes the full v2 surface: mount, format, full path
+//! resolution with HardTail chasing, inline and CTZ file read and write,
+//! streaming append via the stateful [`File`] handle, directory create /
+//! remove / rename, user attributes, atomic cross-directory rename with
+//! mount-time gstate recovery, compact-time inter-pair wear levelling with
+//! mount-time orphan recovery, directory splitting across HardTail
+//! continuation pairs, global-list threading via SoftTail, and
+//! failure-driven relocation of a metadata pair or CTZ block past a worn
+//! block. Bit accuracy against the C reference is verified in both
+//! directions (Rust reads images written by C, C reads images written by
+//! Rust); the round-trip and conformance harnesses gate every CI run.
 //!
-//! Every public item is covered by the semver contract starting at
-//! v1.0; future additive changes ship as 1.x minor releases, and
-//! `#[non_exhaustive]` is applied to [`Error`], [`EntryKind`],
-//! [`AbstractType`], and [`TagType`] so a new spec-driven variant
-//! does not require a major version bump.
+//! Every public item is covered by the semver contract; additive changes
+//! ship as 1.x minor releases, and `#[non_exhaustive]` is applied to
+//! [`Error`], [`EntryKind`], [`AbstractType`], and [`TagType`] so a new
+//! spec-driven variant does not require a major version bump.
 //!
 //! # Entry points
 //!

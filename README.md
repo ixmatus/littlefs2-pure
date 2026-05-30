@@ -44,7 +44,7 @@ governing use.
 
 ## Status
 
-**v1.0 — API frozen.** The kernel implements the complete LittleFS v2 surface and the public API is covered by the semver contract. `#[non_exhaustive]` is applied to every spec-tracking enum (`Error`, `EntryKind`, `AbstractType`, `TagType`) so future variants ship in 1.x minor releases without a major bump. The 0.x dead `ReadOnlyStorage` trait was pruned in the freeze pass; everything else in the public surface is committed. See [`CHANGELOG.md`](CHANGELOG.md) for the per-release record and [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for what stays out of scope by design.
+**v1.2.0: API stable; the LittleFS v2 write surface is complete.** The kernel reads and writes the full LittleFS v2 on disk format, and the public API is covered by the semver contract. The v1.2.0 milestone completed the writer: directories grow across `HardTail` continuation pairs ([ADR-0013](docs/decisions/0013-directory-splitting.md)), every pair is threaded into the global list the C reference walks ([ADR-0012](docs/decisions/0012-softtail-global-list-threading.md)), and a single worn block under a metadata or file commit is relocated past rather than fatal ([ADR-0014](docs/decisions/0014-failure-driven-pair-relocation.md)). `#[non_exhaustive]` is applied to every spec tracking enum (`Error`, `EntryKind`, `AbstractType`, `TagType`) so future variants ship in 1.x minor releases without a major bump. See [`CHANGELOG.md`](CHANGELOG.md) for the per-release record and [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the design rationale and the remaining constraints.
 
 Verification posture (see [ADR-0003](docs/decisions/0003-verification-stacks.md)):
 
@@ -54,11 +54,11 @@ Verification posture (see [ADR-0003](docs/decisions/0003-verification-stacks.md)
 | Property tests (`proptest`) | CRC, tag bit layout, CTZ geometry, metadata commit round-trip. |
 | Conformance (C → Rust) | Mount C-littlefs-written images; assert expected entries. |
 | Conformance (Rust → C) | Mount Rust-written images through a C verifier; assert expected content. |
-| Power-loss sweep | `TornWriteStorage` / `TornWearStorage` across every program-call boundary in inline write, CTZ streaming append, cross-dir rename, and wear-level pair relocation. |
+| Power-loss sweep | `TornWriteStorage` / `TornWearStorage` / `TornBadBlock` across every program-call boundary in inline write, CTZ streaming append, cross-dir rename, wear-level pair relocation, directory splitting, and failure-driven bad-block relocation. |
 | Kani harnesses | `Tag::from_bits` totality, `crc::update` vs bitwise reference, `rev_scmp` wrap-aware compare, `MetadataReader::new` panic-freedom. |
 | libFuzzer (`fuzz/`) | Parser totality on adversarial bytes for tag, path, superblock, CTZ struct, metadata reader. |
 
-246 tests pass, clippy `-D warnings` clean, `cargo doc` warning-free under `RUSTDOCFLAGS=-D warnings`, three ARM cross-compile targets clean.
+The full host and `no_std` suites pass, clippy `-D warnings` is clean, `cargo doc` is warning-free under `RUSTDOCFLAGS=-D warnings`, and the three ARM cross-compile targets build. CI's whole matrix is green, including the advisory Kani proofs.
 
 ## Quick start
 
@@ -122,11 +122,16 @@ The existing `littlefs2` crates on crates.io are FFI wrappers around the C refer
 - [ADR-0003](docs/decisions/0003-verification-stacks.md): Five complementary verification stacks.
 - [ADR-0004](docs/decisions/0004-c-reference-as-golden.md): C-reference vectors are produced offline and committed.
 - [ADR-0005](docs/decisions/0005-wear-leveling-pair-relocation.md): Inter-pair wear levelling via compact-time pair relocation.
+- [ADR-0012](docs/decisions/0012-softtail-global-list-threading.md): SoftTail global directory-list threading.
+- [ADR-0013](docs/decisions/0013-directory-splitting.md): Write-side directory splitting across HardTail continuation pairs.
+- [ADR-0014](docs/decisions/0014-failure-driven-pair-relocation.md): Failure-driven relocation of a metadata pair past a worn block.
+
+ADRs 0006 through 0011 cover the Cortex-M0+ scratch budget, the cycle-safe tail walk, and the allocation and append performance work; the full series lives under [`docs/decisions/`](docs/decisions/).
 
 ### What the kernel does NOT do
 
 - **Allocate.** The kernel takes two `&mut [u8]` buffers (each `S::BLOCK_SIZE` bytes) from the caller for every operation. There is no internal cache; `CACHE_SIZE` and `LOOKAHEAD_SIZE` on the `Storage` trait are advisory.
-- **Use unsafe.** `#![forbid(unsafe_code)]` workspace-wide.
+- **Use unsafe.** The `unsafe_code` lint is set to `forbid` in `[workspace.lints]`; the crate contains no `unsafe` blocks.
 - **Pull in `std` or `alloc` by default.** The default feature set is empty; `alloc` and `std` are opt-in for richer hosts.
 - **Use FFI.** Zero C in the dependency graph.
 
@@ -168,7 +173,7 @@ littlefs2-pure/
 ├── README.md                   this file
 ├── INTEGRATION.md              integration walkthrough, mount-error matrix, recovery envelope
 ├── CHANGELOG.md                per-release notes (Keep a Changelog format)
-├── KNOWN_ISSUES.md             punch list against v1.0
+├── KNOWN_ISSUES.md             feature checklist and design constraints
 ├── LICENSE-MIT / LICENSE-APACHE
 ├── docs/
 │   ├── PLAN.md                 phase retrospective
@@ -181,6 +186,8 @@ littlefs2-pure/
 │   ├── power_loss.rs           torn-write sweep
 │   ├── atomic_move.rs          cross-dir rename torn-write sweep
 │   ├── wear_leveling.rs        compact-time relocation sweep
+│   ├── dir_split_*.rs          directory-split crash + relocation sweeps
+│   ├── badblock_*.rs           failure-driven bad-block relocation + crash sweep
 │   └── vectors/                committed disk images from the C reference
 ├── tools/
 │   ├── gen_vectors/            vendored C reference + driver producing baseline images
@@ -215,11 +222,11 @@ cargo kani --features kani
 cd fuzz && cargo +nightly fuzz run meta_reader_parse
 ```
 
-CI runs every gate above (except Kani and fuzz, which are local-only) on every push and pull request to `main`. See [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+CI runs every gate above on every push and pull request to `main`, plus the Kani proofs and a fuzz smoke run as advisory (non-gating) jobs. See [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ## Versioning
 
-This crate follows [Semantic Versioning](https://semver.org/). The `0.x` line is explicit about API churn; pin to an exact version (`= "0.1.0"`) if you need stability during the run-up to v1.0. Switch to caret ranges (`"^1"`) once v1.0 ships.
+This crate follows [Semantic Versioning](https://semver.org/). v1.x is the current line; depend on it with a caret range (`"1"`). Additive features ship as minor bumps (the LittleFS v2 write surface landed across the 1.x minors), and `#[non_exhaustive]` on the spec tracking enums keeps a new variant out of the breaking set, so a 2.0 would mean a deliberate API break.
 
 `CHANGELOG.md` follows [Keep a Changelog](https://keepachangelog.com/).
 
