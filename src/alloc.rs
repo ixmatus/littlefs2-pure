@@ -222,7 +222,7 @@ fn gather_live_structs(
 /// Walk the filesystem from `root` and mark every reachable block in
 /// `used`. Visits each metadata pair once; follows live `DirStruct`
 /// children and the pair's tail into other pairs; walks each live CTZ
-/// chain. Splice-correct (see [`gather_live_structs`]): a deleted entry's
+/// chain. Splice-correct (see `gather_live_structs`): a deleted entry's
 /// stale struct tag is not followed, so freed blocks are reclaimable.
 ///
 /// `buf_a` and `buf_b` are scratch buffers of `S::BLOCK_SIZE` each;

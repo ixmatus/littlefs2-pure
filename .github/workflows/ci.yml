@@ -153,10 +153,12 @@ jobs:
     # Discharge every #[kani::proof] under src/verify/ via the
     # model-checking action. The two commit_proofs harnesses
     # symbolically explore MetadataReader::new on adversarial bytes
-    # (with crc::update stubbed for tractability — CRC correctness
-    # is proved separately in crc_proofs); the 32-byte panic-freedom
-    # harness runs ~90s on a hosted runner, so the 180s per-harness
-    # timeout has headroom.
+    # (with crc::update stubbed for tractability; CRC correctness
+    # is proved separately in crc_proofs). The FCRC validation added
+    # to MetadataReader::new in v1.1.0 grew the panic-freedom harness's
+    # CBMC solving time past the original 180s timeout, so the
+    # per-harness budget is 360s. This restores headroom and keeps the
+    # full proof rather than weakening it with tighter unwinds or stubs.
     #
     # We do not gate the rest of CI on this job: Kani's toolchain
     # pinning can lag stable Rust, and we would rather flag a
@@ -180,6 +182,6 @@ jobs:
             --features kani
             -Z unstable-options
             -Z stubbing
-            --harness-timeout 180s
+            --harness-timeout 360s
             -j
             --output-format terse
