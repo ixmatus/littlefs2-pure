@@ -94,10 +94,41 @@ buffers, and does not change `MAX_LIVE_ENTRIES`. A 2.x revision is free
 to adopt caller supplied scratch (the doc notes already flag it); that
 is a breaking API change and is deliberately deferred.
 
+## Revision after directory splitting (2026-05-30, lfs-cvh / lfs-fvw)
+
+The write-side directory-splitting arc added two scratch users to the
+write path, both pinned by `const` assertions in the same spirit as the
+originals.
+
+- `alloc::scan_used_blocks` (the used-block scan) was made splice-correct
+  (lfs-fvw) and now stacks a `[LiveStruct; MAX_LIVE_ENTRIES]` local. At
+  `size_of::<LiveStruct>() = 12` that is 3072 bytes (3 KiB), pinned by a
+  guard next to `LiveStruct`. Crucially it is **not** multiplied down the
+  relocation recursion: the scan is an iterative BFS that runs to
+  completion and returns before `propagate_relocation` recurses, so at most
+  one such array is live at a time. It adds 3 KiB once to the worst-case
+  peak, alongside the transient 6 KiB `lookup` array, not `32 * 3 KiB`.
+
+- The split path and `mkdir` gained reachable-pair budget checks
+  (`collect_live_tree_pairs`, lfs-cvh.4 / .5 / lfs-43o) which stack a
+  `[SlotOffsets; MAX_LIVE_ENTRIES]` (the existing 2.5 KiB array) for the
+  duration of the walk. These run before the split / new-pair commit and
+  do not recurse into `apply_op_to_pair_inner`, so they too are not
+  multiplied by depth; they add at most one extra 2.5 KiB frame transiently
+  at the level performing the split.
+
+The recursion-bounded `32 * 2.5 KiB` ≈ 80 KiB `SlotOffsets` worst case from
+the relocation cascade still dominates; the splitting arc raises the
+transient peak by roughly 3 + 2.5 KiB, not by a factor of depth. The
+out-of-scope note stands: a 2.x revision adopting caller-supplied scratch
+would subsume all of these arrays.
+
 ## Related
 
 - `src/fs.rs`: `gather_live_slots`, `apply_op_to_pair_inner`,
   `propagate_relocation`, and the `SlotOffsets` size guard.
+- `src/alloc.rs`: `scan_used_blocks`, `gather_live_structs`, and the
+  `LiveStruct` size guard (lfs-fvw).
 - `src/dir.rs`: `lookup` and the `LookupSlot` size guard.
 - ADR-0005 (wear levelling pair relocation), which introduced the
   `propagate_relocation` recursion this budget accounts for.

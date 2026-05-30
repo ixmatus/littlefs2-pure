@@ -100,6 +100,18 @@ impl LiveStruct {
     const NONE: Self = Self { kind: 0, w0: 0, w1: 0 };
 }
 
+// Pin the splice-replay scratch array's size, matching the ADR-0006
+// discipline for `SlotOffsets` / `LookupSlot`. `scan_used_blocks` stacks
+// one `[LiveStruct; MAX_LIVE_ENTRIES]` per call; it is not multiplied down
+// the write-path recursion (the scan runs to completion and returns before
+// the recursion continues), so it adds this once to the worst-case peak.
+// A field added to `LiveStruct` trips this rather than silently inflating
+// the budget.
+const _: () = assert!(
+    core::mem::size_of::<[LiveStruct; crate::dir::MAX_LIVE_ENTRIES]>() == 3072,
+    "LiveStruct grew; revisit docs/decisions/0006-stack-budget.md"
+);
+
 /// Collect a metadata block's live entry structs, splice-correct.
 ///
 /// Replays `Create` / `Delete` renumbering exactly as
