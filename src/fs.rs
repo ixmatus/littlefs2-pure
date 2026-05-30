@@ -3244,14 +3244,10 @@ impl<S: Storage> Fs<S> {
         if old_pair == self.root {
             return Ok(());
         }
-        let (parent_pair, parent_id) =
-            find_parent_in_tree(&mut self.storage, self.root, old_pair, buf_a, buf_b)?
-                .ok_or(Error::Corrupt)?;
-        let op = WriteOp::UpdateDirStruct { id: parent_id, new_pair };
         let relocate_body = crate::gstate::build_relocate_body(old_pair, new_pair);
-        // Add the fresh half of new_pair to inflight so the parent's
-        // own relocation (if it cascades) doesn't reallocate the
-        // block we just programmed.
+        // Add the fresh half of new_pair to inflight so a cascading
+        // relocation of the pair we are about to commit to does not
+        // reallocate the block we just programmed.
         let fresh = if old_pair.a == new_pair.a { new_pair.b } else { new_pair.a };
         let mut next_inflight = [BlockAddress::NONE; crate::alloc::MAX_QUEUED_PAIRS];
         let mut next_len = 0;
@@ -3270,39 +3266,64 @@ impl<S: Storage> Fs<S> {
         // The relocated pair changed address, so its thread predecessor's
         // tail must be re-pointed at `new_pair` to keep the global
         // metadata-pair list consistent (the C reference's allocator and
-        // traverse follow it). When the predecessor IS the parent (the
-        // common case for a directory's first/only child), fold the tail
-        // update into the parent's DirStruct commit so it lands
-        // atomically; otherwise it is a separate commit on the
-        // predecessor.
+        // traverse follow it).
         let pred = find_thread_predecessor(&mut self.storage, self.root, old_pair, buf_a, buf_b)?;
-        let parent_new_tail = match pred {
-            Some((p, is_hard)) if p == parent_pair => Some((new_pair, is_hard)),
-            _ => None,
-        };
-        self.apply_op_to_pair_inner(
-            parent_pair,
-            &op,
-            None,
-            Some(relocate_body),
-            parent_new_tail,
-            &next_inflight[..next_len],
-            buf_a,
-            buf_b,
-        )?;
-        if let Some((pred_pair, is_hard)) = pred {
-            if pred_pair != parent_pair {
-                self.apply_op_to_pair_inner(
-                    pred_pair,
-                    &WriteOp::Noop,
-                    None,
-                    None,
-                    Some((new_pair, is_hard)),
-                    &[],
-                    buf_a,
-                    buf_b,
-                )?;
+        if let Some((parent_pair, parent_id)) =
+            find_parent_in_tree(&mut self.storage, self.root, old_pair, buf_a, buf_b)?
+        {
+            // Tree node: a parent holds a `DirStruct` to `old_pair`.
+            // Rewrite it to `new_pair`. When the thread predecessor IS the
+            // parent (the common case for a directory's first/only child),
+            // fold the tail update into the same commit so it lands
+            // atomically; otherwise re-point the predecessor's tail in a
+            // separate commit.
+            let op = WriteOp::UpdateDirStruct { id: parent_id, new_pair };
+            let parent_new_tail = match pred {
+                Some((p, is_hard)) if p == parent_pair => Some((new_pair, is_hard)),
+                _ => None,
+            };
+            self.apply_op_to_pair_inner(
+                parent_pair,
+                &op,
+                None,
+                Some(relocate_body),
+                parent_new_tail,
+                &next_inflight[..next_len],
+                buf_a,
+                buf_b,
+            )?;
+            if let Some((pred_pair, is_hard)) = pred {
+                if pred_pair != parent_pair {
+                    self.apply_op_to_pair_inner(
+                        pred_pair,
+                        &WriteOp::Noop,
+                        None,
+                        None,
+                        Some((new_pair, is_hard)),
+                        &[],
+                        buf_a,
+                        buf_b,
+                    )?;
+                }
             }
+        } else {
+            // HardTail continuation: no parent holds a `DirStruct` to it —
+            // it is reached only through its thread predecessor's HardTail.
+            // Re-point that HardTail at `new_pair` and carry the
+            // relocation's gstate on the same commit, so mount-time
+            // recovery balances it. A continuation with no predecessor is
+            // genuinely orphaned (corrupt or already dropped).
+            let (pred_pair, is_hard) = pred.ok_or(Error::Corrupt)?;
+            self.apply_op_to_pair_inner(
+                pred_pair,
+                &WriteOp::Noop,
+                None,
+                Some(relocate_body),
+                Some((new_pair, is_hard)),
+                &next_inflight[..next_len],
+                buf_a,
+                buf_b,
+            )?;
         }
         Ok(())
     }
