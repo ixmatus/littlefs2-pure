@@ -155,10 +155,38 @@ splitting. Lifting `MAX_QUEUED_PAIRS` from a hard limit (the Consequences
 above) is thus still future work and gated on the stack budget (ADR-0006),
 not delivered by splitting alone.
 
-**The root is excluded until `lfs-cvh.5`.** The split branch skips the
-root pair `{0, 1}`: it cannot relocate and its growth needs the
-superblock-expansion guard. A root overflow keeps its prior `OutOfRange`
-behavior until step 5 lands.
+**The root is excluded until `lfs-cvh.5`, and step 5 needs a fullness
+guard.** The split branch skips the root pair `{0, 1}`: it cannot relocate,
+so a root overflow keeps its prior `OutOfRange` behavior. Enabling the
+generic split for the root works correctly in isolation (the superblock
+entry at id 0 stays in the lower half, `{0, 1}` remains the mount anchor
+with a HardTail to the continuation, every entry reads back and the image
+remounts), but a root continuation chain is *permanent*: unlike a freed
+subdirectory, the root cannot be un-split, so its continuation blocks are
+never reclaimed. On a small device the root chain then consumes enough
+blocks that nothing else fits — exactly the case the C reference guards
+with `lfs_dir_splittingcompact`'s superblock-expansion check (`do not
+expand when the filesystem is more than ~88% full`). Step 5 therefore
+needs that fullness guard (a free-block count before a root split) plus a
+redesign of the root-fill reclaim regression (`tests/review_lookahead.rs`,
+tuned for a single-pair root), not just removing the `pair_addr !=
+self.root` guard. It is the subtlest case, as this ADR anticipated, and is
+deferred to its own focused increment.
+
+**A degraded-split fallback was required (`lfs-cvh`, post-`.4`).** Because
+`compute_split_index` targets half a block, any compaction of a pair
+holding more than half a block of live entries wants to split — and a pair
+fills past half a block through in-place appends, so a removal or update
+that triggers a compaction wants to split even though the remaining
+entries still fit one block. On a full device that split cannot allocate a
+continuation. Returning `OutOfRange` there wedged the filesystem: a user
+could neither add nor remove files at capacity. The fix mirrors the C
+reference's "unable to split" path: when a split is wanted but cannot
+proceed (the reachable-pair budget is reached, or no free pair is
+available), the compaction degrades to a single-block commit; only a
+genuine over-one-block overflow still returns `OutOfRange`. The
+reachable-pair budget guard (above) folds into the same fallback.
+Pinned by `tests/dir_split_degraded.rs`.
 
 ## Related
 

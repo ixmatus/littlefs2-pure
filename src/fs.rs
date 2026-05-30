@@ -2827,8 +2827,10 @@ impl<S: Storage> Fs<S> {
         // its prior `Error::OutOfRange` behavior via the normal path.
         // The compacted live set exceeds half a block, so a split would
         // distribute it. Splitting is skipped for the root pair `{0, 1}`
-        // (it cannot relocate and needs the superblock-expansion guard;
-        // lfs-cvh.5), and degrades gracefully when it cannot proceed.
+        // (it cannot relocate, and growing it permanently dedicates blocks
+        // to a continuation chain that cannot be reclaimed, so it needs the
+        // superblock-expansion fullness guard; lfs-cvh.5), and degrades
+        // gracefully when it cannot proceed.
         let total = count + usize::from(op_adds_entry(op));
         let split = compute_split_index::<S>(slots, count, op, 0, total);
         let mut do_split = split > 0 && pair_addr != self.root;
