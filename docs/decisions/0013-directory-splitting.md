@@ -1,8 +1,9 @@
 # ADR-0013: write-side directory splitting (HardTail continuation pairs)
 
-- **Status**: accepted; implemented for subdirectories (`lfs-cvh.1`..`.4`).
-  Root growth (`lfs-cvh.5`) and HardTail-chain relocation (`lfs-cvh.6`)
-  follow.
+- **Status**: accepted; **implemented** (`lfs-cvh.1`..`.6`, plus the
+  allocator splice-correctness fix `lfs-fvw` it surfaced). Subdirectory
+  and root growth, continuation-pair relocation, the degraded-split
+  fallback, and the reachable-pair budget all landed.
 - **Date**: 2026-05-29 (design); revised 2026-05-30 (implementation notes)
 
 ## Context
@@ -155,42 +156,37 @@ splitting. Lifting `MAX_QUEUED_PAIRS` from a hard limit (the Consequences
 above) is thus still future work and gated on the stack budget (ADR-0006),
 not delivered by splitting alone.
 
-**The root is excluded until `lfs-cvh.5`, and step 5 needs a fullness
-guard.** The split branch skips the root pair `{0, 1}`: it cannot relocate,
-so a root overflow keeps its prior `OutOfRange` behavior. Enabling the
-generic split for the root works correctly in isolation (the superblock
-entry at id 0 stays in the lower half, `{0, 1}` remains the mount anchor
-with a HardTail to the continuation, every entry reads back and the image
-remounts), but a root continuation chain is *permanent*: unlike a freed
-subdirectory, the root cannot be un-split, so its continuation blocks are
-never reclaimed. On a small device the root chain then consumes enough
-blocks that nothing else fits — exactly the case the C reference guards
-with `lfs_dir_splittingcompact`'s superblock-expansion check (`do not
-expand when the filesystem is more than ~88% full`). Step 5 therefore
-needs that fullness guard (a free-block count before a root split) plus a
-redesign of the root-fill reclaim regression (`tests/review_lookahead.rs`,
-tuned for a single-pair root), not just removing the `pair_addr !=
-self.root` guard.
+**Root growth (`lfs-cvh.5`) landed with a fullness guard, once the
+allocator was fixed.** The root pair `{0, 1}` now splits like any other
+directory: the superblock entry at id 0 stays in the lower half, `{0, 1}`
+remains the mount anchor with a HardTail to the continuation, every entry
+reads back, the image remounts, and the C reference reads a crate-written
+split root (`roundtrip_split_root`). A root continuation chain is
+*permanent* (the root cannot be un-split, so its blocks are never
+reclaimed), so a fullness guard mirroring the C reference's
+`lfs_dir_splittingcompact` check refuses a root split once free space drops
+below an eighth of the device, degrading to a single-block compaction.
 
-The deeper blocker, though, is the **allocator's used-block scan**
-(`lfs-fvw`). `scan_used_blocks` iterates raw `iter_tags` and marks every
+The fullness guard alone was not enough, though: the real blocker turned
+out to be the **allocator's used-block scan** (`lfs-fvw`).
+`scan_used_blocks` iterated raw `iter_tags` and marked every
 `CtzStruct`/`DirStruct` chain, including entries a later Create/Delete
-splice removed but whose struct tag is still physically present — a delete
-or struct-update that appended rather than compacted. This is benign for
+splice removed but whose struct tag was still physically present — a delete
+or struct-update that appended rather than compacted. This was benign for
 single-pair directories (they fill and compact, erasing the stale tags),
 but a split directory keeps its pairs at half a block, so a delete has
 room to append a Delete tag instead of compacting, and the freed entry's
-`CtzStruct` chain stays over-marked until that pair next compacts. Under
+`CtzStruct` chain stayed over-marked until that pair next compacted. Under
 heavy delete churn on a near-full split directory the over-marked blocks
-are not reclaimed in time and a recreate fails with `OutOfRange` even
-though space was freed. The fullness guard does not address this; the fix
-is to make the scan splice-correct (mark only live entries' chains, as
-`gather_live_slots` does). It is crash-safe — the scan reflects the
-durable state on every mount and the in-memory freeing never persists — but
-it is a core allocator change whose under-marking failure mode is a
-double-allocation, so it warrants its own carefully-verified increment
-(`lfs-fvw`) and gates step 5. This is the subtlest case, as this ADR
-anticipated, and is deferred.
+were not reclaimed in time and a recreate failed with `OutOfRange` even
+though space was freed. The fix made the scan splice-correct (mark only
+live entries' chains, as `gather_live_slots` does). It is crash-safe — the
+scan reflects the durable state on every mount and the in-memory freeing
+never persists — and is the two-buffer scan only; the single-buffer scan
+keeps its strictly-more-conservative over-approximation, so the two never
+disagree in a way that frees a still-used block. With `lfs-fvw` landed, the
+root-fill reclaim regression (`tests/review_lookahead.rs`) passes with root
+splitting on. This was the subtlest case, as this ADR anticipated.
 
 **A degraded-split fallback was required (`lfs-cvh`, post-`.4`).** Because
 `compute_split_index` targets half a block, any compaction of a pair
