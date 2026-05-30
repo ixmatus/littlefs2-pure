@@ -75,6 +75,12 @@ const _: () = assert!(
 /// reuses the existing chain blocks in place.
 const MAX_CTZ_WRITE_BLOCKS: usize = 256;
 
+/// Maximum distinct bad blocks a single CTZ write will relocate past
+/// before giving up with [`Error::Io`]. A worn block is excluded from the
+/// write's allocation and the chain is rebuilt; this bounds the retries so
+/// a wholly-failing device terminates rather than looping.
+const MAX_BAD_BLOCK_RETRIES: usize = 8;
+
 /// Cycle-safe walker for a HardTail chain, in O(1) memory and with no
 /// arbitrary length cap (Brent's algorithm).
 ///
@@ -1147,6 +1153,45 @@ impl<S: Storage> Fs<S> {
         self.write_ctz_to_pair(self.root, name, content, buf_a, buf_b)
     }
 
+    /// Build the CTZ chain blocks for `content` into the physical blocks
+    /// in `chain`: for each block write its skip pointers and content
+    /// slice, then erase + program it. On the first block whose erase or
+    /// program fails (a worn/bad block), returns `Err(phys)` with that
+    /// block's physical address so the caller can exclude it and rebuild
+    /// past it. `chain.len()` is the block count.
+    fn try_build_ctz_chain(
+        &mut self,
+        chain: &[BlockAddress],
+        content: &[u8],
+        buf_a: &mut [u8],
+    ) -> Result<(), u32> {
+        use crate::ctz::skip_pointers_in_block;
+        let mut content_off = 0usize;
+        for (i, block) in chain.iter().enumerate() {
+            let i32 = i as u32;
+            let header = 4 * skip_pointers_in_block(i32) as usize;
+            for b in buf_a.iter_mut() {
+                *b = 0xFF;
+            }
+            let pointer_count = skip_pointers_in_block(i32) as usize;
+            for k in 0..pointer_count {
+                let target_idx = i - (1 << k);
+                let target_phys = chain[target_idx].as_u32();
+                let off = 4 * k;
+                buf_a[off..off + 4].copy_from_slice(&target_phys.to_le_bytes());
+            }
+            let block_capacity = S::BLOCK_SIZE - header;
+            let take = block_capacity.min(content.len() - content_off);
+            buf_a[header..header + take].copy_from_slice(&content[content_off..content_off + take]);
+            content_off += take;
+
+            let phys = block.as_u32();
+            self.storage.erase(phys).map_err(|_| phys)?;
+            self.storage.program(phys, 0, &buf_a[..S::BLOCK_SIZE]).map_err(|_| phys)?;
+        }
+        Ok(())
+    }
+
     /// Internal: write a CTZ-backed file to the given metadata pair.
     fn write_ctz_to_pair(
         &mut self,
@@ -1156,7 +1201,7 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
-        use crate::ctz::{block_count, skip_pointers_in_block};
+        use crate::ctz::block_count;
 
         if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
             return Err(Error::GeometryMismatch);
@@ -1195,47 +1240,40 @@ impl<S: Storage> Fs<S> {
             return Err(Error::OutOfRange);
         }
 
-        // Allocate physical blocks for the chain.
+        // Allocate and build the chain, relocating past any block whose
+        // erase/program fails (a worn/bad block). The C reference handles
+        // bad blocks on demand rather than with a persistent bad-block
+        // list, so a failed block is simply excluded from this write's
+        // allocation and the chain is rebuilt; the block stays free and is
+        // re-relocated if a later write hits it again. Bounded retries
+        // guard against a wholly-bad device.
         let mut chain = [BlockAddress::NONE; MAX_CTZ_WRITE_BLOCKS];
-        crate::alloc::alloc_blocks_cached(
-            &mut self.storage,
-            self.root,
-            &mut self.used_cache,
-            &[],
-            None,
-            &mut chain[..total_blocks],
-            buf_a,
-            buf_b,
-        )?;
-
-        // Build each chain block in `buf_a`, erase + program it.
-        let mut content_off = 0usize;
-        for i in 0..total_blocks {
-            let i32 = i as u32;
-            let header = 4 * skip_pointers_in_block(i32) as usize;
-            // Fill block with 0xFF (erased state).
-            for b in buf_a.iter_mut() {
-                *b = 0xFF;
+        let mut excluded = [BlockAddress::NONE; MAX_BAD_BLOCK_RETRIES];
+        let mut ex_len = 0usize;
+        loop {
+            crate::alloc::alloc_blocks_cached(
+                &mut self.storage,
+                self.root,
+                &mut self.used_cache,
+                &excluded[..ex_len],
+                None,
+                &mut chain[..total_blocks],
+                buf_a,
+                buf_b,
+            )?;
+            match self.try_build_ctz_chain(&chain[..total_blocks], content, buf_a) {
+                Ok(()) => break,
+                Err(bad_phys) => {
+                    if ex_len >= MAX_BAD_BLOCK_RETRIES {
+                        return Err(Error::Io);
+                    }
+                    // Exclude the bad block and re-scan so it is not handed
+                    // back, then rebuild the whole chain.
+                    excluded[ex_len] = BlockAddress::new(bad_phys);
+                    ex_len += 1;
+                    self.used_cache = None;
+                }
             }
-            // Skip pointers: block i has ctz(i)+1 pointers addressing
-            // blocks i - 2^k for k = 0..=ctz(i). Each pointer is the
-            // physical address of that chain index.
-            let pointer_count = skip_pointers_in_block(i32) as usize;
-            for k in 0..pointer_count {
-                let target_idx = i - (1 << k);
-                let target_phys = chain[target_idx].as_u32();
-                let off = 4 * k;
-                buf_a[off..off + 4].copy_from_slice(&target_phys.to_le_bytes());
-            }
-            // Content slice.
-            let block_capacity = S::BLOCK_SIZE - header;
-            let take = block_capacity.min(content.len() - content_off);
-            buf_a[header..header + take].copy_from_slice(&content[content_off..content_off + take]);
-            content_off += take;
-
-            let phys = chain[i].as_u32();
-            self.storage.erase(phys).map_err(|_| Error::Io)?;
-            self.storage.program(phys, 0, &buf_a[..S::BLOCK_SIZE]).map_err(|_| Error::Io)?;
         }
         self.storage.sync().map_err(|_| Error::Io)?;
 
