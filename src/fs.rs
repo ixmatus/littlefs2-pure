@@ -1864,48 +1864,78 @@ impl<S: Storage> Fs<S> {
             // an O(n) chain collect; the walk happens only on a rescan.
             let exclude_chain =
                 if n_old > 0 { Some((ctz.head_block.as_u32(), old_size)) } else { None };
-            let mut new_blocks = [BlockAddress::NONE; MAX_CTZ_WRITE_BLOCKS];
-            crate::alloc::alloc_blocks_cached(
-                &mut self.storage,
-                self.root,
-                &mut self.used_cache,
-                &[],
-                exclude_chain,
-                &mut new_blocks[..new_count],
-                buf_a,
-                buf_b,
-            )?;
-
             let remaining = &data[data_consumed..];
-            let mut content_off = 0usize;
-            for new_i in n_old..new_n {
-                let header_bytes = 4 * skip_pointers_in_block(new_i) as usize;
-                for b in buf_a.iter_mut() {
-                    *b = 0xFF;
-                }
-                let ptr_count = skip_pointers_in_block(new_i) as usize;
-                for k in 0..ptr_count {
-                    let target_idx = (new_i as usize).checked_sub(1 << k).ok_or(Error::Corrupt)?;
-                    let target_phys = if target_idx >= n_old as usize {
-                        new_blocks[target_idx - n_old as usize].as_u32()
-                    } else {
-                        seek_block(&mut self.storage, ctz.head_block, n_old - 1, target_idx as u32)?
-                            .as_u32()
-                    };
-                    let off = 4 * k;
-                    buf_a[off..off + 4].copy_from_slice(&target_phys.to_le_bytes());
-                }
-                let block_capacity = S::BLOCK_SIZE - header_bytes;
-                let take = block_capacity.min(remaining.len() - content_off);
-                buf_a[header_bytes..header_bytes + take]
-                    .copy_from_slice(&remaining[content_off..content_off + take]);
-                content_off += take;
 
-                let phys = new_blocks[(new_i - n_old) as usize].as_u32();
-                self.storage.erase(phys).map_err(|_| Error::Io)?;
-                self.storage.program(phys, 0, &buf_a[..S::BLOCK_SIZE]).map_err(|_| Error::Io)?;
+            // Bad-block retry. A worn overflow block (its erase or program
+            // returns `Err`) is excluded and the whole new-block set
+            // re-allocated and rewritten, mirroring the initial-write
+            // path's `try_build_ctz_chain`. Re-allocation changes the new
+            // blocks' addresses, so the skip pointers among them are
+            // rebuilt each attempt; the existing chain (and the tail bytes
+            // already packed in step 1) are untouched. Bounded by
+            // `MAX_BAD_BLOCK_RETRIES` (lfs-23f).
+            let mut excluded = [BlockAddress::NONE; MAX_BAD_BLOCK_RETRIES];
+            let mut ex_len = 0usize;
+            'retry: loop {
+                let mut new_blocks = [BlockAddress::NONE; MAX_CTZ_WRITE_BLOCKS];
+                crate::alloc::alloc_blocks_cached(
+                    &mut self.storage,
+                    self.root,
+                    &mut self.used_cache,
+                    &excluded[..ex_len],
+                    exclude_chain,
+                    &mut new_blocks[..new_count],
+                    buf_a,
+                    buf_b,
+                )?;
+
+                let mut content_off = 0usize;
+                for new_i in n_old..new_n {
+                    let header_bytes = 4 * skip_pointers_in_block(new_i) as usize;
+                    for b in buf_a.iter_mut() {
+                        *b = 0xFF;
+                    }
+                    let ptr_count = skip_pointers_in_block(new_i) as usize;
+                    for k in 0..ptr_count {
+                        let target_idx =
+                            (new_i as usize).checked_sub(1 << k).ok_or(Error::Corrupt)?;
+                        let target_phys = if target_idx >= n_old as usize {
+                            new_blocks[target_idx - n_old as usize].as_u32()
+                        } else {
+                            seek_block(
+                                &mut self.storage,
+                                ctz.head_block,
+                                n_old - 1,
+                                target_idx as u32,
+                            )?
+                            .as_u32()
+                        };
+                        let off = 4 * k;
+                        buf_a[off..off + 4].copy_from_slice(&target_phys.to_le_bytes());
+                    }
+                    let block_capacity = S::BLOCK_SIZE - header_bytes;
+                    let take = block_capacity.min(remaining.len() - content_off);
+                    buf_a[header_bytes..header_bytes + take]
+                        .copy_from_slice(&remaining[content_off..content_off + take]);
+                    content_off += take;
+
+                    let phys = new_blocks[(new_i - n_old) as usize].as_u32();
+                    if self.storage.erase(phys).is_err()
+                        || self.storage.program(phys, 0, &buf_a[..S::BLOCK_SIZE]).is_err()
+                    {
+                        // Worn block: exclude it and rebuild the new set.
+                        if ex_len >= MAX_BAD_BLOCK_RETRIES {
+                            return Err(Error::Io);
+                        }
+                        excluded[ex_len] = BlockAddress::new(phys);
+                        ex_len += 1;
+                        self.used_cache = None;
+                        continue 'retry;
+                    }
+                }
+                head_phys = new_blocks[new_count - 1].as_u32();
+                break;
             }
-            head_phys = new_blocks[new_count - 1].as_u32();
         }
 
         self.storage.sync().map_err(|_| Error::Io)?;

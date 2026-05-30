@@ -92,6 +92,37 @@ fn write_survives_a_bad_block_via_relocation() {
     assert!(out.iter().all(|&x| x == 0xAA));
 }
 
+/// A worn block hit while a CTZ *append* allocates an overflow block is
+/// relocated past, not fatal. Exercises `stream_ctz_extend` (the append /
+/// `File`-write new-block path), distinct from the initial-write path
+/// above.
+#[test]
+fn append_survives_a_bad_block_via_relocation() {
+    // A 200-byte initial file is a one-block CTZ (above INLINE_MAX = 128),
+    // so the append takes the streaming `stream_ctz_extend` path rather
+    // than re-writing inline. The append overflows into freshly allocated
+    // blocks; the first the allocator hands out is block 3, marked worn.
+    let mut storage = BadBlockDev::new(3);
+    let mut sb = buf();
+    Fs::format(&mut storage, &mut sb).unwrap();
+    let mut ba = buf();
+    let mut bb = buf();
+    let mut fs = Fs::mount(storage, &mut ba, &mut bb).unwrap();
+    let mut a = buf();
+    let mut b = buf();
+    let mut scratch = [0u8; 1024];
+
+    fs.write_to_path(Path::new("/f").unwrap(), &[0x11; 200], &mut a, &mut b).unwrap();
+    fs.append_to_path(Path::new("/f").unwrap(), &[0x22; 500], &mut scratch, &mut a, &mut b)
+        .expect("append should survive a worn overflow block via relocation");
+
+    let mut out = [0u8; 700];
+    let n = fs.read_at_path(Path::new("/f").unwrap(), 0, &mut out, &mut a, &mut b).unwrap();
+    assert_eq!(n, 700);
+    assert!(out[..200].iter().all(|&x| x == 0x11), "original bytes intact");
+    assert!(out[200..].iter().all(|&x| x == 0x22), "appended bytes intact");
+}
+
 /// Storage with several designated worn blocks.
 struct MultiBadDev {
     data: Vec<u8>,
