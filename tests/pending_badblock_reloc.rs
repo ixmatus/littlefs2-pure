@@ -313,3 +313,101 @@ fn too_many_bad_blocks_is_bounded_io() {
     let r = fs.write_to_path(Path::new("/f").unwrap(), &[0xAA; 300], &mut a, &mut b);
     assert!(matches!(r, Err(Error::Io | Error::OutOfRange)), "got {r:?}");
 }
+
+/// Device whose `program` fails on one designated block only for writes at a
+/// non-zero offset, modelling a block worn out for in-place appends but
+/// still accepting a full (offset-zero) compaction write. Reads and erases
+/// always work.
+struct AppendFailDev {
+    data: Vec<u8>,
+    bad: u32,
+}
+impl AppendFailDev {
+    fn new(bad: u32) -> Self {
+        Self {
+            data: vec![0xFFu8; BadBlockDev::BLOCK_SIZE * BadBlockDev::BLOCK_COUNT as usize],
+            bad,
+        }
+    }
+}
+impl Storage for AppendFailDev {
+    type Error = ();
+    const READ_SIZE: usize = 16;
+    const PROG_SIZE: usize = 16;
+    const BLOCK_SIZE: usize = BadBlockDev::BLOCK_SIZE;
+    const BLOCK_COUNT: u32 = BadBlockDev::BLOCK_COUNT;
+    const CACHE_SIZE: usize = 64;
+    const LOOKAHEAD_SIZE: usize = 8;
+    fn read(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), ()> {
+        let s = (block as usize) * Self::BLOCK_SIZE + off as usize;
+        let e = s.checked_add(buf.len()).ok_or(())?;
+        if block >= Self::BLOCK_COUNT || e > self.data.len() {
+            return Err(());
+        }
+        buf.copy_from_slice(&self.data[s..e]);
+        Ok(())
+    }
+    fn program(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), ()> {
+        if block == self.bad && off != 0 {
+            return Err(()); // worn for in-place appends, fine for a fresh compaction
+        }
+        let s = (block as usize) * Self::BLOCK_SIZE + off as usize;
+        let e = s.checked_add(data.len()).ok_or(())?;
+        if block >= Self::BLOCK_COUNT || e > self.data.len() {
+            return Err(());
+        }
+        self.data[s..e].copy_from_slice(data);
+        Ok(())
+    }
+    fn erase(&mut self, block: u32) -> Result<(), ()> {
+        if block >= Self::BLOCK_COUNT {
+            return Err(());
+        }
+        let s = (block as usize) * Self::BLOCK_SIZE;
+        self.data[s..s + Self::BLOCK_SIZE].fill(0xFF);
+        Ok(())
+    }
+}
+
+/// Sub-case 2: an in-place append hits a worn *active* block. The append
+/// must not be fatal; the commit falls back to a relocating compaction that
+/// rebuilds the readable active block's live set onto a fresh block and
+/// evicts the worn block (eager eviction). `mkdir /d` lands at `{2,3}` with
+/// block 2 the active half; marking block 2 worn-for-appends makes the first
+/// in-place append to `/d` fail and fall back.
+#[test]
+fn append_fallback_survives_worn_active() {
+    let mut storage = AppendFailDev::new(2);
+    let mut sb = buf();
+    Fs::format(&mut storage, &mut sb).unwrap();
+    let mut ba = buf();
+    let mut bb = buf();
+    let mut fs = Fs::mount(storage, &mut ba, &mut bb).unwrap();
+    let mut a = buf();
+    let mut b = buf();
+    // mkdir writes block 2's init commit at offset 0 (allowed) and appends
+    // /d's entry to the root at a non-zero offset on block 0 (allowed).
+    fs.mkdir(Path::new("/d").unwrap(), &mut a, &mut b).unwrap();
+
+    // The first write appends f00 to block 2 at a non-zero offset, which
+    // fails; the fallback relocates /d off the worn block. Subsequent writes
+    // land on the relocated (good) active half.
+    let n = 6usize;
+    for i in 0..n {
+        let name = format!("/d/f{i:02}");
+        fs.write_to_path(Path::new(&name).unwrap(), b"y", &mut a, &mut b)
+            .unwrap_or_else(|e| panic!("entry {i} should survive the worn active block: {e:?}"));
+    }
+
+    let check = |fs: &mut Fs<AppendFailDev>, a: &mut [u8], b: &mut [u8]| {
+        let mut seen = 0usize;
+        fs.list_dir(Path::new("/d").unwrap(), |_e| seen += 1, a, b).unwrap();
+        assert_eq!(seen, n, "all entries survive the append-fallback relocation");
+    };
+    check(&mut fs, &mut a, &mut b);
+    let storage = fs.into_storage();
+    let mut ba = buf();
+    let mut bb = buf();
+    let mut fs = Fs::mount(storage, &mut ba, &mut bb).unwrap();
+    check(&mut fs, &mut a, &mut b);
+}

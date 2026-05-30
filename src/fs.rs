@@ -2731,6 +2731,7 @@ impl<S: Storage> Fs<S> {
             && committed_end % S::PROG_SIZE == 0
             && committed_end + dsize <= S::BLOCK_SIZE
             && !clear_tail;
+        let mut did_append = false;
         if can_append {
             let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
             let new_end = {
@@ -2777,14 +2778,23 @@ impl<S: Storage> Fs<S> {
                 commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
                 commit.bytes_written()
             };
-            self.storage
+            // A failed in-place append means the active block is worn for
+            // writes. Do not give up: fall through to the compact path, which
+            // only reads the active block and rebuilds its live set elsewhere
+            // (eagerly onto a fresh block, evicting the worn active — see the
+            // `forced_victim` branch in `compact_and_program`). The live
+            // entries `slots` reference sit below `committed_end`, which the
+            // append never overwrites, so they stay valid for the compaction.
+            did_append = self
+                .storage
                 .program(
                     active_addr.as_u32(),
                     committed_end as u32,
                     &active_buf[committed_end..new_end],
                 )
-                .map_err(|_| Error::Io)?;
-        } else {
+                .is_ok();
+        }
+        if !did_append {
             let new_revision = old_revision.wrapping_add(1);
             let mut net_ms = pair_existing_ms;
             if let Some(extra) = extra_move_state {
@@ -2808,6 +2818,10 @@ impl<S: Storage> Fs<S> {
             } else {
                 Some(net_rs)
             };
+            // When the append above failed, the active block is worn:
+            // instruct the compaction to eagerly relocate the pair, evicting
+            // the active block onto a fresh one. Otherwise a normal compaction.
+            let forced_victim = if can_append { Some(active_addr) } else { None };
             let relocated = self.compact_and_program(
                 pair_addr,
                 active_addr,
@@ -2821,6 +2835,7 @@ impl<S: Storage> Fs<S> {
                 rs_arg,
                 effective_tail,
                 inflight,
+                forced_victim,
                 buf_a,
                 buf_b,
             )?;
@@ -2867,9 +2882,44 @@ impl<S: Storage> Fs<S> {
         rs_arg: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
         tail: Option<(BlockPair, bool)>,
         inflight: &[BlockAddress],
+        forced_victim: Option<BlockAddress>,
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<Option<BlockPair>, Error> {
+        let total = count + usize::from(op_adds_entry(op));
+
+        // `forced_victim` is set when an in-place append failed on a worn
+        // active block: eagerly relocate the pair onto a fresh block,
+        // rebuilding the (readable) active block's live set there and dropping
+        // the worn block, exactly like the alternate-worn pivot but evicting
+        // the active half. A single pair's live set always fits one block (it
+        // splits at half-block during growth), so no split is needed. The
+        // root pair is the fixed superblock anchor and cannot relocate.
+        if let Some(victim) = forced_victim {
+            if pair_addr == self.root {
+                return Err(Error::Io);
+            }
+            let new_pair = self.relocate_compact_to_fresh(
+                pair_addr,
+                victim,
+                active_is_a,
+                new_revision,
+                slots,
+                count,
+                op,
+                0,
+                total,
+                ms_arg,
+                rs_arg,
+                tail,
+                inflight,
+                None,
+                buf_a,
+                buf_b,
+            )?;
+            return Ok(Some(new_pair));
+        }
+
         // Would the compacted pair overflow the block? If so, split it
         // across a HardTail continuation instead of erroring. The split
         // index is computed from the live-entry sizes without any read.
@@ -2885,7 +2935,6 @@ impl<S: Storage> Fs<S> {
         // keeps its address) — but with an extra fullness guard below,
         // because a root continuation chain cannot be reclaimed. Splitting
         // degrades gracefully when it cannot proceed.
-        let total = count + usize::from(op_adds_entry(op));
         let split = compute_split_index::<S>(slots, count, op, 0, total);
         let mut do_split = split > 0;
         if do_split {
