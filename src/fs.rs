@@ -688,6 +688,75 @@ fn accumulate_gstate<S: Storage>(
     Ok(gstate)
 }
 
+/// BFS the directory tree from `root`, following only live
+/// (splice-correct) `DirStruct` children and `HardTail` continuations,
+/// and collect every reachable metadata pair into `out`. Returns the
+/// count.
+///
+/// This is the *tree*, deliberately distinct from the global metadata
+/// thread: `SoftTail` links (the global list) are NOT followed, so a pair
+/// reachable only via the thread (a crash-orphaned half-removed directory)
+/// is absent from the result. The mount-time deorphan sweep uses that
+/// distinction. `HardTail` continuations ARE part of the tree (the same
+/// directory's entries continue there), so they are followed; the live
+/// `DirStruct` view (not raw `iter_tags`) ensures a directory whose entry
+/// has already been deleted is not counted as live.
+fn collect_live_tree_pairs<S: Storage>(
+    storage: &mut S,
+    root: BlockPair,
+    out: &mut [BlockPair; crate::alloc::MAX_QUEUED_PAIRS],
+    buf_a: &mut [u8],
+    buf_b: &mut [u8],
+) -> Result<usize, Error> {
+    out[0] = root;
+    let mut tail = 1usize;
+    let mut head = 0usize;
+    while head < tail {
+        let pair_addr = out[head];
+        head += 1;
+        storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
+        let active_is_a = pair.active_block == pair_addr.a;
+        // A HardTail continues this directory's own pair chain (part of
+        // the tree); a SoftTail is the global list (not the tree).
+        if pair.reader.is_hard_tail() {
+            if let Some(cont) = pair.reader.tail() {
+                if pair_in_bounds::<S>(cont) && !out[..tail].contains(&cont) {
+                    if tail >= crate::alloc::MAX_QUEUED_PAIRS {
+                        return Err(Error::OutOfRange);
+                    }
+                    out[tail] = cont;
+                    tail += 1;
+                }
+            }
+        }
+        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+        let count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
+        let source_buf: &[u8] = if active_is_a { &*buf_a } else { &*buf_b };
+        for slot in slots.iter().take(count) {
+            if slot.struct_kind == 2 && slot.struct_len == 8 {
+                let start = slot.struct_off as usize;
+                let body = &source_buf[start..start + 8];
+                let a = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let b = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
+                if !pair_in_bounds::<S>(child) {
+                    return Err(Error::Corrupt);
+                }
+                if !out[..tail].contains(&child) {
+                    if tail >= crate::alloc::MAX_QUEUED_PAIRS {
+                        return Err(Error::OutOfRange);
+                    }
+                    out[tail] = child;
+                    tail += 1;
+                }
+            }
+        }
+    }
+    Ok(tail)
+}
+
 /// Scan a metadata pair's committed tag stream for `MoveState` tags
 /// and XOR-accumulate their bodies into a single 12-byte body. The
 /// pair's contribution to the filesystem-global gstate is whatever
@@ -846,12 +915,13 @@ fn find_thread_predecessor<S: Storage>(
 /// whose `DirStruct` entry must be flipped to the new pair address
 /// after a child pair migrates to fresh blocks.
 ///
-/// Only `DirStruct` references are matched. Pairs reached via
-/// `HardTail` / `SoftTail` continuations are walked (so the BFS
-/// covers the full reachable forest) but are not themselves
-/// candidates: this writer never emits tail tags during compaction,
-/// so any relocated pair has its predecessor's `DirStruct` to
-/// update, not a tail tag.
+/// Only `DirStruct` references are matched: this finds the *tree*
+/// parent whose entry must be flipped to the new address. The relocated
+/// pair's *thread* predecessor (whose tail also references it) is found
+/// separately by [`find_thread_predecessor`] and updated by
+/// `propagate_relocation`. Pairs reached via `HardTail` / `SoftTail`
+/// continuations are walked (so the BFS covers the full reachable
+/// forest) but are not themselves DirStruct candidates.
 ///
 /// Bounded at [`crate::alloc::MAX_QUEUED_PAIRS`] visited pairs, the
 /// same budget as the allocator's BFS. Deeper trees return
@@ -3307,7 +3377,90 @@ impl<S: Storage> Fs<S> {
         if let Some((old_pair, new_pair)) = gstate.pending_relocation() {
             fs.recover_pending_relocation(old_pair, new_pair, block_a_buf, block_b_buf)?;
         }
+        // Deorphan sweep: drop any pair left in the global thread but not
+        // the live tree by an interrupted rmdir un-thread or
+        // sibling-predecessor relocation. A no-op on a healthy filesystem.
+        fs.deorphan_sweep(block_a_buf, block_b_buf)?;
         Ok(fs)
+    }
+
+    /// Walk the global metadata-pair thread and drop any pair that is in
+    /// the thread but not a live tree directory (a crash orphan from an
+    /// interrupted `rmdir` un-thread or sibling-predecessor relocation).
+    /// Re-points the orphan's predecessor past it so the C reference's
+    /// allocator/traverse stop following a stale link and the orphan's
+    /// blocks are reclaimed. Idempotent; a no-op when every threaded pair
+    /// is a live directory (the healthy case, including C-written images).
+    fn deorphan_sweep(&mut self, buf_a: &mut [u8], buf_b: &mut [u8]) -> Result<(), Error> {
+        let mut tree = [BlockPair::new(BlockAddress::NONE, BlockAddress::NONE);
+            crate::alloc::MAX_QUEUED_PAIRS];
+        let tree_count =
+            collect_live_tree_pairs(&mut self.storage, self.root, &mut tree, buf_a, buf_b)?;
+
+        // Track the pairs advanced through so a cyclic thread (a corrupt
+        // image) terminates the sweep without error: mount must stay
+        // cycle-safe (the resolution path rejects the cycle as Corrupt
+        // later), matching `accumulate_gstate`'s deduped walk. The `steps`
+        // backstop also breaks rather than erroring.
+        let mut cur = self.root;
+        let mut visited = [BlockPair::new(BlockAddress::NONE, BlockAddress::NONE);
+            crate::alloc::MAX_QUEUED_PAIRS];
+        visited[0] = self.root;
+        let mut visited_count = 1usize;
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            if steps > 4 * crate::alloc::MAX_QUEUED_PAIRS {
+                break;
+            }
+            self.storage.read(cur.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+            self.storage.read(cur.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            let next = {
+                let p = MetadataPair::parse(cur.a, &*buf_a, cur.b, &*buf_b)?;
+                p.reader.tail()
+            };
+            let Some(next) = next else {
+                break;
+            };
+            if tree[..tree_count].contains(&next) {
+                // A live threaded directory; advance, but stop on a cycle
+                // (leave the corrupt thread as-is for the resolution path
+                // to reject).
+                if visited[..visited_count].contains(&next) {
+                    break;
+                }
+                if visited_count < crate::alloc::MAX_QUEUED_PAIRS {
+                    visited[visited_count] = next;
+                    visited_count += 1;
+                }
+                cur = next;
+                continue;
+            }
+            // `next` is threaded but not a live tree pair: a crash orphan.
+            // Re-point `cur` past it (to the orphan's own successor, or
+            // clear if it was the list end), then re-check `cur` for
+            // consecutive orphans without advancing.
+            self.storage.read(next.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+            self.storage.read(next.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            let orphan_tail = {
+                let p = MetadataPair::parse(next.a, &*buf_a, next.b, &*buf_b)?;
+                p.reader.tail().map(|t| (t, p.reader.is_hard_tail()))
+            };
+            let new_tail = orphan_tail
+                .or(Some((BlockPair::new(BlockAddress::NONE, BlockAddress::NONE), false)));
+            self.apply_op_to_pair_inner(
+                cur,
+                &WriteOp::Noop,
+                None,
+                None,
+                new_tail,
+                &[],
+                buf_a,
+                buf_b,
+            )?;
+            self.used_cache = None; // the orphan's blocks are now free
+        }
+        Ok(())
     }
 
     /// Complete a cross-directory rename whose destination commit
