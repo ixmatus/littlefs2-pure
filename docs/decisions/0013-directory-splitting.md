@@ -170,8 +170,27 @@ expand when the filesystem is more than ~88% full`). Step 5 therefore
 needs that fullness guard (a free-block count before a root split) plus a
 redesign of the root-fill reclaim regression (`tests/review_lookahead.rs`,
 tuned for a single-pair root), not just removing the `pair_addr !=
-self.root` guard. It is the subtlest case, as this ADR anticipated, and is
-deferred to its own focused increment.
+self.root` guard.
+
+The deeper blocker, though, is the **allocator's used-block scan**
+(`lfs-fvw`). `scan_used_blocks` iterates raw `iter_tags` and marks every
+`CtzStruct`/`DirStruct` chain, including entries a later Create/Delete
+splice removed but whose struct tag is still physically present — a delete
+or struct-update that appended rather than compacted. This is benign for
+single-pair directories (they fill and compact, erasing the stale tags),
+but a split directory keeps its pairs at half a block, so a delete has
+room to append a Delete tag instead of compacting, and the freed entry's
+`CtzStruct` chain stays over-marked until that pair next compacts. Under
+heavy delete churn on a near-full split directory the over-marked blocks
+are not reclaimed in time and a recreate fails with `OutOfRange` even
+though space was freed. The fullness guard does not address this; the fix
+is to make the scan splice-correct (mark only live entries' chains, as
+`gather_live_slots` does). It is crash-safe — the scan reflects the
+durable state on every mount and the in-memory freeing never persists — but
+it is a core allocator change whose under-marking failure mode is a
+double-allocation, so it warrants its own carefully-verified increment
+(`lfs-fvw`) and gates step 5. This is the subtlest case, as this ADR
+anticipated, and is deferred.
 
 **A degraded-split fallback was required (`lfs-cvh`, post-`.4`).** Because
 `compute_split_index` targets half a block, any compaction of a pair
