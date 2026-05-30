@@ -1,6 +1,6 @@
 # ADR-0012: SoftTail global directory-list threading (design)
 
-- **Status**: proposed (design only; implementation is `lfs-xmx`, not yet landed)
+- **Status**: accepted (implemented and landed on `feature/v2-write-completeness`)
 - **Date**: 2026-05-29
 
 ## Context
