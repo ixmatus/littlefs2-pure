@@ -2095,6 +2095,28 @@ impl<S: Storage> Fs<S> {
             p.reader.tail().map(|t| (t, p.reader.is_hard_tail()))
         };
 
+        // Reachable-pair budget. The mount-time walks (allocator scan,
+        // gstate accumulation, deorphan) enumerate the forest into fixed
+        // `MAX_QUEUED_PAIRS` arrays (ADR-0006), so a forest larger than the
+        // budget is unmountable. mkdir adds the new directory pair, and the
+        // `CreateDir` commit may split the parent's last pair into a
+        // continuation — up to two new reachable pairs, and neither the new
+        // dir (not yet referenced) nor the split (its own check sees the
+        // pre-split tree) accounts for the other. Reserve two slots here,
+        // else the writer could produce an image its own mount cannot read
+        // (lfs-43o, the mkdir analogue of the split-path guard).
+        // `collect_live_tree_pairs` clobbers both buffers, but `parent_tail`
+        // is already captured and the allocation re-reads what it needs.
+        {
+            let mut tree = [BlockPair::new(BlockAddress::NONE, BlockAddress::NONE);
+                crate::alloc::MAX_QUEUED_PAIRS];
+            let reachable =
+                collect_live_tree_pairs(&mut self.storage, self.root, &mut tree, buf_a, buf_b)?;
+            if reachable + 2 > crate::alloc::MAX_QUEUED_PAIRS {
+                return Err(Error::OutOfRange);
+            }
+        }
+
         // Allocate two blocks for the new directory's metadata pair.
         let mut new_blocks = [BlockAddress::NONE; 2];
         crate::alloc::alloc_blocks_cached(
