@@ -177,6 +177,49 @@ impl Storage for MultiBadDev {
     }
 }
 
+/// Sub-case 1 in isolation: a worn block hit by a *plain compaction* (the
+/// live set still fits one block, so no split). After `mkdir /d` at `{2,3}`
+/// with block 3 (the alternate) worn, six entries overflow block 2 once: the
+/// sixth write compacts the pair, and the compaction's write lands on the
+/// worn alternate. The pair must relocate onto a fresh block. Smaller and
+/// split-free, so it pins the plain-compact relocation path on its own
+/// before the full reproducer exercises the split path too.
+#[test]
+fn metadata_plain_compact_survives_worn_alternate() {
+    let mut storage = BadBlockDev::new(3);
+    let mut sb = buf();
+    Fs::format(&mut storage, &mut sb).unwrap();
+    let mut ba = buf();
+    let mut bb = buf();
+    let mut fs = Fs::mount(storage, &mut ba, &mut bb).unwrap();
+    let mut a = buf();
+    let mut b = buf();
+    fs.mkdir(Path::new("/d").unwrap(), &mut a, &mut b).unwrap();
+
+    // Six entries: five append into block 2, the sixth overflows and
+    // compacts onto the worn alternate (block 3), which must relocate. Six
+    // keeps the live set under half a block, so the kernel compacts rather
+    // than splits.
+    let n = 6usize;
+    for i in 0..n {
+        let name = format!("/d/f{i:02}");
+        fs.write_to_path(Path::new(&name).unwrap(), b"x", &mut a, &mut b)
+            .unwrap_or_else(|e| panic!("entry {i} should survive the worn alternate: {e:?}"));
+    }
+
+    let check = |fs: &mut Fs<BadBlockDev>, a: &mut [u8], b: &mut [u8]| {
+        let mut seen = 0usize;
+        fs.list_dir(Path::new("/d").unwrap(), |_e| seen += 1, a, b).unwrap();
+        assert_eq!(seen, n, "all entries survive the plain-compact relocation");
+    };
+    check(&mut fs, &mut a, &mut b);
+    let storage = fs.into_storage();
+    let mut ba = buf();
+    let mut bb = buf();
+    let mut fs = Fs::mount(storage, &mut ba, &mut bb).unwrap();
+    check(&mut fs, &mut a, &mut b);
+}
+
 /// A worn block hit while a metadata pair *commits* (compacts onto its
 /// alternate, or splits onto it) should be relocated past: the pair
 /// migrates to a fresh block, the parent's `DirStruct` is updated, and the
