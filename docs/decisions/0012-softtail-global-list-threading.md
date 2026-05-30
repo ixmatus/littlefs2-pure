@@ -139,6 +139,33 @@ not corrupted, but C traverse would follow the stale link, defeating the
 threading. Relocation happens during ordinary writes, so this is not
 deferrable to the `rmdir` slice. Step 2 was reverted; step 1 remains.
 
+**Progress (2026-05-29, continued).** The steady-state feature landed and
+is green across the full suite (power-loss + relocation crash tests
+included), conformance, and round-trip, in three further increments:
+mkdir threading; `find_thread_predecessor` + relocation thread-update (the
+predecessor-tail update folds atomically into the parent's DirStruct
+commit when the predecessor is the parent, the common case); and `rmdir`
+un-threading with a tail-clear capability (a NONE-sentinel `new_tail`
+forces a compaction so the rebuilt block drops the sticky tail tag).
+Pinned by `tests/pending_softtail.rs`
+(`directories_are_threaded_into_the_global_list`,
+`mkdir_rmdir_churn_reclaims_blocks`).
+
+What remains is the **mount-time deorphan sweep** for the crash windows
+(`rmdir`'s two-pair un-thread; the sibling-predecessor relocation case). A
+crash there leaves a pair in the thread but not the tree. Analysis: this
+is a recoverable **space leak, not corruption** — both the crate's and the
+C reference's allocators over-approximate by following the thread, so the
+orphan's blocks are marked used (never reused) until reclaimed. Deorphan
+reclaims them by walking the thread and dropping any threaded pair absent
+from the **live, splice-correct** tree set (latest-wins `DirStruct`
+reachability, modelled on `accumulate_gstate`, *not* raw `iter_tags`: a
+crashed `rmdir` has already deleted the parent's `DirStruct`, so an
+over-approximating tree walk would miss the orphan). The sweep is
+idempotent and re-runnable, so it needs no orphan-count gstate gate for
+correctness (only for the efficiency of skipping it on healthy mounts).
+A torn-`rmdir` power-loss test pins it.
+
 Consequence: the **thread-predecessor maintenance machinery**
 (`lfs_fs_pred`-style walk to find the pair whose tail references a given
 pair, plus a thread-update commit, plus the crash-window recovery for the
