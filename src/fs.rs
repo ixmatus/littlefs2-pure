@@ -833,6 +833,120 @@ fn op_dsize_of(op: &WriteOp<'_>) -> usize {
     }
 }
 
+/// Bytes a compacting split reserves in each pair beyond the live
+/// entries: the tail tag (`4 + 2*4 = 12`), the gstate tags
+/// (`4 + 3*4 = 16`), a move-delete tag (`4`), and the CCRC (`4 + 4 = 8`),
+/// totalling 40. Matches the C reference's `lfs_dir_splittingcompact`
+/// (lfs.c, "space is complicated").
+// `allow(dead_code)`: the split mechanism that consumes these helpers
+// lands in the next increment (lfs-cvh.3); the pure split-point math and
+// its unit tests land here first. Removed when `compact_and_program`
+// wires the split branch in.
+#[allow(dead_code)]
+const SPLIT_RESERVE: usize = 40;
+
+/// Wire size of the live entries in the combined-sequence range
+/// `[lo, hi)` exactly as [`build_compact_commit`] would emit them, plus
+/// the virtual new entry (combined index `count`) when it falls in the
+/// range for a Create-family op. Excludes the revision header, gstate,
+/// tail, and CCRC — those are covered by [`SPLIT_RESERVE`].
+///
+/// This MUST mirror `build_compact_commit`'s per-entry emission so the
+/// split-point estimate matches the bytes the compactor actually writes;
+/// the two are edited together. Per entry: a `Create` tag (4) + a NAME
+/// tag (`4 + name_len`) + a STRUCT tag (`4 + struct_len`). An `Update`
+/// substitutes the struct body length; `UpdateCtz` / `UpdateDirStruct`
+/// substitute 8; `RenameInPlace` adds a second NAME tag; `Remove` drops
+/// its target.
+#[allow(dead_code)] // wired into the split branch in lfs-cvh.3
+fn compact_range_size(
+    slots: &[SlotOffsets; MAX_LIVE_ENTRIES],
+    count: usize,
+    op: &WriteOp<'_>,
+    lo: usize,
+    hi: usize,
+) -> usize {
+    let mut size = 0usize;
+    let hi_slots = hi.min(count);
+    for (i, s) in slots.iter().enumerate().take(hi_slots).skip(lo) {
+        // Remove drops its target entirely (matches the compactor's skip).
+        if let WriteOp::Remove { id } = *op {
+            if i as u16 == id {
+                continue;
+            }
+        }
+        // Create tag (4) + NAME tag (4 + name_len), always emitted.
+        let mut entry = 4 + (4 + s.name_len as usize);
+        // RenameInPlace emits a second NAME (the new name) before STRUCT.
+        if let WriteOp::RenameInPlace { id, new_name, .. } = *op {
+            if i as u16 == id {
+                entry += 4 + new_name.len();
+            }
+        }
+        // STRUCT body: substituted for an Update-family target, else the
+        // source slot's own struct length.
+        let struct_len = match *op {
+            WriteOp::Update { id, content } if i as u16 == id => content.len(),
+            WriteOp::UpdateCtz { id, .. } if i as u16 == id => 8,
+            WriteOp::UpdateDirStruct { id, .. } if i as u16 == id => 8,
+            _ => s.struct_len as usize,
+        };
+        entry += 4 + struct_len;
+        size += entry;
+    }
+    // The appended new entry lands at combined index `count` for a
+    // Create-family op (the highest index, so always the upper half).
+    if lo <= count
+        && count < hi
+        && matches!(
+            *op,
+            WriteOp::Create { .. } | WriteOp::CreateCtz { .. } | WriteOp::CreateDir { .. }
+        )
+    {
+        size += op_dsize_of(op) - 8;
+    }
+    size
+}
+
+/// Pick the split index over the combined-sequence range `[begin, end)`,
+/// mirroring the C reference's `lfs_dir_splittingcompact` inner loop: the
+/// upper portion `[split, end)` is shrunk (by increasing `split`) until it
+/// fits the per-pair budget — capped at half a block (prog-aligned) to
+/// avoid degenerate nearly-full pairs, and reserving [`SPLIT_RESERVE`]
+/// bytes for the tail, gstate, move-delete, and CCRC.
+///
+/// This is a monotone shrink, not a binary search: `split` only
+/// increases, bounding the loop to ~log2 iterations and matching the
+/// oracle's metadata distribution (which matters for byte-equal
+/// conformance once split directories are emitted). The `< 0xff` guard is
+/// the oracle's id-fits-in-a-byte cap on entries per pair.
+///
+/// Returns `begin` when the whole range already fits (no split needed);
+/// otherwise the index where the upper portion `[split, end)` moves to a
+/// continuation pair and the lower portion `[begin, split)` stays.
+#[allow(dead_code)] // wired into the split branch in lfs-cvh.3
+fn compute_split_index<S: Storage>(
+    slots: &[SlotOffsets; MAX_LIVE_ENTRIES],
+    count: usize,
+    op: &WriteOp<'_>,
+    begin: usize,
+    end: usize,
+) -> usize {
+    let budget = core::cmp::min(
+        S::BLOCK_SIZE.saturating_sub(SPLIT_RESERVE),
+        (S::BLOCK_SIZE / 2).next_multiple_of(S::PROG_SIZE),
+    );
+    let mut split = begin;
+    while end - split > 1 {
+        let size = compact_range_size(slots, count, op, split, end);
+        if (end - split) < 0xff && size <= budget {
+            break;
+        }
+        split += (end - split) / 2;
+    }
+    split
+}
+
 /// `true` if every byte of `buf` is `0xFF`. This is the erased state
 /// for NOR / NAND flash; both blocks of the root metadata pair in
 /// this condition means the device has never been formatted (versus
@@ -3883,5 +3997,141 @@ impl<S: Storage> Fs<S> {
         self.storage.read(addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
         self.storage.read(addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
         MetadataPair::parse(addr.a, buf_a, addr.b, buf_b)
+    }
+}
+
+#[cfg(test)]
+mod split_point_tests {
+    //! Unit tests for the pure split-point math (`compact_range_size`,
+    //! `compute_split_index`). These run with no I/O: a zero-sized
+    //! `Storage` impl supplies only the `BLOCK_SIZE` / `PROG_SIZE`
+    //! geometry the budget reads. Geometry matches `tests/pending_dir_split.rs`
+    //! (256-byte blocks, 16-byte prog), the reproduce-first target.
+
+    use super::{compact_range_size, compute_split_index, SlotOffsets, WriteOp, MAX_LIVE_ENTRIES};
+    use crate::storage::Storage;
+
+    struct Dev256;
+    impl Storage for Dev256 {
+        type Error = ();
+        const READ_SIZE: usize = 16;
+        const PROG_SIZE: usize = 16;
+        const BLOCK_SIZE: usize = 256;
+        const BLOCK_COUNT: u32 = 64;
+        const CACHE_SIZE: usize = 64;
+        const LOOKAHEAD_SIZE: usize = 8;
+        fn read(&mut self, _: u32, _: u32, _: &mut [u8]) -> Result<(), ()> {
+            unreachable!("split-point math performs no I/O")
+        }
+        fn program(&mut self, _: u32, _: u32, _: &[u8]) -> Result<(), ()> {
+            unreachable!("split-point math performs no I/O")
+        }
+        fn erase(&mut self, _: u32) -> Result<(), ()> {
+            unreachable!("split-point math performs no I/O")
+        }
+    }
+
+    /// A live regular-file slot with the given NAME and STRUCT byte
+    /// lengths (offsets are irrelevant to the size math).
+    fn slot(name_len: u16, struct_len: u16) -> SlotOffsets {
+        SlotOffsets {
+            name_off: 0,
+            name_len,
+            name_kind: 0, // RegularFile
+            struct_off: 0,
+            struct_len,
+            struct_kind: 0, // InlineStruct
+        }
+    }
+
+    fn filled(n: usize, name_len: u16, struct_len: u16) -> [SlotOffsets; MAX_LIVE_ENTRIES] {
+        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+        for s in slots.iter_mut().take(n) {
+            *s = slot(name_len, struct_len);
+        }
+        slots
+    }
+
+    // The 256/16 budget: min(256 - 40, alignup(128, 16)) = min(216, 128) = 128.
+    const BUDGET: usize = 128;
+
+    #[test]
+    fn budget_matches_oracle_geometry() {
+        // Empty range fits trivially; confirm the budget the split obeys
+        // by probing a single oversized entry that must not be split off
+        // alone (end - split == 1 stops the loop).
+        let slots = filled(1, 200, 200);
+        // A 2-entry combined sequence whose single existing slot is huge:
+        // the loop can split at most down to one entry per side.
+        let n = compute_split_index::<Dev256>(&slots, 1, &WriteOp::Noop, 0, 1);
+        assert_eq!(n, 0, "a single-entry range never splits");
+    }
+
+    #[test]
+    fn range_size_create_family() {
+        // name "fNNN" = 4 bytes, inline content "x" = 1 byte.
+        let slots = filled(3, 4, 1);
+        let op = WriteOp::Create { id: 3, name: b"f003", content: b"x" };
+        // Each live slot: 12 + 4 + 1 = 17. New entry (op_dsize_of - 8):
+        // 4 + (4+4) + (4+1) = 17. Range [0,4) over count=3 includes all
+        // three live slots plus the virtual new entry.
+        assert_eq!(compact_range_size(&slots, 3, &op, 0, 4), 3 * 17 + 17);
+        // Upper sub-range [2,4): one live slot + the new entry.
+        assert_eq!(compact_range_size(&slots, 3, &op, 2, 4), 17 + 17);
+        // The new entry is excluded from a lower range that stops before
+        // its index.
+        assert_eq!(compact_range_size(&slots, 3, &op, 0, 3), 3 * 17);
+    }
+
+    #[test]
+    fn small_directory_does_not_split() {
+        // 3 entries plus a create = 68 bytes < 128 budget: no split.
+        let slots = filled(3, 4, 1);
+        let op = WriteOp::Create { id: 3, name: b"f003", content: b"x" };
+        assert_eq!(compute_split_index::<Dev256>(&slots, 3, &op, 0, 4), 0);
+    }
+
+    #[test]
+    fn overflowing_directory_splits_at_half() {
+        // 11 existing 17-byte entries + a 12th (create) = 204 bytes > 128.
+        // Inner loop: split 0 -> 6 (upper [6,12) = 5*17 + 17 = 102 <= 128).
+        let slots = filled(11, 4, 1);
+        let op = WriteOp::Create { id: 11, name: b"f011", content: b"x" };
+        let split = compute_split_index::<Dev256>(&slots, 11, &op, 0, 12);
+        assert_eq!(split, 6);
+        // Both halves must fit the budget after the chosen split.
+        assert!(compact_range_size(&slots, 11, &op, 0, split) <= BUDGET);
+        assert!(compact_range_size(&slots, 11, &op, split, 12) <= BUDGET);
+    }
+
+    #[test]
+    fn remove_target_costs_nothing_in_range() {
+        let slots = filled(4, 4, 1);
+        let op = WriteOp::Remove { id: 1 };
+        // Four 17-byte slots, one removed -> three remain: 51 bytes.
+        assert_eq!(compact_range_size(&slots, 4, &op, 0, 4), 3 * 17);
+    }
+
+    #[test]
+    fn rename_in_place_counts_both_names() {
+        let slots = filled(2, 4, 1);
+        let op = WriteOp::RenameInPlace {
+            id: 0,
+            name_type: crate::tag::TagType::RegularFile,
+            new_name: b"renamed-longer",
+        };
+        // Slot 0 carries Create(4) + NAME(4+4) + NAME(4+14) + STRUCT(4+1)
+        // = 35; slot 1 is a plain 17-byte entry.
+        assert_eq!(compact_range_size(&slots, 2, &op, 0, 2), 35 + 17);
+    }
+
+    #[test]
+    fn cascade_subrange_reuses_begin() {
+        // Emulate the cascade's second pass over a shrunk lower range:
+        // begin stays 0, end is the prior split. A range that now fits
+        // returns begin (no further split).
+        let slots = filled(6, 4, 1);
+        // 6 * 17 = 102 <= 128: the lower half fits, no further split.
+        assert_eq!(compute_split_index::<Dev256>(&slots, 6, &WriteOp::Noop, 0, 6), 0);
     }
 }
