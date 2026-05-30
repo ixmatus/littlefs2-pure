@@ -124,6 +124,35 @@ no orphan window); (3) the orphan-count gstate + mount-time deorphan; (4)
 regression test; (6) confirm rename needs no change. Each step
 reproduce-first and conformance/round-trip gated.
 
+**Revision after attempting step 2 (2026-05-29).** Step 1 (tail emission
++ compaction preservation) landed as a verified no-op. Attempting step 2
+(`mkdir` threading) in isolation surfaced a coupling the original order
+missed: **wear-levelling relocation also breaks the thread.** When a
+threaded directory pair relocates, its address changes; the relocation
+updates the parent's `DirStruct` (via `propagate_relocation` /
+`UpdateDirStruct`) but **not** the thread predecessor's tail, so that
+predecessor's `SoftTail` is left pointing at the stale old pair. The
+existing `tests/wear_leveling.rs::relocation_xor_aggregate_zeros_on_success`
+caught this (the stale link makes the gstate walk double-count a
+`RelocateState` body). The crate's own allocator over-approximates and is
+not corrupted, but C traverse would follow the stale link, defeating the
+threading. Relocation happens during ordinary writes, so this is not
+deferrable to the `rmdir` slice. Step 2 was reverted; step 1 remains.
+
+Consequence: the **thread-predecessor maintenance machinery**
+(`lfs_fs_pred`-style walk to find the pair whose tail references a given
+pair, plus a thread-update commit, plus the crash-window recovery for the
+separate-pair update) is a **prerequisite shared by relocation and
+`rmdir`**, not a later step. The revised order is: (1) tail infra
+[done]; (2) the predecessor walk + the orphan/relocation crash-window
+recovery (the orphan-count gstate + mount-time deorphan, generalized to
+cover a stale thread link from a relocated *or* removed pair); (3)
+relocation thread-update wired into `propagate_relocation`; (4) `mkdir`
+threading; (5) `rmdir` un-threading; (6) the C traverse regression test;
+(7) confirm rename. Threading cannot be enabled (step 4) until the
+predecessor maintenance (steps 2 and 3) exists, because every write can
+trigger a relocation.
+
 ## Related
 
 - `tests/pending_softtail.rs`: the crate-side reproduce-first target.
