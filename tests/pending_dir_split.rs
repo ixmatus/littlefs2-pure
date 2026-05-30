@@ -89,18 +89,18 @@ fn fill_subdir_until_full() -> usize {
 
 #[test]
 fn confirm_overflow_is_the_current_limit() {
-    // Today the directory caps at one pair: a bounded number of entries,
-    // then OutOfRange. This documents the gap lfs-cvh closes.
+    // With HardTail splitting (lfs-cvh) a directory grows across
+    // continuation pairs, so it is no longer capped at one pair. Overflow
+    // is now device-bound: continuation pairs consume free blocks until
+    // this 64-block device is exhausted, at which point the allocator
+    // returns OutOfRange. The bound still falls below the 200-entry probe
+    // ceiling, so this documents that a finite device still terminates.
     let n = fill_subdir_until_full();
     assert!(n >= 1, "should fit at least one entry");
-    assert!(
-        n < 200,
-        "without HardTail splitting the directory must overflow before 200 entries (got {n})",
-    );
+    assert!(n < 200, "a 64-block device must run out of blocks before 200 entries (got {n})");
 }
 
 #[test]
-#[ignore = "target for lfs-cvh: remove ignore when write-side directory splitting lands"]
 fn directory_grows_past_one_pair_via_split() {
     // After splitting lands, a directory holds far more entries than one
     // metadata pair can, and every entry reads back.

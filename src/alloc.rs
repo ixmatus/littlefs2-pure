@@ -83,9 +83,135 @@ impl Bitmap {
     }
 }
 
+/// One live entry's block-bearing struct after Create/Delete splice
+/// renumbering (latest-wins per id). `InlineStruct` entries carry no
+/// separate blocks and are recorded as `None`.
+#[derive(Clone, Copy)]
+struct LiveStruct {
+    /// `0` = none/inline (no blocks), `1` = CtzStruct, `2` = DirStruct.
+    kind: u8,
+    /// CtzStruct `head_block` or DirStruct block `a`.
+    w0: u32,
+    /// CtzStruct `size` or DirStruct block `b`.
+    w1: u32,
+}
+
+impl LiveStruct {
+    const NONE: Self = Self { kind: 0, w0: 0, w1: 0 };
+}
+
+/// Collect a metadata block's live entry structs, splice-correct.
+///
+/// Replays `Create` / `Delete` renumbering exactly as
+/// `fs::gather_live_slots` does, so a `CtzStruct` or `DirStruct` left
+/// behind by an entry that a later splice removed (a delete or
+/// struct-update that appended rather than compacted) is **not** reported.
+/// This is what keeps the allocator from over-marking a deleted file's CTZ
+/// chain as in-use: a split directory holds its pairs at half a block, so
+/// such deletes append rather than compact, and a raw tag scan would mark
+/// the freed chain until the pair next compacts. The pair's tail tag is
+/// not an entry and is handled by the caller (latest-wins via
+/// `reader.tail()`).
+///
+/// Crash-safe: the reader reflects the active block's durable committed
+/// state, and the allocator's marking is in-memory only, so a torn commit
+/// that mount rejects simply re-scans the prior durable state.
+fn gather_live_structs(
+    reader: &crate::meta::MetadataReader<'_>,
+    out: &mut [LiveStruct; crate::dir::MAX_LIVE_ENTRIES],
+) -> Result<usize, Error> {
+    use crate::tag::TagType;
+    let max = crate::dir::MAX_LIVE_ENTRIES;
+    let mut count = 0usize;
+    for entry in reader.iter_tags() {
+        let tag = entry.tag;
+        let id = tag.id() as usize;
+        match tag.tag_type() {
+            TagType::Create => {
+                if count >= max {
+                    return Err(Error::OutOfRange);
+                }
+                if id > count {
+                    return Err(Error::Corrupt);
+                }
+                let mut i = count;
+                while i > id {
+                    out[i] = out[i - 1];
+                    i -= 1;
+                }
+                out[id] = LiveStruct::NONE;
+                count += 1;
+            }
+            TagType::Delete => {
+                if id >= count {
+                    return Err(Error::Corrupt);
+                }
+                let mut i = id;
+                while i + 1 < count {
+                    out[i] = out[i + 1];
+                    i += 1;
+                }
+                out[count - 1] = LiveStruct::NONE;
+                count -= 1;
+            }
+            TagType::RegularFile | TagType::Directory | TagType::Superblock => {
+                // The NAME labels an existing slot, extends the live set by
+                // one when it names the next id, or is corrupt past that.
+                if id == count && count < max {
+                    out[id] = LiveStruct::NONE;
+                    count += 1;
+                } else if id >= count {
+                    return Err(Error::Corrupt);
+                }
+                // The NAME itself bears no blocks.
+            }
+            TagType::CtzStruct if id < count && entry.body.len() == 8 => {
+                out[id] = LiveStruct {
+                    kind: 1,
+                    w0: u32::from_le_bytes([
+                        entry.body[0],
+                        entry.body[1],
+                        entry.body[2],
+                        entry.body[3],
+                    ]),
+                    w1: u32::from_le_bytes([
+                        entry.body[4],
+                        entry.body[5],
+                        entry.body[6],
+                        entry.body[7],
+                    ]),
+                };
+            }
+            TagType::DirStruct if id < count && entry.body.len() == 8 => {
+                out[id] = LiveStruct {
+                    kind: 2,
+                    w0: u32::from_le_bytes([
+                        entry.body[0],
+                        entry.body[1],
+                        entry.body[2],
+                        entry.body[3],
+                    ]),
+                    w1: u32::from_le_bytes([
+                        entry.body[4],
+                        entry.body[5],
+                        entry.body[6],
+                        entry.body[7],
+                    ]),
+                };
+            }
+            // InlineStruct (incl. the superblock geometry) bears no
+            // separate blocks; nothing to record.
+            _ => {}
+        }
+    }
+    Ok(count)
+}
+
 /// Walk the filesystem from `root` and mark every reachable block in
-/// `used`. Visits each metadata pair once; follows DirStruct and Tail
-/// references into other pairs; walks each CTZ chain.
+/// `used`. Visits each metadata pair once; follows live `DirStruct`
+/// children and the pair's tail into other pairs; walks each live CTZ
+/// chain. Splice-correct (see [`gather_live_structs`]): a deleted entry's
+/// stale struct tag is not followed, so freed blocks are reclaimable.
 ///
 /// `buf_a` and `buf_b` are scratch buffers of `S::BLOCK_SIZE` each;
 /// they are reused for every pair read.
@@ -107,6 +233,8 @@ pub fn scan_used_blocks<S: Storage>(
     queue[0] = root;
     let mut tail = 1usize;
     let mut head = 0usize;
+    // Per-pair live-entry scratch, reused across pairs to bound the stack.
+    let mut live = [LiveStruct::NONE; crate::dir::MAX_LIVE_ENTRIES];
 
     while head < tail {
         let pair = queue[head];
@@ -116,74 +244,54 @@ pub fn scan_used_blocks<S: Storage>(
         used.set(pair.a.as_u32())?;
         used.set(pair.b.as_u32())?;
 
-        // Read both blocks and parse.
+        // Read both blocks and parse the active one. Collect the splice-
+        // correct live entry structs and the latest tail before the parse
+        // borrow ends, so the CTZ-chain storage reads below can proceed.
         storage.read(pair.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
         storage.read(pair.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        let parsed = MetadataPair::parse(pair.a, &*buf_a, pair.b, &*buf_b)?;
+        let (count, next_tail) = {
+            let parsed = MetadataPair::parse(pair.a, &*buf_a, pair.b, &*buf_b)?;
+            let n = gather_live_structs(&parsed.reader, &mut live)?;
+            (n, parsed.reader.tail())
+        };
 
-        // Walk tags, enqueueing referenced pairs and marking CTZ blocks.
-        // We need to drop the iterator borrow before we can read storage
-        // for CTZ walks, so collect references first.
         let mut child_pairs: [BlockPair; MAX_QUEUED_PAIRS] =
             [BlockPair::new(BlockAddress::NONE, BlockAddress::NONE); MAX_QUEUED_PAIRS];
         let mut child_count = 0usize;
-        let mut ctz_chains: [(u32, u32); MAX_QUEUED_PAIRS] = [(0, 0); MAX_QUEUED_PAIRS];
-        let mut ctz_count = 0usize;
 
-        for entry in parsed.reader.iter_tags() {
-            match entry.tag.tag_type() {
-                TagType::DirStruct | TagType::HardTail | TagType::SoftTail
-                    if entry.body.len() == 8 =>
-                {
-                    let a = u32::from_le_bytes([
-                        entry.body[0],
-                        entry.body[1],
-                        entry.body[2],
-                        entry.body[3],
-                    ]);
-                    let b = u32::from_le_bytes([
-                        entry.body[4],
-                        entry.body[5],
-                        entry.body[6],
-                        entry.body[7],
-                    ]);
-                    // Skip pairs already marked (visited or about-to-be).
-                    if !used.is_set(a) || !used.is_set(b) {
+        // Walk each live CTZ chain; enqueue each live DirStruct child.
+        for ls in &live[..count] {
+            match ls.kind {
+                1 => walk_ctz_chain(storage, ls.w0, ls.w1, used)?,
+                2 => {
+                    let child = BlockPair::new(BlockAddress::new(ls.w0), BlockAddress::new(ls.w1));
+                    // Skip pairs already marked (visited) or in-flight.
+                    if (!used.is_set(child.a.as_u32()) || !used.is_set(child.b.as_u32()))
+                        && !child_pairs[..child_count].contains(&child)
+                    {
                         if child_count >= MAX_QUEUED_PAIRS {
                             return Err(Error::OutOfRange);
                         }
-                        child_pairs[child_count] =
-                            BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
+                        child_pairs[child_count] = child;
                         child_count += 1;
                     }
-                }
-                TagType::CtzStruct if entry.body.len() == 8 => {
-                    let head_block = u32::from_le_bytes([
-                        entry.body[0],
-                        entry.body[1],
-                        entry.body[2],
-                        entry.body[3],
-                    ]);
-                    let size = u32::from_le_bytes([
-                        entry.body[4],
-                        entry.body[5],
-                        entry.body[6],
-                        entry.body[7],
-                    ]);
-                    if ctz_count >= MAX_QUEUED_PAIRS {
-                        return Err(Error::OutOfRange);
-                    }
-                    ctz_chains[ctz_count] = (head_block, size);
-                    ctz_count += 1;
                 }
                 _ => {}
             }
         }
-        let _ = parsed; // pair borrow ends here; iter_tags is finished
-
-        // Walk CTZ chains (storage reads, so the pair borrow must be done).
-        for &(head_block, size) in &ctz_chains[..ctz_count] {
-            walk_ctz_chain(storage, head_block, size, used)?;
+        // Follow the pair's tail (a HardTail continuation of this directory
+        // or a SoftTail to the next directory in the global thread). The
+        // tail is not an entry; `reader.tail()` is latest-wins.
+        if let Some(t) = next_tail {
+            if (!used.is_set(t.a.as_u32()) || !used.is_set(t.b.as_u32()))
+                && !child_pairs[..child_count].contains(&t)
+            {
+                if child_count >= MAX_QUEUED_PAIRS {
+                    return Err(Error::OutOfRange);
+                }
+                child_pairs[child_count] = t;
+                child_count += 1;
+            }
         }
 
         // Enqueue child pairs for BFS.
