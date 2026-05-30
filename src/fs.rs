@@ -405,6 +405,7 @@ fn build_compact_commit(
     block_size: usize,
     move_state: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
     relocate_state: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
+    tail: Option<(BlockPair, bool)>,
 ) -> Result<usize, Error> {
     use crate::tag::TagType;
 
@@ -575,6 +576,18 @@ fn build_compact_commit(
                 &body,
             )?;
         }
+    }
+    // Re-emit the pair's tail tag. Compaction rebuilds the block from
+    // live entries, so without this the metadata-pair global thread link
+    // (SoftTail = next directory in the filesystem list, HardTail = this
+    // directory's continuation) would be silently dropped. `None` means
+    // the pair has no tail (the common case until threading lands).
+    if let Some((pair, is_hard)) = tail {
+        let mut body = [0u8; 8];
+        body[0..4].copy_from_slice(&pair.a.as_u32().to_le_bytes());
+        body[4..8].copy_from_slice(&pair.b.as_u32().to_le_bytes());
+        let tag_type = if is_hard { TagType::HardTail } else { TagType::SoftTail };
+        commit.tag(crate::tag::Tag::new(true, tag_type, crate::tag::ID_NONE, 8), &body)?;
     }
     commit.finish_padded(0, prog_size, block_size)?;
     Ok(commit.bytes_written())
@@ -1146,6 +1159,7 @@ impl<S: Storage> Fs<S> {
         self.apply_op_to_pair_inner(
             pair_addr,
             &op,
+            None,
             None,
             None,
             &chain[..total_blocks],
@@ -1811,7 +1825,7 @@ impl<S: Storage> Fs<S> {
             return Err(Error::OutOfRange);
         }
         let op = WriteOp::CreateDir { id: new_id, name: dir_name_bytes, dir_pair: new_dir };
-        self.apply_op_to_pair_inner(parent, &op, None, None, &new_blocks, buf_a, buf_b)
+        self.apply_op_to_pair_inner(parent, &op, None, None, None, &new_blocks, buf_a, buf_b)
     }
 
     /// Write or update a file at `path` (path-based variant of
@@ -2252,7 +2266,7 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
-        self.apply_op_to_pair_inner(pair_addr, op, extra_move_state, None, &[], buf_a, buf_b)
+        self.apply_op_to_pair_inner(pair_addr, op, extra_move_state, None, None, &[], buf_a, buf_b)
     }
 
     /// Inner form of [`Self::apply_op_to_pair_with_movestate`] that
@@ -2268,6 +2282,7 @@ impl<S: Storage> Fs<S> {
         op: &WriteOp<'_>,
         extra_move_state: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
         extra_relocate_state: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
+        new_tail: Option<(BlockPair, bool)>,
         inflight: &[BlockAddress],
         buf_a: &mut [u8],
         buf_b: &mut [u8],
@@ -2286,6 +2301,7 @@ impl<S: Storage> Fs<S> {
         let count: usize;
         let pair_existing_ms: [u8; crate::gstate::MOVE_STATE_BODY_SIZE];
         let pair_existing_rs: [u8; crate::gstate::RELOCATE_STATE_BODY_SIZE];
+        let current_tail: Option<(BlockPair, bool)>;
         {
             let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
             active_addr = pair.active_block;
@@ -2297,14 +2313,24 @@ impl<S: Storage> Fs<S> {
             active_erased = pair.reader.erased();
             pair_existing_ms = scan_pair_move_state(&pair);
             pair_existing_rs = scan_pair_relocate_state(&pair);
+            current_tail = pair.reader.tail().map(|t| (t, pair.reader.is_hard_tail()));
             count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
         }
+        // The effective tail for this commit: an explicit `new_tail`
+        // override (mkdir threading, rmdir un-threading) wins; otherwise
+        // preserve whatever the pair already threads. Compaction must
+        // re-emit it; an in-place append keeps the existing tail tag and
+        // only emits when the tail actually changes.
+        let effective_tail = new_tail.or(current_tail);
 
         let extra_ms_dsize =
             extra_move_state.map_or(0, |_| 4 + crate::gstate::MOVE_STATE_BODY_SIZE);
         let extra_rs_dsize =
             extra_relocate_state.map_or(0, |_| 4 + crate::gstate::RELOCATE_STATE_BODY_SIZE);
-        let dsize = op_dsize_of(op) + extra_ms_dsize + extra_rs_dsize;
+        // A tail change on the append path emits one 4-byte tag + 8-byte
+        // pair body; reserve that so `can_append` does not overflow.
+        let extra_tail_dsize = new_tail.map_or(0, |_| 4 + 8);
+        let dsize = op_dsize_of(op) + extra_ms_dsize + extra_rs_dsize + extra_tail_dsize;
         // Append in place only when the active block reports its next
         // window as erased (the FCRC matched the on-disk bytes) and that
         // window is prog-aligned. A non-erased window means a torn write
@@ -2341,6 +2367,21 @@ impl<S: Storage> Fs<S> {
                         ),
                         &body,
                     )?;
+                }
+                // Only an explicit tail change needs emitting on the
+                // append path; the pair's prior tail tag persists in the
+                // block (latest-wins) when `new_tail` is None.
+                if let Some((tail_pair, is_hard)) = new_tail {
+                    let mut body = [0u8; 8];
+                    body[0..4].copy_from_slice(&tail_pair.a.as_u32().to_le_bytes());
+                    body[4..8].copy_from_slice(&tail_pair.b.as_u32().to_le_bytes());
+                    let tag_type = if is_hard {
+                        crate::tag::TagType::HardTail
+                    } else {
+                        crate::tag::TagType::SoftTail
+                    };
+                    commit
+                        .tag(crate::tag::Tag::new(true, tag_type, crate::tag::ID_NONE, 8), &body)?;
                 }
                 commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
                 commit.bytes_written()
@@ -2387,6 +2428,7 @@ impl<S: Storage> Fs<S> {
                 op,
                 ms_arg,
                 rs_arg,
+                effective_tail,
                 inflight,
                 buf_a,
                 buf_b,
@@ -2432,6 +2474,7 @@ impl<S: Storage> Fs<S> {
         op: &WriteOp<'_>,
         ms_arg: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
         rs_arg: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
+        tail: Option<(BlockPair, bool)>,
         inflight: &[BlockAddress],
         buf_a: &mut [u8],
         buf_b: &mut [u8],
@@ -2523,6 +2566,7 @@ impl<S: Storage> Fs<S> {
                 S::BLOCK_SIZE,
                 ms_arg,
                 combined_rs,
+                tail,
             )?
         } else {
             build_compact_commit(
@@ -2536,6 +2580,7 @@ impl<S: Storage> Fs<S> {
                 S::BLOCK_SIZE,
                 ms_arg,
                 combined_rs,
+                tail,
             )?
         };
 
@@ -2608,6 +2653,7 @@ impl<S: Storage> Fs<S> {
             &op,
             None,
             Some(relocate_body),
+            None,
             &next_inflight[..next_len],
             buf_a,
             buf_b,
@@ -3175,6 +3221,7 @@ impl<S: Storage> Fs<S> {
             &WriteOp::Noop,
             None,
             Some(balance),
+            None,
             &[],
             buf_a,
             buf_b,
