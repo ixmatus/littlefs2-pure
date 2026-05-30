@@ -422,6 +422,8 @@ fn build_compact_commit(
     slots: &[SlotOffsets; MAX_LIVE_ENTRIES],
     count: usize,
     op: &WriteOp<'_>,
+    lo: usize,
+    hi: usize,
     prog_size: usize,
     block_size: usize,
     move_state: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
@@ -435,10 +437,15 @@ fn build_compact_commit(
     }
     let mut commit = crate::meta::Commit::new(alt_buf, new_revision)?;
 
-    // `emit_id` is the id assigned in the compacted output; it diverges
-    // from the source slot index after a Remove skip.
+    // Emit only the combined-sequence sub-range `[lo, hi)`: the live
+    // slots `slots[lo..min(hi, count)]` followed by the virtual new entry
+    // at index `count` when it falls in range. A split builds the lower
+    // half with `[0, split)` and the continuation with `[split, total)`;
+    // the prior single-pair callers pass `[0, total)`. `emit_id` restarts
+    // at 0 for every range, so a continuation's entries get local ids
+    // 0.. (the reader concatenates them across the HardTail chain).
     let mut emit_id: u16 = 0;
-    for (i, s) in slots.iter().enumerate().take(count) {
+    for (i, s) in slots.iter().enumerate().take(hi.min(count)).skip(lo) {
         if let WriteOp::Remove { id: remove_id } = *op {
             if (i as u16) == remove_id {
                 continue; // drop this entry; do not bump emit_id
@@ -528,43 +535,66 @@ fn build_compact_commit(
         emit_id += 1;
     }
 
-    // Append the new entry at id == emit_id.
-    match *op {
-        WriteOp::Create { id, name, content } => {
-            debug_assert_eq!(id, emit_id, "Create id must equal post-replay emit count");
-            commit.tag(crate::tag::Tag::new(true, TagType::Create, id, 0), &[])?;
-            commit.tag(
-                crate::tag::Tag::new(true, TagType::RegularFile, id, name.len() as u16),
-                name,
-            )?;
-            commit.tag(
-                crate::tag::Tag::new(true, TagType::InlineStruct, id, content.len() as u16),
-                content,
-            )?;
+    // Append the new entry, but only when its combined index `count`
+    // falls in `[lo, hi)`. The new entry has the highest index, so a
+    // split always places it in the upper-half continuation; the lower
+    // half emits no new entry. Its local id is `emit_id` (the entries
+    // emitted in this range), which equals the op's `id` for the
+    // single-pair `[0, total)` case the debug-assert checks.
+    if lo <= count && count < hi {
+        match *op {
+            WriteOp::Create { id, name, content } => {
+                debug_assert!(
+                    lo > 0 || id == emit_id,
+                    "single-pair Create id must equal emit count"
+                );
+                commit.tag(crate::tag::Tag::new(true, TagType::Create, emit_id, 0), &[])?;
+                commit.tag(
+                    crate::tag::Tag::new(true, TagType::RegularFile, emit_id, name.len() as u16),
+                    name,
+                )?;
+                commit.tag(
+                    crate::tag::Tag::new(
+                        true,
+                        TagType::InlineStruct,
+                        emit_id,
+                        content.len() as u16,
+                    ),
+                    content,
+                )?;
+            }
+            WriteOp::CreateCtz { id, name, head_block, total_size } => {
+                debug_assert!(
+                    lo > 0 || id == emit_id,
+                    "single-pair CreateCtz id must equal emit count"
+                );
+                commit.tag(crate::tag::Tag::new(true, TagType::Create, emit_id, 0), &[])?;
+                commit.tag(
+                    crate::tag::Tag::new(true, TagType::RegularFile, emit_id, name.len() as u16),
+                    name,
+                )?;
+                let mut body = [0u8; 8];
+                body[0..4].copy_from_slice(&head_block.to_le_bytes());
+                body[4..8].copy_from_slice(&total_size.to_le_bytes());
+                commit.tag(crate::tag::Tag::new(true, TagType::CtzStruct, emit_id, 8), &body)?;
+            }
+            WriteOp::CreateDir { id, name, dir_pair } => {
+                debug_assert!(
+                    lo > 0 || id == emit_id,
+                    "single-pair CreateDir id must equal emit count"
+                );
+                commit.tag(crate::tag::Tag::new(true, TagType::Create, emit_id, 0), &[])?;
+                commit.tag(
+                    crate::tag::Tag::new(true, TagType::Directory, emit_id, name.len() as u16),
+                    name,
+                )?;
+                let mut body = [0u8; 8];
+                body[0..4].copy_from_slice(&dir_pair.a.as_u32().to_le_bytes());
+                body[4..8].copy_from_slice(&dir_pair.b.as_u32().to_le_bytes());
+                commit.tag(crate::tag::Tag::new(true, TagType::DirStruct, emit_id, 8), &body)?;
+            }
+            _ => {}
         }
-        WriteOp::CreateCtz { id, name, head_block, total_size } => {
-            debug_assert_eq!(id, emit_id, "CreateCtz id must equal post-replay emit count");
-            commit.tag(crate::tag::Tag::new(true, TagType::Create, id, 0), &[])?;
-            commit.tag(
-                crate::tag::Tag::new(true, TagType::RegularFile, id, name.len() as u16),
-                name,
-            )?;
-            let mut body = [0u8; 8];
-            body[0..4].copy_from_slice(&head_block.to_le_bytes());
-            body[4..8].copy_from_slice(&total_size.to_le_bytes());
-            commit.tag(crate::tag::Tag::new(true, TagType::CtzStruct, id, 8), &body)?;
-        }
-        WriteOp::CreateDir { id, name, dir_pair } => {
-            debug_assert_eq!(id, emit_id, "CreateDir id must equal post-replay emit count");
-            commit.tag(crate::tag::Tag::new(true, TagType::Create, id, 0), &[])?;
-            commit
-                .tag(crate::tag::Tag::new(true, TagType::Directory, id, name.len() as u16), name)?;
-            let mut body = [0u8; 8];
-            body[0..4].copy_from_slice(&dir_pair.a.as_u32().to_le_bytes());
-            body[4..8].copy_from_slice(&dir_pair.b.as_u32().to_le_bytes());
-            commit.tag(crate::tag::Tag::new(true, TagType::DirStruct, id, 8), &body)?;
-        }
-        _ => {}
     }
     // If the caller passed a MoveState body (typically the pair's
     // pre-compaction accumulated gstate XOR any new contribution),
@@ -833,16 +863,19 @@ fn op_dsize_of(op: &WriteOp<'_>) -> usize {
     }
 }
 
+/// True when `op` adds a new entry, so the combined entry sequence has
+/// one more element (at index `count`) than the live entry count.
+/// Create-family ops append an entry; every other op transforms or
+/// removes an existing one.
+fn op_adds_entry(op: &WriteOp<'_>) -> bool {
+    matches!(op, WriteOp::Create { .. } | WriteOp::CreateCtz { .. } | WriteOp::CreateDir { .. })
+}
+
 /// Bytes a compacting split reserves in each pair beyond the live
 /// entries: the tail tag (`4 + 2*4 = 12`), the gstate tags
 /// (`4 + 3*4 = 16`), a move-delete tag (`4`), and the CCRC (`4 + 4 = 8`),
 /// totalling 40. Matches the C reference's `lfs_dir_splittingcompact`
 /// (lfs.c, "space is complicated").
-// `allow(dead_code)`: the split mechanism that consumes these helpers
-// lands in the next increment (lfs-cvh.3); the pure split-point math and
-// its unit tests land here first. Removed when `compact_and_program`
-// wires the split branch in.
-#[allow(dead_code)]
 const SPLIT_RESERVE: usize = 40;
 
 /// Wire size of the live entries in the combined-sequence range
@@ -858,7 +891,6 @@ const SPLIT_RESERVE: usize = 40;
 /// substitutes the struct body length; `UpdateCtz` / `UpdateDirStruct`
 /// substitute 8; `RenameInPlace` adds a second NAME tag; `Remove` drops
 /// its target.
-#[allow(dead_code)] // wired into the split branch in lfs-cvh.3
 fn compact_range_size(
     slots: &[SlotOffsets; MAX_LIVE_ENTRIES],
     count: usize,
@@ -896,13 +928,7 @@ fn compact_range_size(
     }
     // The appended new entry lands at combined index `count` for a
     // Create-family op (the highest index, so always the upper half).
-    if lo <= count
-        && count < hi
-        && matches!(
-            *op,
-            WriteOp::Create { .. } | WriteOp::CreateCtz { .. } | WriteOp::CreateDir { .. }
-        )
-    {
+    if lo <= count && count < hi && op_adds_entry(op) {
         size += op_dsize_of(op) - 8;
     }
     size
@@ -924,7 +950,6 @@ fn compact_range_size(
 /// Returns `begin` when the whole range already fits (no split needed);
 /// otherwise the index where the upper portion `[split, end)` moves to a
 /// continuation pair and the lower portion `[begin, split)` stays.
-#[allow(dead_code)] // wired into the split branch in lfs-cvh.3
 fn compute_split_index<S: Storage>(
     slots: &[SlotOffsets; MAX_LIVE_ENTRIES],
     count: usize,
@@ -2793,6 +2818,42 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<Option<BlockPair>, Error> {
+        // Would the compacted pair overflow the block? If so, split it
+        // across a HardTail continuation instead of erroring. The split
+        // index is computed from the live-entry sizes without any read.
+        // The root pair `{0, 1}` is excluded here: it cannot relocate and
+        // its growth needs the superblock-expansion guard, which lands in
+        // a later increment (lfs-cvh.5); until then a root overflow keeps
+        // its prior `Error::OutOfRange` behavior via the normal path.
+        let total = count + usize::from(op_adds_entry(op));
+        let split = compute_split_index::<S>(slots, count, op, 0, total);
+        if split > 0 && pair_addr != self.root {
+            // Overflow → split. Wear-levelling relocation is a hint, not a
+            // correctness requirement; defer it to the next commit rather
+            // than fold a relocation's fresh allocation and parent update
+            // into the same crash window as the split. The original keeps
+            // its address (lower half + a HardTail to the continuation),
+            // so there is nothing to propagate to the parent — `Ok(None)`.
+            self.split_directory_pair(
+                active_addr,
+                alternate_addr,
+                active_is_a,
+                new_revision,
+                slots,
+                count,
+                op,
+                split,
+                total,
+                tail,
+                ms_arg,
+                rs_arg,
+                inflight,
+                buf_a,
+                buf_b,
+            )?;
+            return Ok(None);
+        }
+
         let relocating = should_relocate(pair_addr, self.root, new_revision, S::BLOCK_CYCLES);
 
         // When relocating, allocate the fresh destination block FIRST
@@ -2868,6 +2929,8 @@ impl<S: Storage> Fs<S> {
             }
         };
 
+        // The whole live set plus the new entry fits one block (`split`
+        // was 0): compact the full combined range `[0, total)`.
         let new_end = if active_is_a {
             build_compact_commit(
                 buf_b,
@@ -2876,6 +2939,8 @@ impl<S: Storage> Fs<S> {
                 slots,
                 count,
                 op,
+                0,
+                total,
                 S::PROG_SIZE,
                 S::BLOCK_SIZE,
                 ms_arg,
@@ -2890,6 +2955,8 @@ impl<S: Storage> Fs<S> {
                 slots,
                 count,
                 op,
+                0,
+                total,
                 S::PROG_SIZE,
                 S::BLOCK_SIZE,
                 ms_arg,
@@ -2919,6 +2986,213 @@ impl<S: Storage> Fs<S> {
                 .map_err(|_| Error::Io)?;
         }
         Ok(Some(new_pair))
+    }
+
+    /// Split an overflowing directory pair across a freshly allocated
+    /// `HardTail` continuation, matching the C reference's `lfs_dir_split`.
+    /// The combined entry sequence is cut at `split` (computed by
+    /// [`compute_split_index`]): the upper portion `[split, total)` moves
+    /// to the continuation, the lower portion `[0, split)` stays in the
+    /// original pair, now ending in a `HardTail` to the continuation.
+    ///
+    /// **Ordering and crash-safety.** The continuation is allocated and
+    /// fully programmed *before* the original's lower-half commit lands.
+    /// Until that commit, the continuation is referenced by nothing (the
+    /// original's active block still holds its pre-split tags with no
+    /// HardTail), so a crash leaves it an unreferenced orphan reclaimed by
+    /// the next allocator scan — exactly the `mkdir` create window. After
+    /// the lower-half commit lands on the original's alternate (higher
+    /// revision, CCRC-valid), the directory reads as the post-split state:
+    /// the original's lower entries followed by the continuation's upper
+    /// entries (which include the new entry for a Create), concatenated by
+    /// `list_pair_chain` across the HardTail.
+    ///
+    /// **gstate** stays on the original (lower) pair; the continuation is
+    /// brand new and carries a zero contribution. The continuation
+    /// inherits the original's prior tail so the global thread (and any
+    /// further continuation) stays linked.
+    ///
+    /// This is the single-level split. Cascading (when the upper portion
+    /// itself overflows) lands in the next increment (lfs-cvh.4); here a
+    /// lower portion that still exceeds the block surfaces as the
+    /// pre-existing `Error::OutOfRange` from `build_compact_commit`.
+    #[allow(clippy::too_many_arguments)]
+    fn split_directory_pair(
+        &mut self,
+        active_addr: BlockAddress,
+        alternate_addr: BlockAddress,
+        active_is_a: bool,
+        new_revision: u32,
+        slots: &[SlotOffsets; MAX_LIVE_ENTRIES],
+        count: usize,
+        op: &WriteOp<'_>,
+        split: usize,
+        total: usize,
+        inherited_tail: Option<(BlockPair, bool)>,
+        ms_arg: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
+        rs_arg: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
+        inflight: &[BlockAddress],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        // Allocate the continuation pair (two fresh blocks) using the
+        // build buffer's single-buffer scan, so the source buffer (holding
+        // the bytes `slots` point into) is never clobbered. Exclude the
+        // pair's own blocks and any inflight blocks.
+        let mut excluded = [BlockAddress::NONE; 3 + crate::alloc::MAX_QUEUED_PAIRS];
+        excluded[0] = active_addr;
+        excluded[1] = alternate_addr;
+        let mut ex = 2;
+        for &b in inflight {
+            if ex >= excluded.len() {
+                return Err(Error::OutOfRange);
+            }
+            excluded[ex] = b;
+            ex += 1;
+        }
+        let cont = {
+            let a = if active_is_a {
+                crate::alloc::alloc_one_block_cached_single_buf(
+                    &mut self.storage,
+                    self.root,
+                    &mut self.used_cache,
+                    &excluded[..ex],
+                    buf_b,
+                )?
+            } else {
+                crate::alloc::alloc_one_block_cached_single_buf(
+                    &mut self.storage,
+                    self.root,
+                    &mut self.used_cache,
+                    &excluded[..ex],
+                    buf_a,
+                )?
+            };
+            if ex >= excluded.len() {
+                return Err(Error::OutOfRange);
+            }
+            excluded[ex] = a;
+            ex += 1;
+            let b = if active_is_a {
+                crate::alloc::alloc_one_block_cached_single_buf(
+                    &mut self.storage,
+                    self.root,
+                    &mut self.used_cache,
+                    &excluded[..ex],
+                    buf_b,
+                )?
+            } else {
+                crate::alloc::alloc_one_block_cached_single_buf(
+                    &mut self.storage,
+                    self.root,
+                    &mut self.used_cache,
+                    &excluded[..ex],
+                    buf_a,
+                )?
+            };
+            BlockPair::new(a, b)
+        };
+
+        // Build + program the continuation FIRST: the upper portion at
+        // revision 1, inheriting the original's prior tail, carrying no
+        // gstate. Block B stays erased as the continuation's alternate so
+        // a stale image there cannot masquerade as a newer revision.
+        let cont_len = if active_is_a {
+            build_compact_commit(
+                buf_b,
+                buf_a,
+                1,
+                slots,
+                count,
+                op,
+                split,
+                total,
+                S::PROG_SIZE,
+                S::BLOCK_SIZE,
+                None,
+                None,
+                inherited_tail,
+            )?
+        } else {
+            build_compact_commit(
+                buf_a,
+                buf_b,
+                1,
+                slots,
+                count,
+                op,
+                split,
+                total,
+                S::PROG_SIZE,
+                S::BLOCK_SIZE,
+                None,
+                None,
+                inherited_tail,
+            )?
+        };
+        self.storage.erase(cont.a.as_u32()).map_err(|_| Error::Io)?;
+        {
+            let build_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+            self.storage
+                .program(cont.a.as_u32(), 0, &build_buf[..cont_len])
+                .map_err(|_| Error::Io)?;
+        }
+        self.storage.erase(cont.b.as_u32()).map_err(|_| Error::Io)?;
+        // Make the continuation durable before the linearizing commit, so
+        // a reordering device cannot expose a HardTail to a not-yet-written
+        // continuation (mirrors mkdir's sync between the new dir and the
+        // parent commit).
+        self.storage.sync().map_err(|_| Error::Io)?;
+
+        // Build + program the original's alternate: the lower portion at
+        // `new_revision`, ending in a HardTail (split bit set) to the
+        // continuation, carrying the original's gstate. Programming this
+        // block (higher revision, CCRC-valid) is the split's linearization
+        // point — the moment the continuation becomes reachable.
+        let low_len = if active_is_a {
+            build_compact_commit(
+                buf_b,
+                buf_a,
+                new_revision,
+                slots,
+                count,
+                op,
+                0,
+                split,
+                S::PROG_SIZE,
+                S::BLOCK_SIZE,
+                ms_arg,
+                rs_arg,
+                Some((cont, true)),
+            )?
+        } else {
+            build_compact_commit(
+                buf_a,
+                buf_b,
+                new_revision,
+                slots,
+                count,
+                op,
+                0,
+                split,
+                S::PROG_SIZE,
+                S::BLOCK_SIZE,
+                ms_arg,
+                rs_arg,
+                Some((cont, true)),
+            )?
+        };
+        self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
+        {
+            let build_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+            self.storage
+                .program(alternate_addr.as_u32(), 0, &build_buf[..low_len])
+                .map_err(|_| Error::Io)?;
+        }
+        // A continuation born here is a new reachable pair; drop the
+        // lookahead so its blocks are not handed out again.
+        self.used_cache = None;
+        Ok(())
     }
 
     /// Propagate a pair relocation up the tree: find the parent that
