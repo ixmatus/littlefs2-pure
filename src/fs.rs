@@ -2731,6 +2731,7 @@ impl<S: Storage> Fs<S> {
             && committed_end % S::PROG_SIZE == 0
             && committed_end + dsize <= S::BLOCK_SIZE
             && !clear_tail;
+        let mut did_append = false;
         if can_append {
             let active_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
             let new_end = {
@@ -2777,14 +2778,23 @@ impl<S: Storage> Fs<S> {
                 commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
                 commit.bytes_written()
             };
-            self.storage
+            // A failed in-place append means the active block is worn for
+            // writes. Do not give up: fall through to the compact path, which
+            // only reads the active block and rebuilds its live set elsewhere
+            // (eagerly onto a fresh block, evicting the worn active — see the
+            // `forced_victim` branch in `compact_and_program`). The live
+            // entries `slots` reference sit below `committed_end`, which the
+            // append never overwrites, so they stay valid for the compaction.
+            did_append = self
+                .storage
                 .program(
                     active_addr.as_u32(),
                     committed_end as u32,
                     &active_buf[committed_end..new_end],
                 )
-                .map_err(|_| Error::Io)?;
-        } else {
+                .is_ok();
+        }
+        if !did_append {
             let new_revision = old_revision.wrapping_add(1);
             let mut net_ms = pair_existing_ms;
             if let Some(extra) = extra_move_state {
@@ -2808,6 +2818,10 @@ impl<S: Storage> Fs<S> {
             } else {
                 Some(net_rs)
             };
+            // When the append above failed, the active block is worn:
+            // instruct the compaction to eagerly relocate the pair, evicting
+            // the active block onto a fresh one. Otherwise a normal compaction.
+            let forced_victim = if can_append { Some(active_addr) } else { None };
             let relocated = self.compact_and_program(
                 pair_addr,
                 active_addr,
@@ -2821,6 +2835,7 @@ impl<S: Storage> Fs<S> {
                 rs_arg,
                 effective_tail,
                 inflight,
+                forced_victim,
                 buf_a,
                 buf_b,
             )?;
@@ -2867,9 +2882,44 @@ impl<S: Storage> Fs<S> {
         rs_arg: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
         tail: Option<(BlockPair, bool)>,
         inflight: &[BlockAddress],
+        forced_victim: Option<BlockAddress>,
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<Option<BlockPair>, Error> {
+        let total = count + usize::from(op_adds_entry(op));
+
+        // `forced_victim` is set when an in-place append failed on a worn
+        // active block: eagerly relocate the pair onto a fresh block,
+        // rebuilding the (readable) active block's live set there and dropping
+        // the worn block, exactly like the alternate-worn pivot but evicting
+        // the active half. A single pair's live set always fits one block (it
+        // splits at half-block during growth), so no split is needed. The
+        // root pair is the fixed superblock anchor and cannot relocate.
+        if let Some(victim) = forced_victim {
+            if pair_addr == self.root {
+                return Err(Error::Io);
+            }
+            let new_pair = self.relocate_compact_to_fresh(
+                pair_addr,
+                victim,
+                active_is_a,
+                new_revision,
+                slots,
+                count,
+                op,
+                0,
+                total,
+                ms_arg,
+                rs_arg,
+                tail,
+                inflight,
+                None,
+                buf_a,
+                buf_b,
+            )?;
+            return Ok(Some(new_pair));
+        }
+
         // Would the compacted pair overflow the block? If so, split it
         // across a HardTail continuation instead of erroring. The split
         // index is computed from the live-entry sizes without any read.
@@ -2885,7 +2935,6 @@ impl<S: Storage> Fs<S> {
         // keeps its address) — but with an extra fullness guard below,
         // because a root continuation chain cannot be reclaimed. Splitting
         // degrades gracefully when it cannot proceed.
-        let total = count + usize::from(op_adds_entry(op));
         let split = compute_split_index::<S>(slots, count, op, 0, total);
         let mut do_split = split > 0;
         if do_split {
@@ -2947,6 +2996,7 @@ impl<S: Storage> Fs<S> {
             // continuation allocation clobbers only the build buffer, but
             // re-read the source to be safe before the fallback.
             match self.split_directory_pair(
+                pair_addr,
                 active_addr,
                 alternate_addr,
                 active_is_a,
@@ -2963,7 +3013,10 @@ impl<S: Storage> Fs<S> {
                 buf_a,
                 buf_b,
             ) {
-                Ok(()) => return Ok(None),
+                // `Some(new_pair)` when the split had to relocate the original
+                // (its lower-half write hit a worn alternate); the caller
+                // propagates that to the parent like any pair relocation.
+                Ok(opt) => return Ok(opt),
                 Err(Error::OutOfRange) => {
                     let source_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
                     self.storage
@@ -3085,27 +3138,249 @@ impl<S: Storage> Fs<S> {
             )?
         };
 
-        self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
         let alt_bytes_len = new_end;
-        {
+        let alt_write_ok = {
             let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
-            self.storage
-                .program(alternate_addr.as_u32(), 0, &alt_buf[..alt_bytes_len])
-                .map_err(|_| Error::Io)?;
+            self.storage.erase(alternate_addr.as_u32()).is_ok()
+                && self
+                    .storage
+                    .program(alternate_addr.as_u32(), 0, &alt_buf[..alt_bytes_len])
+                    .is_ok()
+        };
+
+        if !alt_write_ok {
+            // The alternate is a worn block (sub-case 1, or a wear-scheduled
+            // relocation whose alternate happens to be worn). There is no
+            // in-place anchor to fall back on, so relocate the pair directly
+            // onto a fresh block: the new commit lands only on the fresh
+            // block (unreachable until the parent's `DirStruct` repoints at
+            // it), so a crash before that repoint mounts as the pre-commit
+            // state (the good active half out-revisions the blank/worn
+            // alternate) and the fresh block is reclaimed as an orphan. The
+            // root pair `{0, 1}` is the fixed superblock anchor and cannot
+            // relocate, so a worn root commit stays fatal.
+            if pair_addr == self.root {
+                return Err(Error::Io);
+            }
+            // Reuse a wear-allocated fresh block as the first candidate so a
+            // wear relocation whose alternate is worn does not allocate (and
+            // orphan) two fresh blocks.
+            let seed = fresh_opt.map(|(f, _)| f);
+            let new_pair = self.relocate_compact_to_fresh(
+                pair_addr,
+                alternate_addr,
+                active_is_a,
+                new_revision,
+                slots,
+                count,
+                op,
+                0,
+                total,
+                ms_arg,
+                rs_arg,
+                tail,
+                inflight,
+                seed,
+                buf_a,
+                buf_b,
+            )?;
+            return Ok(Some(new_pair));
         }
 
         let Some((fresh, new_pair)) = fresh_opt else {
             return Ok(None);
         };
 
-        self.storage.erase(fresh.as_u32()).map_err(|_| Error::Io)?;
-        {
+        // Wear relocation: copy the same bytes (already carrying the relocate
+        // body) to the fresh block. If the fresh block is itself worn, the
+        // anchor on the alternate already holds a durable commit, so abandon
+        // the relocation this cycle — mount recovery cancels the stale
+        // `RelocateState` body on the anchor and the worn fresh is reclaimed.
+        // Wear levelling is opportunistic and re-fires at the next cycle.
+        let fresh_write_ok = {
             let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
-            self.storage
-                .program(fresh.as_u32(), 0, &alt_buf[..alt_bytes_len])
-                .map_err(|_| Error::Io)?;
+            self.storage.erase(fresh.as_u32()).is_ok()
+                && self.storage.program(fresh.as_u32(), 0, &alt_buf[..alt_bytes_len]).is_ok()
+        };
+        if fresh_write_ok {
+            Ok(Some(new_pair))
+        } else {
+            Ok(None)
         }
-        Ok(Some(new_pair))
+    }
+
+    /// Relocate a metadata pair onto a freshly allocated block when a commit
+    /// cannot write one of the pair's own blocks (a worn / bad block). The
+    /// compacted bytes (carrying a balanced `RelocateState` body for the
+    /// `pair_addr -> new_pair` migration) are programmed ONLY to the fresh
+    /// block, replacing `victim_addr` (the worn block) in the pair while
+    /// keeping the other (good) block. The caller must then propagate the
+    /// returned `new_pair` to the parent via [`Self::propagate_relocation`].
+    ///
+    /// **Crash-safety (fresh-only, no in-place anchor).** Unlike the
+    /// wear-levelling path, the commit is never written to one of the pair's
+    /// current blocks, so until the parent repoints at `new_pair` the fresh
+    /// block is unreferenced and the pair reads as its pre-commit state (the
+    /// kept good block out-revisions the blank/worn victim, which has no
+    /// verified CCRC and so loses the active-block selection). The parent
+    /// repoint is the sole linearization point: a crash before it mounts as
+    /// the pre-state with the fresh block reclaimed as an orphan; a crash
+    /// after it mounts as the post-state. The reachable `RelocateState`
+    /// aggregate is therefore always zero (no body reachable before the
+    /// repoint) or balanced (fresh + parent after it) — never the single
+    /// unbalanced body that would trip mount-time relocation recovery, which
+    /// must not fire here because it would try to commit onto the worn pair.
+    ///
+    /// `range_start..range_end` selects the live-entry range to compact (the
+    /// full `0..total` for a plain compaction, or `0..split` for the lower
+    /// half of a directory split, where `tail` carries the `HardTail` to the
+    /// continuation). `seed_fresh`, when `Some`, is tried as the first
+    /// destination before allocating (used to reuse a wear-allocated fresh).
+    /// Bounded by [`MAX_BAD_BLOCK_RETRIES`]; exhaustion returns
+    /// [`Error::Io`], never an infinite loop.
+    #[allow(clippy::too_many_arguments)]
+    fn relocate_compact_to_fresh(
+        &mut self,
+        pair_addr: BlockPair,
+        victim_addr: BlockAddress,
+        active_is_a: bool,
+        new_revision: u32,
+        slots: &[SlotOffsets; MAX_LIVE_ENTRIES],
+        count: usize,
+        op: &WriteOp<'_>,
+        range_start: usize,
+        range_end: usize,
+        ms_arg: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
+        rs_arg: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
+        tail: Option<(BlockPair, bool)>,
+        inflight: &[BlockAddress],
+        seed_fresh: Option<BlockAddress>,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<BlockPair, Error> {
+        // Excluded set: the pair's own two blocks, every inflight block from a
+        // parent relocation cascade, and every worn fresh candidate tried so
+        // far. Sized for the worst case with bound checks → `OutOfRange`.
+        let mut excluded =
+            [BlockAddress::NONE; 2 + 2 + crate::alloc::MAX_QUEUED_PAIRS + MAX_BAD_BLOCK_RETRIES];
+        excluded[0] = pair_addr.a;
+        excluded[1] = pair_addr.b;
+        let mut base_len = 2;
+        for &blk in inflight {
+            if base_len >= excluded.len() {
+                return Err(Error::OutOfRange);
+            }
+            excluded[base_len] = blk;
+            base_len += 1;
+        }
+        let mut ex_len = base_len;
+        let mut seed = seed_fresh;
+        let mut tries = 0usize;
+        loop {
+            let fresh = match seed.take() {
+                Some(s) => s,
+                None => {
+                    // The allocator's single-buffer BFS scan clobbers the
+                    // build buffer (the one we are about to rebuild the commit
+                    // into); the source buffer holding the live entries stays
+                    // intact so `slots` remain valid.
+                    if active_is_a {
+                        crate::alloc::alloc_one_block_cached_single_buf(
+                            &mut self.storage,
+                            self.root,
+                            &mut self.used_cache,
+                            &excluded[..ex_len],
+                            buf_b,
+                        )?
+                    } else {
+                        crate::alloc::alloc_one_block_cached_single_buf(
+                            &mut self.storage,
+                            self.root,
+                            &mut self.used_cache,
+                            &excluded[..ex_len],
+                            buf_a,
+                        )?
+                    }
+                }
+            };
+            let new_pair = BlockPair::new(
+                if pair_addr.a == victim_addr { fresh } else { pair_addr.a },
+                if pair_addr.b == victim_addr { fresh } else { pair_addr.b },
+            );
+            // Fold the relocation's `RelocateState` body into the caller's
+            // pre-existing contribution. The body is non-zero (it encodes two
+            // distinct pairs), so the result is `Some` unless `rs_arg`
+            // exactly cancels it.
+            let relocate_body = crate::gstate::build_relocate_body(pair_addr, new_pair);
+            let combined_rs = match rs_arg {
+                None => Some(relocate_body),
+                Some(a) => {
+                    let mut out = a;
+                    for (o, e) in out.iter_mut().zip(relocate_body.iter()) {
+                        *o ^= *e;
+                    }
+                    if out == [0u8; crate::gstate::RELOCATE_STATE_BODY_SIZE] {
+                        None
+                    } else {
+                        Some(out)
+                    }
+                }
+            };
+            // Rebuild the commit AFTER the alloc (which clobbered the build
+            // buffer) so the bytes reflect this candidate's relocate body.
+            let new_end = if active_is_a {
+                build_compact_commit(
+                    buf_b,
+                    buf_a,
+                    new_revision,
+                    slots,
+                    count,
+                    op,
+                    range_start,
+                    range_end,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                    ms_arg,
+                    combined_rs,
+                    tail,
+                )?
+            } else {
+                build_compact_commit(
+                    buf_a,
+                    buf_b,
+                    new_revision,
+                    slots,
+                    count,
+                    op,
+                    range_start,
+                    range_end,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                    ms_arg,
+                    combined_rs,
+                    tail,
+                )?
+            };
+            let write_ok = {
+                let build_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+                self.storage.erase(fresh.as_u32()).is_ok()
+                    && self.storage.program(fresh.as_u32(), 0, &build_buf[..new_end]).is_ok()
+            };
+            if write_ok {
+                // The fresh block is now in use; drop the stale lookahead.
+                self.used_cache = None;
+                return Ok(new_pair);
+            }
+            // The fresh candidate is itself worn: exclude it and try another,
+            // bounded so a wholly-failing device cannot loop forever.
+            self.used_cache = None;
+            tries += 1;
+            if tries >= MAX_BAD_BLOCK_RETRIES || ex_len >= excluded.len() {
+                return Err(Error::Io);
+            }
+            excluded[ex_len] = fresh;
+            ex_len += 1;
+        }
     }
 
     /// Split an overflowing directory pair across a freshly allocated
@@ -3132,6 +3407,19 @@ impl<S: Storage> Fs<S> {
     /// inherits the original's prior tail so the global thread (and any
     /// further continuation) stays linked.
     ///
+    /// **Worn blocks.** A split writes a fresh continuation block and the
+    /// original's alternate, either of which may be worn. A worn continuation
+    /// block is relocated past in place: the continuation is unreferenced
+    /// until the lower-half commit, so a failed write is a clean blank orphan
+    /// — exclude it and reallocate the pair (bounded by
+    /// [`MAX_BAD_BLOCK_RETRIES`]). A worn *alternate* on the lower-half write
+    /// relocates the original onto a fresh block via
+    /// [`Self::relocate_compact_to_fresh`], with the lower half still
+    /// carrying the `HardTail` to the continuation; that returns the new pair
+    /// address (`Ok(Some(new_pair))`) so the caller repoints the parent. The
+    /// root pair cannot relocate, so a worn root alternate stays
+    /// [`Error::Io`]. A normal split returns `Ok(None)`.
+    ///
     /// One split always suffices in this writer: each metadata pair fits
     /// one block and each `WriteOp` adds at most one entry, so the combined
     /// sequence is at most one block plus one entry, which a single cut
@@ -3146,6 +3434,7 @@ impl<S: Storage> Fs<S> {
     #[allow(clippy::too_many_arguments)]
     fn split_directory_pair(
         &mut self,
+        pair_addr: BlockPair,
         active_addr: BlockAddress,
         alternate_addr: BlockAddress,
         active_is_a: bool,
@@ -3161,24 +3450,34 @@ impl<S: Storage> Fs<S> {
         inflight: &[BlockAddress],
         buf_a: &mut [u8],
         buf_b: &mut [u8],
-    ) -> Result<(), Error> {
-        // Allocate the continuation pair (two fresh blocks) using the
-        // build buffer's single-buffer scan, so the source buffer (holding
-        // the bytes `slots` point into) is never clobbered. Exclude the
-        // pair's own blocks and any inflight blocks.
-        let mut excluded = [BlockAddress::NONE; 3 + crate::alloc::MAX_QUEUED_PAIRS];
+    ) -> Result<Option<BlockPair>, Error> {
+        // Excluded set for the continuation allocation: the pair's own blocks,
+        // any inflight blocks, and every worn continuation candidate tried.
+        // The build buffer is the allocator's single-buffer scan scratch, so
+        // the source buffer (holding the bytes `slots` point into) is never
+        // clobbered. One extra slot holds the first-allocated block tentatively
+        // while the second is allocated.
+        let mut excluded =
+            [BlockAddress::NONE; 2 + crate::alloc::MAX_QUEUED_PAIRS + MAX_BAD_BLOCK_RETRIES + 1];
         excluded[0] = active_addr;
         excluded[1] = alternate_addr;
-        let mut ex = 2;
+        let mut base = 2;
         for &b in inflight {
-            if ex >= excluded.len() {
+            if base >= excluded.len() {
                 return Err(Error::OutOfRange);
             }
-            excluded[ex] = b;
-            ex += 1;
+            excluded[base] = b;
+            base += 1;
         }
-        let cont = {
-            let a = if active_is_a {
+
+        // Allocate + program the continuation, relocating past worn
+        // continuation blocks. The continuation is unreferenced until the
+        // lower-half commit, so an attempt that hits a worn block leaves a
+        // blank/unreferenced orphan: exclude the worn block and retry.
+        let mut ex = base;
+        let mut tries = 0usize;
+        let cont = loop {
+            let ca = if active_is_a {
                 crate::alloc::alloc_one_block_cached_single_buf(
                     &mut self.storage,
                     self.root,
@@ -3195,17 +3494,19 @@ impl<S: Storage> Fs<S> {
                     buf_a,
                 )?
             };
+            // Hold `ca` in the scratch slot at `ex` so the second allocation
+            // does not pick it; the slot is overwritten (with the worn block)
+            // only if this attempt fails.
             if ex >= excluded.len() {
                 return Err(Error::OutOfRange);
             }
-            excluded[ex] = a;
-            ex += 1;
-            let b = if active_is_a {
+            excluded[ex] = ca;
+            let cb = if active_is_a {
                 crate::alloc::alloc_one_block_cached_single_buf(
                     &mut self.storage,
                     self.root,
                     &mut self.used_cache,
-                    &excluded[..ex],
+                    &excluded[..=ex],
                     buf_b,
                 )?
             } else {
@@ -3213,69 +3514,85 @@ impl<S: Storage> Fs<S> {
                     &mut self.storage,
                     self.root,
                     &mut self.used_cache,
-                    &excluded[..ex],
+                    &excluded[..=ex],
                     buf_a,
                 )?
             };
-            BlockPair::new(a, b)
+            let cont = BlockPair::new(ca, cb);
+
+            // Build + program the continuation: the upper portion at revision
+            // 1, inheriting the original's prior tail, carrying no gstate.
+            // Rebuilt each attempt (the alloc clobbered the build buffer);
+            // the bytes are identical since the continuation's tail does not
+            // reference its own address.
+            let cont_len = if active_is_a {
+                build_compact_commit(
+                    buf_b,
+                    buf_a,
+                    1,
+                    slots,
+                    count,
+                    op,
+                    split,
+                    total,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                    None,
+                    None,
+                    inherited_tail,
+                )?
+            } else {
+                build_compact_commit(
+                    buf_a,
+                    buf_b,
+                    1,
+                    slots,
+                    count,
+                    op,
+                    split,
+                    total,
+                    S::PROG_SIZE,
+                    S::BLOCK_SIZE,
+                    None,
+                    None,
+                    inherited_tail,
+                )?
+            };
+            let a_ok = {
+                let build_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+                self.storage.erase(ca.as_u32()).is_ok()
+                    && self.storage.program(ca.as_u32(), 0, &build_buf[..cont_len]).is_ok()
+            };
+            // Block B stays erased as the continuation's alternate so a stale
+            // image there cannot masquerade as a newer revision.
+            let b_ok = a_ok && self.storage.erase(cb.as_u32()).is_ok();
+            if a_ok && b_ok {
+                break cont;
+            }
+            // A continuation block is worn: exclude it and retry. The other
+            // (good, possibly already-written) block is abandoned as a
+            // blank/unreferenced orphan and reclaimed by the next scan.
+            self.used_cache = None;
+            tries += 1;
+            if tries >= MAX_BAD_BLOCK_RETRIES {
+                return Err(Error::Io);
+            }
+            let worn = if a_ok { cb } else { ca };
+            excluded[ex] = worn;
+            ex += 1;
         };
 
-        // Build + program the continuation FIRST: the upper portion at
-        // revision 1, inheriting the original's prior tail, carrying no
-        // gstate. Block B stays erased as the continuation's alternate so
-        // a stale image there cannot masquerade as a newer revision.
-        let cont_len = if active_is_a {
-            build_compact_commit(
-                buf_b,
-                buf_a,
-                1,
-                slots,
-                count,
-                op,
-                split,
-                total,
-                S::PROG_SIZE,
-                S::BLOCK_SIZE,
-                None,
-                None,
-                inherited_tail,
-            )?
-        } else {
-            build_compact_commit(
-                buf_a,
-                buf_b,
-                1,
-                slots,
-                count,
-                op,
-                split,
-                total,
-                S::PROG_SIZE,
-                S::BLOCK_SIZE,
-                None,
-                None,
-                inherited_tail,
-            )?
-        };
-        self.storage.erase(cont.a.as_u32()).map_err(|_| Error::Io)?;
-        {
-            let build_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
-            self.storage
-                .program(cont.a.as_u32(), 0, &build_buf[..cont_len])
-                .map_err(|_| Error::Io)?;
-        }
-        self.storage.erase(cont.b.as_u32()).map_err(|_| Error::Io)?;
         // Make the continuation durable before the linearizing commit, so
         // a reordering device cannot expose a HardTail to a not-yet-written
         // continuation (mirrors mkdir's sync between the new dir and the
         // parent commit).
         self.storage.sync().map_err(|_| Error::Io)?;
 
-        // Build + program the original's alternate: the lower portion at
-        // `new_revision`, ending in a HardTail (split bit set) to the
-        // continuation, carrying the original's gstate. Programming this
-        // block (higher revision, CCRC-valid) is the split's linearization
-        // point — the moment the continuation becomes reachable.
+        // Build + program the original's lower half: at `new_revision`,
+        // ending in a HardTail (split bit set) to the continuation, carrying
+        // the original's gstate. Programming this block (higher revision,
+        // CCRC-valid) is the split's linearization point — the moment the
+        // continuation becomes reachable.
         let low_len = if active_is_a {
             build_compact_commit(
                 buf_b,
@@ -3309,17 +3626,59 @@ impl<S: Storage> Fs<S> {
                 Some((cont, true)),
             )?
         };
-        self.storage.erase(alternate_addr.as_u32()).map_err(|_| Error::Io)?;
-        {
+        let low_ok = {
             let build_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
-            self.storage
-                .program(alternate_addr.as_u32(), 0, &build_buf[..low_len])
-                .map_err(|_| Error::Io)?;
+            self.storage.erase(alternate_addr.as_u32()).is_ok()
+                && self.storage.program(alternate_addr.as_u32(), 0, &build_buf[..low_len]).is_ok()
+        };
+        if low_ok {
+            // A continuation born here is a new reachable pair; drop the
+            // lookahead so its blocks are not handed out again.
+            self.used_cache = None;
+            return Ok(None);
         }
-        // A continuation born here is a new reachable pair; drop the
-        // lookahead so its blocks are not handed out again.
+
+        // The alternate is worn: relocate the original onto a fresh block.
+        // The lower half (still carrying the HardTail to the continuation) is
+        // written only to the fresh block; the parent repoint linearizes the
+        // split, exactly like the plain-compaction relocation. The root pair
+        // is the fixed superblock anchor and cannot relocate.
+        if pair_addr == self.root {
+            return Err(Error::Io);
+        }
+        // The continuation blocks are allocated but not yet reachable; keep
+        // the relocation's fresh allocation off them.
+        let mut reloc_inflight = [BlockAddress::NONE; 2 + crate::alloc::MAX_QUEUED_PAIRS];
+        reloc_inflight[0] = cont.a;
+        reloc_inflight[1] = cont.b;
+        let mut rl = 2;
+        for &b in inflight {
+            if rl >= reloc_inflight.len() {
+                return Err(Error::OutOfRange);
+            }
+            reloc_inflight[rl] = b;
+            rl += 1;
+        }
+        let new_pair = self.relocate_compact_to_fresh(
+            pair_addr,
+            alternate_addr,
+            active_is_a,
+            new_revision,
+            slots,
+            count,
+            op,
+            0,
+            split,
+            ms_arg,
+            rs_arg,
+            Some((cont, true)),
+            &reloc_inflight[..rl],
+            None,
+            buf_a,
+            buf_b,
+        )?;
         self.used_cache = None;
-        Ok(())
+        Ok(Some(new_pair))
     }
 
     /// Propagate a pair relocation up the tree: find the parent that

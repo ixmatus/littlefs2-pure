@@ -177,27 +177,67 @@ impl Storage for MultiBadDev {
     }
 }
 
-/// A worn block hit while a metadata pair *commits* (compacts onto its
-/// alternate, or splits onto it) should be relocated past: the pair
-/// migrates to a fresh block, the parent's `DirStruct` is updated, and the
-/// operation completes. Distinct from the CTZ data/append paths above,
-/// which relocate file blocks, not metadata pairs.
-///
-/// `#[ignore]`d: this is the remaining `lfs-23f` target. It is harder than
-/// the CTZ paths because the failure cannot reuse wear-levelling
-/// relocation as-is. Wear-levelling writes the compacted bytes to the
-/// **alternate first** (the in-place durability anchor) and only then
-/// copies to a fresh block, balancing a 3-way `RelocateState` for crash
-/// recovery. When the *alternate* is the worn block, that alternate-first
-/// step is precisely what fails, so a failure-driven relocation must
-/// commit directly to a fresh block — a different crash-safety model and
-/// `RelocateState` balance than `compact_and_program`'s wear path. The
-/// append-path case (a worn *active* block) must additionally fall back
-/// from the in-place append to a relocating compact. The root pair `{0,1}`
-/// cannot relocate, so a worn root block stays fatal (to be documented).
-/// Remove the ignore when failure-driven metadata relocation lands.
+/// Sub-case 1 in isolation: a worn block hit by a *plain compaction* (the
+/// live set still fits one block, so no split). After `mkdir /d` at `{2,3}`
+/// with block 3 (the alternate) worn, six entries overflow block 2 once: the
+/// sixth write compacts the pair, and the compaction's write lands on the
+/// worn alternate. The pair must relocate onto a fresh block. Smaller and
+/// split-free, so it pins the plain-compact relocation path on its own
+/// before the full reproducer exercises the split path too.
 #[test]
-#[ignore = "lfs-23f: failure-driven metadata-pair relocation not yet implemented"]
+fn metadata_plain_compact_survives_worn_alternate() {
+    let mut storage = BadBlockDev::new(3);
+    let mut sb = buf();
+    Fs::format(&mut storage, &mut sb).unwrap();
+    let mut ba = buf();
+    let mut bb = buf();
+    let mut fs = Fs::mount(storage, &mut ba, &mut bb).unwrap();
+    let mut a = buf();
+    let mut b = buf();
+    fs.mkdir(Path::new("/d").unwrap(), &mut a, &mut b).unwrap();
+
+    // Six entries: five append into block 2, the sixth overflows and
+    // compacts onto the worn alternate (block 3), which must relocate. Six
+    // keeps the live set under half a block, so the kernel compacts rather
+    // than splits.
+    let n = 6usize;
+    for i in 0..n {
+        let name = format!("/d/f{i:02}");
+        fs.write_to_path(Path::new(&name).unwrap(), b"x", &mut a, &mut b)
+            .unwrap_or_else(|e| panic!("entry {i} should survive the worn alternate: {e:?}"));
+    }
+
+    let check = |fs: &mut Fs<BadBlockDev>, a: &mut [u8], b: &mut [u8]| {
+        let mut seen = 0usize;
+        fs.list_dir(Path::new("/d").unwrap(), |_e| seen += 1, a, b).unwrap();
+        assert_eq!(seen, n, "all entries survive the plain-compact relocation");
+    };
+    check(&mut fs, &mut a, &mut b);
+    let storage = fs.into_storage();
+    let mut ba = buf();
+    let mut bb = buf();
+    let mut fs = Fs::mount(storage, &mut ba, &mut bb).unwrap();
+    check(&mut fs, &mut a, &mut b);
+}
+
+/// A worn block hit while a metadata pair *commits* (compacts onto its
+/// alternate, or splits onto it) is relocated past: the pair migrates to a
+/// fresh block, the parent's `DirStruct` is updated, and the operation
+/// completes. Distinct from the CTZ data/append paths above, which relocate
+/// file blocks, not metadata pairs.
+///
+/// Twenty-four entries overflow a 256-byte block, so `/d` must split across
+/// a `HardTail` continuation. The first overflow (write 5) is a plain
+/// compaction onto the worn alternate (block 3), which relocates `/d` onto a
+/// fresh block and drops block 3 from the pair. The later split therefore
+/// lands on good blocks: once relocated, block 3 is no longer one of `/d`'s
+/// blocks, and `scan_used_blocks`' raw-tag over-approximation keeps the
+/// parent's superseded `DirStruct(/d -> {2,3})` marking block 3 as used
+/// until the root next compacts, so the allocator does not re-hand it out as
+/// a continuation block. A split that lands *directly* onto a worn block
+/// (larger entries, so the first overflow splits before any plain
+/// compaction can evict the worn half) is covered separately.
+#[test]
 fn metadata_commit_survives_a_bad_block_via_relocation() {
     // After format the root is {0,1}; `mkdir /d` takes the next two free
     // blocks {2,3}, writing its init commit to block 2 (the active half)
@@ -272,4 +312,102 @@ fn too_many_bad_blocks_is_bounded_io() {
     let mut b = buf();
     let r = fs.write_to_path(Path::new("/f").unwrap(), &[0xAA; 300], &mut a, &mut b);
     assert!(matches!(r, Err(Error::Io | Error::OutOfRange)), "got {r:?}");
+}
+
+/// Device whose `program` fails on one designated block only for writes at a
+/// non-zero offset, modelling a block worn out for in-place appends but
+/// still accepting a full (offset-zero) compaction write. Reads and erases
+/// always work.
+struct AppendFailDev {
+    data: Vec<u8>,
+    bad: u32,
+}
+impl AppendFailDev {
+    fn new(bad: u32) -> Self {
+        Self {
+            data: vec![0xFFu8; BadBlockDev::BLOCK_SIZE * BadBlockDev::BLOCK_COUNT as usize],
+            bad,
+        }
+    }
+}
+impl Storage for AppendFailDev {
+    type Error = ();
+    const READ_SIZE: usize = 16;
+    const PROG_SIZE: usize = 16;
+    const BLOCK_SIZE: usize = BadBlockDev::BLOCK_SIZE;
+    const BLOCK_COUNT: u32 = BadBlockDev::BLOCK_COUNT;
+    const CACHE_SIZE: usize = 64;
+    const LOOKAHEAD_SIZE: usize = 8;
+    fn read(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), ()> {
+        let s = (block as usize) * Self::BLOCK_SIZE + off as usize;
+        let e = s.checked_add(buf.len()).ok_or(())?;
+        if block >= Self::BLOCK_COUNT || e > self.data.len() {
+            return Err(());
+        }
+        buf.copy_from_slice(&self.data[s..e]);
+        Ok(())
+    }
+    fn program(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), ()> {
+        if block == self.bad && off != 0 {
+            return Err(()); // worn for in-place appends, fine for a fresh compaction
+        }
+        let s = (block as usize) * Self::BLOCK_SIZE + off as usize;
+        let e = s.checked_add(data.len()).ok_or(())?;
+        if block >= Self::BLOCK_COUNT || e > self.data.len() {
+            return Err(());
+        }
+        self.data[s..e].copy_from_slice(data);
+        Ok(())
+    }
+    fn erase(&mut self, block: u32) -> Result<(), ()> {
+        if block >= Self::BLOCK_COUNT {
+            return Err(());
+        }
+        let s = (block as usize) * Self::BLOCK_SIZE;
+        self.data[s..s + Self::BLOCK_SIZE].fill(0xFF);
+        Ok(())
+    }
+}
+
+/// Sub-case 2: an in-place append hits a worn *active* block. The append
+/// must not be fatal; the commit falls back to a relocating compaction that
+/// rebuilds the readable active block's live set onto a fresh block and
+/// evicts the worn block (eager eviction). `mkdir /d` lands at `{2,3}` with
+/// block 2 the active half; marking block 2 worn-for-appends makes the first
+/// in-place append to `/d` fail and fall back.
+#[test]
+fn append_fallback_survives_worn_active() {
+    let mut storage = AppendFailDev::new(2);
+    let mut sb = buf();
+    Fs::format(&mut storage, &mut sb).unwrap();
+    let mut ba = buf();
+    let mut bb = buf();
+    let mut fs = Fs::mount(storage, &mut ba, &mut bb).unwrap();
+    let mut a = buf();
+    let mut b = buf();
+    // mkdir writes block 2's init commit at offset 0 (allowed) and appends
+    // /d's entry to the root at a non-zero offset on block 0 (allowed).
+    fs.mkdir(Path::new("/d").unwrap(), &mut a, &mut b).unwrap();
+
+    // The first write appends f00 to block 2 at a non-zero offset, which
+    // fails; the fallback relocates /d off the worn block. Subsequent writes
+    // land on the relocated (good) active half.
+    let n = 6usize;
+    for i in 0..n {
+        let name = format!("/d/f{i:02}");
+        fs.write_to_path(Path::new(&name).unwrap(), b"y", &mut a, &mut b)
+            .unwrap_or_else(|e| panic!("entry {i} should survive the worn active block: {e:?}"));
+    }
+
+    let check = |fs: &mut Fs<AppendFailDev>, a: &mut [u8], b: &mut [u8]| {
+        let mut seen = 0usize;
+        fs.list_dir(Path::new("/d").unwrap(), |_e| seen += 1, a, b).unwrap();
+        assert_eq!(seen, n, "all entries survive the append-fallback relocation");
+    };
+    check(&mut fs, &mut a, &mut b);
+    let storage = fs.into_storage();
+    let mut ba = buf();
+    let mut bb = buf();
+    let mut fs = Fs::mount(storage, &mut ba, &mut bb).unwrap();
+    check(&mut fs, &mut a, &mut b);
 }
