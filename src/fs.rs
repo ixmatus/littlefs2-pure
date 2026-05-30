@@ -3036,10 +3036,17 @@ impl<S: Storage> Fs<S> {
     /// inherits the original's prior tail so the global thread (and any
     /// further continuation) stays linked.
     ///
-    /// This is the single-level split. Cascading (when the upper portion
-    /// itself overflows) lands in the next increment (lfs-cvh.4); here a
-    /// lower portion that still exceeds the block surfaces as the
-    /// pre-existing `Error::OutOfRange` from `build_compact_commit`.
+    /// One split always suffices in this writer: each metadata pair fits
+    /// one block and each `WriteOp` adds at most one entry, so the combined
+    /// sequence is at most one block plus one entry, which a single cut
+    /// splits into two sub-block pairs (the upper bounded to half a block
+    /// by `compute_split_index`, the lower being the pre-existing entries).
+    /// A multi-pair directory grows by repeatedly splitting the last pair
+    /// as it fills. The within-compaction cascade of the C reference's
+    /// `lfs_dir_splittingcompact` (reachable only when one commit batches
+    /// several creates) is therefore unreachable here; see ADR-0013. A
+    /// lower portion that somehow still exceeded the block would surface as
+    /// the pre-existing `Error::OutOfRange` from `build_compact_commit`.
     #[allow(clippy::too_many_arguments)]
     fn split_directory_pair(
         &mut self,

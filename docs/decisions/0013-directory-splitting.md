@@ -1,7 +1,9 @@
 # ADR-0013: write-side directory splitting (HardTail continuation pairs)
 
-- **Status**: proposed (design; implementation is `lfs-cvh`)
-- **Date**: 2026-05-29
+- **Status**: accepted; implemented for subdirectories (`lfs-cvh.1`..`.4`).
+  Root growth (`lfs-cvh.5`) and HardTail-chain relocation (`lfs-cvh.6`)
+  follow.
+- **Date**: 2026-05-29 (design); revised 2026-05-30 (implementation notes)
 
 ## Context
 
@@ -113,9 +115,58 @@ reproduce-first and conformance/round-trip gated; `pending_dir_split.rs`'s
 `directory_grows_past_one_pair_via_split` target comes off `#[ignore]` at
 step 4.
 
+## Revision after implementation (2026-05-30)
+
+Three findings refined the plan during `lfs-cvh.1`..`.4`.
+
+**A single split suffices per op; the within-compaction cascade is
+unreachable here.** The C reference cascades because `lfs_dir_commit`
+batches many attrs into one commit, so a single compaction can add many
+entries and overflow by more than one pair. This crate commits one
+`WriteOp` at a time, adding at most one entry, and every metadata pair
+already fits one block (the append path rejects anything larger). So the
+combined sequence a compaction must place is at most one block plus one
+entry, and one split always cuts it into two sub-block pairs: the upper
+portion is bounded to half a block by `compute_split_index`, and the
+lower portion is the pre-existing entries, themselves at most one block.
+The outer cascade loop of `lfs_dir_splittingcompact` therefore never runs
+a second iteration in this writer. Repeatedly splitting the *last* pair as
+it fills builds the multi-pair chain, so the reproduce-first target
+(`directory_grows_past_one_pair_via_split`, 60 entries) passed at the
+single-split step (`lfs-cvh.3`), not a later cascade step. No speculative
+cascade code was written: an unreachable second iteration would be
+untestable through the public API, and the design favors total functions
+over dead branches. Should a future feature batch multiple creates into
+one commit, the cascade becomes reachable and must be added then, with a
+test that exercises it.
+
+**The reachable-pair budget needed a pre-split guard.** The mount-time
+walks (allocator scan, gstate accumulation, deorphan) enumerate the
+reachable forest into fixed `MAX_QUEUED_PAIRS` arrays, so a forest larger
+than that bound is unmountable. A split's continuation allocation scans
+the forest *before* the new pair exists, so at exactly `MAX_QUEUED_PAIRS`
+reachable pairs the scan fits and the split lands, producing an
+unmountable `MAX_QUEUED_PAIRS + 1` forest. The split branch now counts the
+live tree first and refuses with `OutOfRange` at the budget, keeping the
+image mountable; the directory caps cleanly one pair below the bound. The
+same off-by-one affects `mkdir` creating the budget-th directory and is
+filed separately (`lfs-43o`); it is pre-existing and orthogonal to
+splitting. Lifting `MAX_QUEUED_PAIRS` from a hard limit (the Consequences
+above) is thus still future work and gated on the stack budget (ADR-0006),
+not delivered by splitting alone.
+
+**The root is excluded until `lfs-cvh.5`.** The split branch skips the
+root pair `{0, 1}`: it cannot relocate and its growth needs the
+superblock-expansion guard. A root overflow keeps its prior `OutOfRange`
+behavior until step 5 lands.
+
 ## Related
 
 - `tests/pending_dir_split.rs`: the reproduce-first target.
+- `tests/dir_split_torn.rs`: the split crash-window power-loss pin.
+- `tests/dir_split_budget.rs`: clean failure at the reachable-pair budget.
+- `tools/verify_image` `split_dir` scenario + `roundtrip_split_dir`: the C
+  reference reads a crate-written split directory.
 - Review item `lfs-cvh`.
 - C reference: `lfs_dir_split`, `lfs_dir_splittingcompact`,
   `lfs_dir_compact`, `lfs_dir_find_` in
