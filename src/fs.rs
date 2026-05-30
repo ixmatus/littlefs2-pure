@@ -2825,40 +2825,53 @@ impl<S: Storage> Fs<S> {
         // its growth needs the superblock-expansion guard, which lands in
         // a later increment (lfs-cvh.5); until then a root overflow keeps
         // its prior `Error::OutOfRange` behavior via the normal path.
+        // The compacted live set exceeds half a block, so a split would
+        // distribute it. Splitting is skipped for the root pair `{0, 1}`
+        // (it cannot relocate and needs the superblock-expansion guard;
+        // lfs-cvh.5), and degrades gracefully when it cannot proceed.
         let total = count + usize::from(op_adds_entry(op));
         let split = compute_split_index::<S>(slots, count, op, 0, total);
-        if split > 0 && pair_addr != self.root {
+        let mut do_split = split > 0 && pair_addr != self.root;
+        if do_split {
             // Bound the reachable-pair count before splitting. The split
             // adds exactly one reachable pair (the continuation); the
             // mount-time walks (allocator scan, gstate accumulation,
             // deorphan) enumerate the forest into fixed `MAX_QUEUED_PAIRS`
             // arrays (ADR-0006), so a forest of more than `MAX_QUEUED_PAIRS`
-            // reachable pairs is unmountable. Refuse the split when the tree
-            // is already at the budget — otherwise the writer would produce
-            // an image its own mount cannot read. This is the clean
-            // `OutOfRange` a deeply-split directory hits; nothing is written.
+            // reachable pairs is unmountable. At the budget, do not split:
+            // fall through to a single-block compaction (degraded), which
+            // still fits when the live set is at most one block and only
+            // a genuine overflow turns into `OutOfRange` below.
             //
             // `collect_live_tree_pairs` clobbers both scratch buffers, so
             // re-read the active block afterward to restore the bytes
-            // `slots` reference before building the split commits.
-            {
-                let mut tree = [BlockPair::new(BlockAddress::NONE, BlockAddress::NONE);
-                    crate::alloc::MAX_QUEUED_PAIRS];
-                let reachable =
-                    collect_live_tree_pairs(&mut self.storage, self.root, &mut tree, buf_a, buf_b)?;
-                if reachable >= crate::alloc::MAX_QUEUED_PAIRS {
-                    return Err(Error::OutOfRange);
-                }
-                let source_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
-                self.storage.read(active_addr.as_u32(), 0, source_buf).map_err(|_| Error::Io)?;
+            // `slots` reference.
+            let mut tree = [BlockPair::new(BlockAddress::NONE, BlockAddress::NONE);
+                crate::alloc::MAX_QUEUED_PAIRS];
+            let reachable =
+                collect_live_tree_pairs(&mut self.storage, self.root, &mut tree, buf_a, buf_b)?;
+            let source_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
+            self.storage.read(active_addr.as_u32(), 0, source_buf).map_err(|_| Error::Io)?;
+            if reachable >= crate::alloc::MAX_QUEUED_PAIRS {
+                do_split = false;
             }
-            // Overflow → split. Wear-levelling relocation is a hint, not a
-            // correctness requirement; defer it to the next commit rather
-            // than fold a relocation's fresh allocation and parent update
-            // into the same crash window as the split. The original keeps
-            // its address (lower half + a HardTail to the continuation),
-            // so there is nothing to propagate to the parent — `Ok(None)`.
-            self.split_directory_pair(
+        }
+        if do_split {
+            // Split. Wear-levelling relocation is a hint, not a correctness
+            // requirement; defer it to the next commit rather than fold a
+            // relocation's fresh allocation and parent update into the same
+            // crash window as the split. The original keeps its address
+            // (lower half + a HardTail to the continuation), so there is
+            // nothing to propagate to the parent — `Ok(None)`.
+            //
+            // If no free pair is available for the continuation, degrade to
+            // a single-block compaction (the C reference's "unable to
+            // split" fallback): a removal or update that shrunk the live
+            // set back within one block still lands, while a true overflow
+            // surfaces as `OutOfRange` from the compaction below. The
+            // continuation allocation clobbers only the build buffer, but
+            // re-read the source to be safe before the fallback.
+            match self.split_directory_pair(
                 active_addr,
                 alternate_addr,
                 active_is_a,
@@ -2874,8 +2887,16 @@ impl<S: Storage> Fs<S> {
                 inflight,
                 buf_a,
                 buf_b,
-            )?;
-            return Ok(None);
+            ) {
+                Ok(()) => return Ok(None),
+                Err(Error::OutOfRange) => {
+                    let source_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
+                    self.storage
+                        .read(active_addr.as_u32(), 0, source_buf)
+                        .map_err(|_| Error::Io)?;
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         let relocating = should_relocate(pair_addr, self.root, new_revision, S::BLOCK_CYCLES);
