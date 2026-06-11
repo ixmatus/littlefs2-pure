@@ -899,6 +899,56 @@ fn collect_live_tree_pairs<S: Storage>(
     Ok(tail)
 }
 
+/// Find the live tree pair that is the relocated TWIN of `stale`, if
+/// any: the pair the filesystem now reaches where `stale` used to be.
+///
+/// Both relocation flavors replace exactly one block of a pair and
+/// keep the other (wear levelling keeps the old active block and
+/// replaces the alternate with the fresh; the failure-driven path
+/// keeps the good block and replaces the worn victim), so the twin
+/// shares exactly one block with `stale`. Sharing alone is not
+/// sufficient: a block `stale` no longer needs (its anchor, freed by
+/// the relocation) can be reallocated as the FRESH half of a later
+/// relocation in the same cascade. The disambiguator is which half
+/// the shared block is *in the candidate*: a relocation's kept block
+/// carries the pre-relocation revision while the fresh block carries
+/// the new commit, so in the true twin the shared block is the
+/// INACTIVE half; in a reuser the recycled block is the fresh,
+/// ACTIVE half. Block ownership is otherwise exclusive, so at most
+/// one tree pair passes the test.
+///
+/// Used by the mount-recovery paths whose durable coordinates can be
+/// outdated by a relocation cascade (reviews C6 and H4); within those
+/// windows only cascade commits run, so no other pair shapes (e.g. a
+/// fresh mkdir pair with an erased half) can alias the rule.
+fn relocated_twin_in<S: Storage>(
+    storage: &mut S,
+    tree: &[BlockPair],
+    stale: BlockPair,
+    buf_a: &mut [u8],
+    buf_b: &mut [u8],
+) -> Result<Option<BlockPair>, Error> {
+    for &t in tree {
+        if t == stale {
+            continue;
+        }
+        let shared = if t.a == stale.a || t.a == stale.b {
+            t.a
+        } else if t.b == stale.a || t.b == stale.b {
+            t.b
+        } else {
+            continue;
+        };
+        storage.read(t.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        storage.read(t.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let p = MetadataPair::parse(t.a, &*buf_a, t.b, &*buf_b)?;
+        if p.active_block != shared {
+            return Ok(Some(t));
+        }
+    }
+    Ok(None)
+}
+
 /// Read a metadata pair's `MoveState` contribution: the body of the
 /// *latest* committed `MoveState` tag, or all-zero when none exists.
 ///
@@ -1149,9 +1199,28 @@ fn find_thread_predecessor<S: Storage>(
 /// parent whose entry must be flipped to the new address. The relocated
 /// pair's *thread* predecessor (whose tail also references it) is found
 /// separately by [`find_thread_predecessor`] and updated by
-/// `propagate_relocation`. Pairs reached via `HardTail` / `SoftTail`
-/// continuations are walked (so the BFS covers the full reachable
-/// forest) but are not themselves DirStruct candidates.
+/// `propagate_relocation`. `HardTail` continuations are walked and ARE
+/// DirStruct candidates (a split directory's child entries live there).
+///
+/// # Live state only (reviews C5 and C6)
+///
+/// The walk consumes exclusively LIVE state: children are enqueued
+/// from each pair's splice-corrected latest-wins `DirStruct` bodies
+/// (via `gather_live_slots`), the tail from the reader's latest tail
+/// tag, and the match runs over the live bodies, so the returned id is
+/// a live id by construction (review C5) and the returned pair is the
+/// live parent. Iterating raw tags here was a confirmed corruption
+/// source twice over: a raw match returned write-time ids that
+/// relocation consumed as live ids (C5), and raw enqueueing followed
+/// superseded `DirStruct` bodies into STALE pre-relocation pairs whose
+/// old logs can still match the target, committing the parent repoint
+/// onto a dead pair (erasing freed or reallocated blocks) while the
+/// real parent kept the outdated reference (found while reproducing
+/// C6). `accumulate_gstate` and `collect_live_tree_pairs` follow the
+/// same authoritative-children rule for the same reason. The C
+/// reference's `lfs_fs_parent` only ever fetches live pairs (it walks
+/// the thread) and matches through `lfs_dir_fetchmatch`'s
+/// splice-corrected view.
 ///
 /// Bounded at [`crate::alloc::MAX_QUEUED_PAIRS`] visited pairs, the
 /// same budget as the allocator's BFS. Deeper trees return
@@ -1175,109 +1244,51 @@ fn find_parent_in_tree<S: Storage>(
     while head < tail {
         let pair_addr = queue[head];
         head += 1;
-        if pair_addr == target {
-            // The root or another visited pair equals the target; that's
-            // handled by the caller (root is excluded by should_relocate).
-            // We still need to walk this pair's children to keep BFS
-            // monotone; do NOT skip the body of the loop.
-        }
 
         storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
         storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
         let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
+        let active_is_a = pair.active_block == pair_addr.a;
+        let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
+        let count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
+        let source_buf: &[u8] = if active_is_a { &*buf_a } else { &*buf_b };
 
-        // Splice-corrected candidate (review C5). A matching DirStruct
-        // tag carries the id the entry had at *write* time; every
-        // Create/Delete committed after it renumbers the live entries,
-        // so the raw id must be carried forward through the rest of
-        // the log. This is the C reference's `tempbesttag` discipline
-        // in `lfs_dir_fetchmatch` (lfs.c:1241ff, 1280ff): latest
-        // content match wins; an identical-id DirStruct with different
-        // contents means the match was overwritten; a Delete at the
-        // candidate id kills it; a splice at or below it shifts it.
-        let mut cand: Option<u16> = None;
-        for entry in pair.reader.iter_tags() {
-            let tag = entry.tag;
-            match tag.tag_type() {
-                crate::tag::TagType::DirStruct if entry.body.len() == 8 => {
-                    let a = u32::from_le_bytes([
-                        entry.body[0],
-                        entry.body[1],
-                        entry.body[2],
-                        entry.body[3],
-                    ]);
-                    let b = u32::from_le_bytes([
-                        entry.body[4],
-                        entry.body[5],
-                        entry.body[6],
-                        entry.body[7],
-                    ]);
-                    let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
-                    if child == target {
-                        cand = Some(tag.id());
-                        continue;
-                    }
-                    if cand == Some(tag.id()) {
-                        // The candidate's entry now points elsewhere;
-                        // the earlier match was overwritten.
-                        cand = None;
-                    }
-                    // An out-of-range DirStruct body cannot be the
-                    // target (a real allocated pair) and must never be
-                    // dereferenced; skip it rather than enqueue.
-                    if pair_in_bounds::<S>(child) && !queue[..tail].contains(&child) {
-                        if tail >= crate::alloc::MAX_QUEUED_PAIRS {
-                            return Err(Error::OutOfRange);
-                        }
-                        queue[tail] = child;
-                        tail += 1;
-                    }
+        // Latest tail only; every raw tail tag would re-enqueue
+        // superseded thread links.
+        if let Some(t) = pair.reader.tail() {
+            if pair_in_bounds::<S>(t) && !queue[..tail].contains(&t) {
+                if tail >= crate::alloc::MAX_QUEUED_PAIRS {
+                    return Err(Error::OutOfRange);
                 }
-                crate::tag::TagType::Create => {
-                    if let Some(c) = cand {
-                        if tag.id() <= c {
-                            cand = Some(c + 1);
-                        }
-                    }
-                }
-                crate::tag::TagType::Delete => {
-                    if let Some(c) = cand {
-                        if tag.id() == c {
-                            cand = None;
-                        } else if tag.id() < c {
-                            cand = Some(c - 1);
-                        }
-                    }
-                }
-                crate::tag::TagType::HardTail | crate::tag::TagType::SoftTail
-                    if entry.body.len() == 8 =>
-                {
-                    let a = u32::from_le_bytes([
-                        entry.body[0],
-                        entry.body[1],
-                        entry.body[2],
-                        entry.body[3],
-                    ]);
-                    let b = u32::from_le_bytes([
-                        entry.body[4],
-                        entry.body[5],
-                        entry.body[6],
-                        entry.body[7],
-                    ]);
-                    let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
-                    if pair_in_bounds::<S>(child) && !queue[..tail].contains(&child) {
-                        if tail >= crate::alloc::MAX_QUEUED_PAIRS {
-                            return Err(Error::OutOfRange);
-                        }
-                        queue[tail] = child;
-                        tail += 1;
-                    }
-                }
-                _ => {}
+                queue[tail] = t;
+                tail += 1;
             }
         }
-        if let Some(c) = cand {
-            return Ok(Some((pair_addr, c)));
+
+        for (i, slot) in slots.iter().enumerate().take(count) {
+            // struct_kind 2 == DirStruct (gather_live_slots encoding).
+            if slot.struct_kind != 2 || slot.struct_len != 8 {
+                continue;
+            }
+            let start = slot.struct_off as usize;
+            let body = &source_buf[start..start + 8];
+            let a = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+            let b = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+            let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
+            if child == target {
+                // `i` is the entry's live id by construction.
+                return Ok(Some((pair_addr, i as u16)));
+            }
+            // An out-of-range DirStruct body cannot be the target (a
+            // real allocated pair) and must never be dereferenced;
+            // skip it rather than enqueue.
+            if pair_in_bounds::<S>(child) && !queue[..tail].contains(&child) {
+                if tail >= crate::alloc::MAX_QUEUED_PAIRS {
+                    return Err(Error::OutOfRange);
+                }
+                queue[tail] = child;
+                tail += 1;
+            }
         }
     }
 
@@ -1338,6 +1349,29 @@ pub struct Fs<S: Storage> {
     /// invalidates it for promptness, but correctness never depends on
     /// invalidation (see `crate::alloc::alloc_blocks_cached`).
     used_cache: Option<crate::alloc::Bitmap>,
+    /// In-flight cross-directory rename coordinates (review C6): set
+    /// before the destination commit, consumed by the source commit.
+    /// The destination commit can trigger a relocation cascade that
+    /// relocates the SOURCE pair before the source commit runs;
+    /// [`Fs::propagate_relocation`] remaps these coordinates so the
+    /// source delete targets the live address. The C reference patches
+    /// its in-RAM gstate at the same sites: "this looks like an
+    /// optimization but is in fact _required_ since relocating may
+    /// outdate the move" (lfs.c:2484, 2536). `None` outside the rename
+    /// window.
+    pending_move: Option<PendingMove>,
+}
+
+/// See [`Fs::pending_move`]. `delta` is the original MoveState body
+/// committed with the destination create; the balancing source commit
+/// must fold the SAME delta (the bodies cancel by XOR regardless of
+/// which address the source pair lives at by then), while `cur_pair`
+/// tracks the source pair's current address through relocations.
+#[derive(Clone, Copy, Debug)]
+struct PendingMove {
+    cur_pair: BlockPair,
+    cur_id: u16,
+    delta: [u8; crate::gstate::MOVE_STATE_BODY_SIZE],
 }
 
 impl<S: Storage> Fs<S> {
@@ -2688,11 +2722,30 @@ impl<S: Storage> Fs<S> {
         // pair so mount-time recovery completes the Delete at the right
         // pair when the source spans a HardTail chain.
         let move_body = crate::gstate::build_move_body(src_owner, src_id);
-        self.apply_op_to_pair_with_movestate(dst_last, &create_op, Some(move_body), buf_a, buf_b)?;
-        self.apply_op_to_pair_with_movestate(
-            src_owner,
-            &WriteOp::Remove { id: src_id },
+        // Track the in-flight source coordinates so a relocation
+        // cascade triggered by the destination commit can remap them
+        // (review C6; see `Fs::pending_move`). Cleared on every exit
+        // from this window, including the destination commit failing.
+        self.pending_move =
+            Some(PendingMove { cur_pair: src_owner, cur_id: src_id, delta: move_body });
+        let dst_result = self.apply_op_to_pair_with_movestate(
+            dst_last,
+            &create_op,
             Some(move_body),
+            buf_a,
+            buf_b,
+        );
+        let pm = self.pending_move.take();
+        dst_result?;
+        // The delta must be the ORIGINAL body (it cancels the
+        // destination commit's by XOR); the target address is the
+        // source pair's CURRENT location, remapped through any cascade.
+        let pm =
+            pm.unwrap_or(PendingMove { cur_pair: src_owner, cur_id: src_id, delta: move_body });
+        self.apply_op_to_pair_with_movestate(
+            pm.cur_pair,
+            &WriteOp::Remove { id: pm.cur_id },
+            Some(pm.delta),
             buf_a,
             buf_b,
         )
@@ -3310,9 +3363,8 @@ impl<S: Storage> Fs<S> {
         // Wear relocation: copy the same bytes (already carrying the relocate
         // body) to the fresh block. If the fresh block is itself worn, the
         // anchor on the alternate already holds a durable commit, so abandon
-        // the relocation this cycle — mount recovery cancels the stale
-        // `RelocateState` body on the anchor and the worn fresh is reclaimed.
-        // Wear levelling is opportunistic and re-fires at the next cycle.
+        // the relocation this cycle. Wear levelling is opportunistic and
+        // re-fires at the next cycle.
         let fresh_write_ok = {
             let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
             self.storage.erase(fresh.as_u32()).is_ok()
@@ -3321,6 +3373,33 @@ impl<S: Storage> Fs<S> {
         if fresh_write_ok {
             Ok(Some(new_pair))
         } else {
+            // Cancel the abandoned relocation's `RelocateState`
+            // immediately (review H3). The anchor commit durably
+            // carries the unbalanced `(pair_addr, new_pair)` body;
+            // deferring the cancel to mount-time recovery leaves a
+            // window where a LATER successful relocation of this pair
+            // outdates both addresses, and recovery then commits
+            // through a dead address on every mount, forever. The
+            // cancelling delta folds the body back out of the pair's
+            // total in a follow-up commit on the same (unchanged) pair
+            // address; a crash before it lands keeps today's recovery
+            // path (the pair has not moved, so the decoded addresses
+            // are live). The recursion through `apply_op_to_pair_inner`
+            // is the standard commit path (it may compact, and that
+            // compact may itself relocate, which is the normal nested
+            // cascade bounded like any other commit).
+            let body =
+                relocate_event_body.expect("a wear relocation attempt always has a relocate body");
+            self.apply_op_to_pair_inner(
+                pair_addr,
+                &WriteOp::Noop,
+                None,
+                Some(body),
+                None,
+                inflight,
+                buf_a,
+                buf_b,
+            )?;
             Ok(None)
         }
     }
@@ -3814,6 +3893,17 @@ impl<S: Storage> Fs<S> {
     ) -> Result<(), Error> {
         if old_pair == self.root {
             return Ok(());
+        }
+        // Remap the in-flight rename's source coordinates (review C6):
+        // if the pair that just relocated is the pending move's source,
+        // the source delete (and anything else consuming these
+        // coordinates) must target the new address. Without this, the
+        // delete lands on the orphaned old address: a permanent
+        // duplicate entry whose MoveState can never cancel.
+        if let Some(pm) = self.pending_move.as_mut() {
+            if pm.cur_pair == old_pair {
+                pm.cur_pair = new_pair;
+            }
         }
         let relocate_body = crate::gstate::build_relocate_body(old_pair, new_pair);
         // Add the fresh half of new_pair to inflight so a cascading
@@ -4442,7 +4532,13 @@ impl<S: Storage> Fs<S> {
         // go out of scope releases the borrow. Reuse `block_a_buf`
         // and `block_b_buf` for the gstate sweep below.
         let _ = pair;
-        let mut fs = Self { storage, superblock: sb, root: ROOT_BLOCK_PAIR, used_cache: None };
+        let mut fs = Self {
+            storage,
+            superblock: sb,
+            root: ROOT_BLOCK_PAIR,
+            used_cache: None,
+            pending_move: None,
+        };
 
         // Atomic-move-state recovery: walk every reachable metadata
         // pair, XOR-accumulate `MoveState` tag bodies into a single
@@ -4495,9 +4591,9 @@ impl<S: Storage> Fs<S> {
             }
             self.storage.read(cur.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
             self.storage.read(cur.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-            let next = {
+            let (next, cur_is_hard) = {
                 let p = MetadataPair::parse(cur.a, &*buf_a, cur.b, &*buf_b)?;
-                p.reader.tail()
+                (p.reader.tail(), p.reader.is_hard_tail())
             };
             let Some(next) = next else {
                 break;
@@ -4516,11 +4612,43 @@ impl<S: Storage> Fs<S> {
                 cur = next;
                 continue;
             }
-            // `next` is threaded but not a live tree pair: a crash orphan.
-            // Re-point `cur` past it (to the orphan's own successor, or
-            // clear if it was the list end), stealing the orphan's
-            // gstate contribution (review C7/D5), then re-check `cur`
-            // for consecutive orphans without advancing.
+            // `next` is threaded but not a live tree pair. Two cases,
+            // distinguished exactly as the C reference's deorphan does
+            // (lfs.c `lfs_fs_deorphan`, the half-orphan pass):
+            //
+            // 1. Half-orphan (review H4): a crash between
+            //    `propagate_relocation`'s parent commit and predecessor
+            //    commit left the TREE holding the relocated twin while
+            //    the thread still points at the outdated address. The
+            //    tree is authoritative: re-point the thread AT the
+            //    twin. Reclaiming instead would permanently drop a
+            //    live pair from the thread, which the C reference's
+            //    allocator and traverse depend on. No gstate steal:
+            //    the twin carries the pair's (shared) log, so its
+            //    contribution stays counted through the tree address.
+            //
+            // 2. Full orphan: a crash mid-rmdir. Re-point `cur` past
+            //    it (to the orphan's own successor, or clear at the
+            //    list end), stealing the orphan's gstate contribution
+            //    (review C7/D5).
+            //
+            // Either way, re-check `cur` without advancing.
+            if let Some(twin) =
+                relocated_twin_in(&mut self.storage, &tree[..tree_count], next, buf_a, buf_b)?
+            {
+                self.apply_op_to_pair_inner(
+                    cur,
+                    &WriteOp::Noop,
+                    None,
+                    None,
+                    Some((twin, cur_is_hard)),
+                    &[],
+                    buf_a,
+                    buf_b,
+                )?;
+                self.used_cache = None; // the stale twin's exclusive block frees
+                continue;
+            }
             self.unthread_and_steal(cur, next, buf_a, buf_b)?;
             self.used_cache = None; // the orphan's blocks are now free
         }
@@ -4548,12 +4676,33 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
-        // Validate src_id against the live entry count of src_pair.
-        self.storage.read(src_pair.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(src_pair.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        // The durable MoveState body names the source pair at the
+        // address it had when the destination commit landed; the crash
+        // window spans the destination commit's relocation cascade,
+        // which can have relocated the source (review C6). Resolve to
+        // the pair's live address: the decoded address when it is
+        // still in the live tree, otherwise its relocated twin. The
+        // commit must land on the LIVE address: committing through the
+        // stale one can rotate onto a block the live pair does not
+        // contain, making the delete (and the gstate cancel) invisible
+        // to every future mount.
+        let mut tree = [BlockPair::new(BlockAddress::NONE, BlockAddress::NONE);
+            crate::alloc::MAX_QUEUED_PAIRS];
+        let tree_count =
+            collect_live_tree_pairs(&mut self.storage, self.root, &mut tree, buf_a, buf_b)?;
+        let target = if tree[..tree_count].contains(&src_pair) {
+            src_pair
+        } else {
+            relocated_twin_in(&mut self.storage, &tree[..tree_count], src_pair, buf_a, buf_b)?
+                .unwrap_or(src_pair)
+        };
+
+        // Validate src_id against the live entry count of the target.
+        self.storage.read(target.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(target.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
         {
-            let pair = MetadataPair::parse(src_pair.a, &*buf_a, src_pair.b, &*buf_b)?;
-            let active_is_a = pair.active_block == src_pair.a;
+            let pair = MetadataPair::parse(target.a, &*buf_a, target.b, &*buf_b)?;
+            let active_is_a = pair.active_block == target.a;
             let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
             let count = gather_live_slots(&pair, active_is_a, buf_a, buf_b, &mut slots)?;
             if (src_id as usize) >= count {
@@ -4561,9 +4710,11 @@ impl<S: Storage> Fs<S> {
             }
         }
 
+        // The balancing delta uses the ORIGINAL coordinates: it must
+        // XOR-cancel the destination commit's body byte for byte.
         let balance = crate::gstate::build_move_body(src_pair, src_id);
         self.apply_op_to_pair_with_movestate(
-            src_pair,
+            target,
             &WriteOp::Remove { id: src_id },
             Some(balance),
             buf_a,
