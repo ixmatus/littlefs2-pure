@@ -304,6 +304,45 @@ pub(crate) enum WriteOp<'a> {
     Noop,
 }
 
+/// Blocks the allocator must treat as in-use during a commit even
+/// though no committed metadata references them yet (review C9,
+/// design D7). Every commit entry point names its in-flight state
+/// explicitly; passing nothing requires the visible
+/// [`Inflight::NONE`], so a new commit path cannot forget the
+/// question.
+///
+/// Two shapes, matching how callers hold the information:
+///
+/// - `blocks`: individually named blocks (a relocation cascade's
+///   fresh halves, a freshly written chain the caller has as a list).
+/// - `chain`: an un-committed CTZ chain `(head, size)` whose blocks
+///   are programmed but unreferenced (the stateful `File`'s batched
+///   writes and the streaming append between extend and publish).
+///   Carried as coordinates, not a list, so the hot path never walks
+///   the chain (ADR-0011); the allocator walks it only on an
+///   authoritative rescan, which is exactly the path that cannot see
+///   un-committed blocks (ADR-0010's exclusion invariant).
+///
+/// Commit-internal allocations (the wear-relocation fresh block, the
+/// worn-block retry rescan, the split continuation) consume both:
+/// before review C9 they received an empty list from the publish
+/// paths, so a retry rescan could hand the relocation the very chain
+/// blocks the commit was publishing, destroying the file's data at
+/// the moment it became durable (reproduced).
+#[derive(Clone, Copy)]
+pub(crate) struct Inflight<'a> {
+    /// Individually named in-flight blocks.
+    pub(crate) blocks: &'a [BlockAddress],
+    /// An un-committed CTZ chain `(head_block, total_size)`.
+    pub(crate) chain: Option<(u32, u32)>,
+}
+
+impl Inflight<'static> {
+    /// No in-flight state: the commit publishes nothing whose blocks
+    /// a rescan could miss.
+    pub(crate) const NONE: Inflight<'static> = Inflight { blocks: &[], chain: None };
+}
+
 /// Outcome of walking a directory's HardTail chain looking for an entry
 /// by name (see [`Fs::seek_entry_in_chain`]). A directory may span
 /// several metadata pairs linked by `HardTail` tags; a name lives in one
@@ -1617,7 +1656,7 @@ impl<S: Storage> Fs<S> {
             None,
             None,
             None,
-            &chain[..total_blocks],
+            Inflight { blocks: &chain[..total_blocks], chain: None },
             buf_a,
             buf_b,
         )
@@ -2279,7 +2318,20 @@ impl<S: Storage> Fs<S> {
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
         let op = WriteOp::UpdateCtz { id, head_block, total_size };
-        self.apply_op_to_pair(pair_addr, &op, buf_a, buf_b)
+        // The chain being published is programmed but unreferenced
+        // until this commit lands; name it so commit-internal
+        // allocations (wear relocation, worn-block retry rescans,
+        // split continuations) cannot hand out its blocks (review C9).
+        self.apply_op_to_pair_inner(
+            pair_addr,
+            &op,
+            None,
+            None,
+            None,
+            Inflight { blocks: &[], chain: Some((head_block, total_size)) },
+            buf_a,
+            buf_b,
+        )
     }
 
     /// Resolve a path's parent directory. Returns `(parent_pair,
@@ -2454,7 +2506,7 @@ impl<S: Storage> Fs<S> {
             None,
             None,
             Some((new_dir, false)),
-            &new_blocks,
+            Inflight { blocks: &new_blocks, chain: None },
             buf_a,
             buf_b,
         )
@@ -2850,6 +2902,11 @@ impl<S: Storage> Fs<S> {
     /// append-or-compact dispatch. Convenience wrapper around
     /// [`Self::apply_op_to_pair_with_movestate`] with no MoveState
     /// piggyback (the common case).
+    /// Convenience wrapper for ops with NO in-flight blocks: it
+    /// passes [`Inflight::NONE`]. A caller publishing blocks that no
+    /// committed metadata references yet (a CTZ chain, a fresh pair)
+    /// must call [`Self::apply_op_to_pair_inner`] and name them
+    /// (review C9).
     pub(crate) fn apply_op_to_pair(
         &mut self,
         pair_addr: BlockPair,
@@ -2898,7 +2955,16 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
-        self.apply_op_to_pair_inner(pair_addr, op, extra_move_state, None, None, &[], buf_a, buf_b)
+        self.apply_op_to_pair_inner(
+            pair_addr,
+            op,
+            extra_move_state,
+            None,
+            None,
+            Inflight::NONE,
+            buf_a,
+            buf_b,
+        )
     }
 
     /// Inner form of [`Self::apply_op_to_pair_with_movestate`] that
@@ -2915,7 +2981,7 @@ impl<S: Storage> Fs<S> {
         extra_move_state: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
         extra_relocate_state: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
         new_tail: Option<(BlockPair, bool)>,
-        inflight: &[BlockAddress],
+        inflight: Inflight<'_>,
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
@@ -3142,7 +3208,7 @@ impl<S: Storage> Fs<S> {
         ms_arg: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
         rs_arg: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
         tail: Option<(BlockPair, bool)>,
-        inflight: &[BlockAddress],
+        inflight: Inflight<'_>,
         forced_victim: Option<BlockAddress>,
         buf_a: &mut [u8],
         buf_b: &mut [u8],
@@ -3312,7 +3378,7 @@ impl<S: Storage> Fs<S> {
             excluded[0] = active_addr;
             excluded[1] = alternate_addr;
             let mut ex_len = 2;
-            for &b in inflight {
+            for &b in inflight.blocks {
                 if ex_len >= excluded.len() {
                     return Err(Error::OutOfRange);
                 }
@@ -3325,6 +3391,7 @@ impl<S: Storage> Fs<S> {
                     self.root,
                     &mut self.used_cache,
                     &excluded[..ex_len],
+                    inflight.chain,
                     buf_b,
                 )?
             } else {
@@ -3333,6 +3400,7 @@ impl<S: Storage> Fs<S> {
                     self.root,
                     &mut self.used_cache,
                     &excluded[..ex_len],
+                    inflight.chain,
                     buf_a,
                 )?
             };
@@ -3543,7 +3611,7 @@ impl<S: Storage> Fs<S> {
         ms_arg: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
         rs_arg: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
         tail: Option<(BlockPair, bool)>,
-        inflight: &[BlockAddress],
+        inflight: Inflight<'_>,
         seed_fresh: Option<BlockAddress>,
         buf_a: &mut [u8],
         buf_b: &mut [u8],
@@ -3556,7 +3624,7 @@ impl<S: Storage> Fs<S> {
         excluded[0] = pair_addr.a;
         excluded[1] = pair_addr.b;
         let mut base_len = 2;
-        for &blk in inflight {
+        for &blk in inflight.blocks {
             if base_len >= excluded.len() {
                 return Err(Error::OutOfRange);
             }
@@ -3580,6 +3648,7 @@ impl<S: Storage> Fs<S> {
                             self.root,
                             &mut self.used_cache,
                             &excluded[..ex_len],
+                            inflight.chain,
                             buf_b,
                         )?
                     } else {
@@ -3588,6 +3657,7 @@ impl<S: Storage> Fs<S> {
                             self.root,
                             &mut self.used_cache,
                             &excluded[..ex_len],
+                            inflight.chain,
                             buf_a,
                         )?
                     }
@@ -3737,7 +3807,7 @@ impl<S: Storage> Fs<S> {
         inherited_tail: Option<(BlockPair, bool)>,
         ms_arg: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
         rs_arg: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
-        inflight: &[BlockAddress],
+        inflight: Inflight<'_>,
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<Option<BlockPair>, Error> {
@@ -3752,7 +3822,7 @@ impl<S: Storage> Fs<S> {
         excluded[0] = active_addr;
         excluded[1] = alternate_addr;
         let mut base = 2;
-        for &b in inflight {
+        for &b in inflight.blocks {
             if base >= excluded.len() {
                 return Err(Error::OutOfRange);
             }
@@ -3773,6 +3843,7 @@ impl<S: Storage> Fs<S> {
                     self.root,
                     &mut self.used_cache,
                     &excluded[..ex],
+                    inflight.chain,
                     buf_b,
                 )?
             } else {
@@ -3781,6 +3852,7 @@ impl<S: Storage> Fs<S> {
                     self.root,
                     &mut self.used_cache,
                     &excluded[..ex],
+                    inflight.chain,
                     buf_a,
                 )?
             };
@@ -3797,6 +3869,7 @@ impl<S: Storage> Fs<S> {
                     self.root,
                     &mut self.used_cache,
                     &excluded[..=ex],
+                    inflight.chain,
                     buf_b,
                 )?
             } else {
@@ -3805,6 +3878,7 @@ impl<S: Storage> Fs<S> {
                     self.root,
                     &mut self.used_cache,
                     &excluded[..=ex],
+                    inflight.chain,
                     buf_a,
                 )?
             };
@@ -3942,7 +4016,7 @@ impl<S: Storage> Fs<S> {
         reloc_inflight[0] = cont.a;
         reloc_inflight[1] = cont.b;
         let mut rl = 2;
-        for &b in inflight {
+        for &b in inflight.blocks {
             if rl >= reloc_inflight.len() {
                 return Err(Error::OutOfRange);
             }
@@ -3962,7 +4036,7 @@ impl<S: Storage> Fs<S> {
             ms_arg,
             rs_arg,
             Some((cont, true)),
-            &reloc_inflight[..rl],
+            Inflight { blocks: &reloc_inflight[..rl], chain: inflight.chain },
             None,
             buf_a,
             buf_b,
@@ -3982,7 +4056,7 @@ impl<S: Storage> Fs<S> {
         &mut self,
         old_pair: BlockPair,
         new_pair: BlockPair,
-        inflight: &[BlockAddress],
+        inflight: Inflight<'_>,
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
@@ -4007,7 +4081,7 @@ impl<S: Storage> Fs<S> {
         let fresh = if old_pair.a == new_pair.a { new_pair.b } else { new_pair.a };
         let mut next_inflight = [BlockAddress::NONE; crate::alloc::MAX_QUEUED_PAIRS];
         let mut next_len = 0;
-        for &b in inflight {
+        for &b in inflight.blocks {
             if next_len >= next_inflight.len() {
                 return Err(Error::OutOfRange);
             }
@@ -4044,7 +4118,7 @@ impl<S: Storage> Fs<S> {
                 None,
                 Some(relocate_body),
                 parent_new_tail,
-                &next_inflight[..next_len],
+                Inflight { blocks: &next_inflight[..next_len], chain: inflight.chain },
                 buf_a,
                 buf_b,
             )?;
@@ -4056,7 +4130,7 @@ impl<S: Storage> Fs<S> {
                         None,
                         None,
                         Some((new_pair, is_hard)),
-                        &[],
+                        Inflight::NONE,
                         buf_a,
                         buf_b,
                     )?;
@@ -4076,7 +4150,7 @@ impl<S: Storage> Fs<S> {
                 None,
                 Some(relocate_body),
                 Some((new_pair, is_hard)),
-                &next_inflight[..next_len],
+                Inflight { blocks: &next_inflight[..next_len], chain: inflight.chain },
                 buf_a,
                 buf_b,
             )?;
@@ -4129,7 +4203,16 @@ impl<S: Storage> Fs<S> {
             dropped_tail.or(Some((BlockPair::new(BlockAddress::NONE, BlockAddress::NONE), false)));
         let ms = (stolen_ms != [0u8; crate::gstate::MOVE_STATE_BODY_SIZE]).then_some(stolen_ms);
         let rs = (stolen_rs != [0u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]).then_some(stolen_rs);
-        self.apply_op_to_pair_inner(pred_pair, &WriteOp::Noop, ms, rs, new_tail, &[], buf_a, buf_b)
+        self.apply_op_to_pair_inner(
+            pred_pair,
+            &WriteOp::Noop,
+            ms,
+            rs,
+            new_tail,
+            Inflight::NONE,
+            buf_a,
+            buf_b,
+        )
     }
 
     /// Remove an empty directory at `path`.
@@ -4737,7 +4820,7 @@ impl<S: Storage> Fs<S> {
                     None,
                     None,
                     Some((twin, cur_is_hard)),
-                    &[],
+                    Inflight::NONE,
                     buf_a,
                     buf_b,
                 )?;
@@ -4833,7 +4916,7 @@ impl<S: Storage> Fs<S> {
             None,
             Some(balance),
             None,
-            &[],
+            Inflight::NONE,
             buf_a,
             buf_b,
         )
