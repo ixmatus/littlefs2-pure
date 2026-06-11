@@ -899,42 +899,54 @@ fn collect_live_tree_pairs<S: Storage>(
     Ok(tail)
 }
 
-/// Scan a metadata pair's committed tag stream for `MoveState` tags
-/// and XOR-accumulate their bodies into a single 12-byte body. The
-/// pair's contribution to the filesystem-global gstate is whatever
-/// this function returns; compaction must preserve it.
+/// Read a metadata pair's `MoveState` contribution: the body of the
+/// *latest* committed `MoveState` tag, or all-zero when none exists.
+///
+/// Latest-tag-wins is the C reference's semantics (review C4): a
+/// reader takes the single newest matching tag (`lfs_dir_getgstate`
+/// over `lfs_dir_getslice`), and every writer folds the pair's
+/// existing contribution into each tag it commits, so each committed
+/// tag is the pair's new TOTAL contribution, not a delta. A valid
+/// C-written log can hold several MoveState tags (two moves into the
+/// same directory with no intervening compaction); XOR-accumulating
+/// them, as this function did before the C4 fix, decodes a phantom
+/// move and mount recovery destroys a live entry. The write-side half
+/// of the convention lives in `apply_op_to_pair_inner` (append path
+/// folds `pair_existing` into the emitted tag) and
+/// `build_compact_commit` (the compacted block re-emits the net total
+/// as its single tag). An explicit all-zero body is a real
+/// contribution ("returned to zero") and must win over earlier
+/// non-zero tags, which the newest-first scan gives for free.
 fn scan_pair_move_state(pair: &MetadataPair<'_>) -> [u8; crate::gstate::MOVE_STATE_BODY_SIZE] {
-    let mut acc = [0u8; crate::gstate::MOVE_STATE_BODY_SIZE];
-    for entry in pair.reader.iter_tags() {
+    let mut out = [0u8; crate::gstate::MOVE_STATE_BODY_SIZE];
+    for entry in pair.reader.iter_tags_rev() {
         if entry.tag.tag_type() == crate::tag::TagType::MoveState
             && entry.body.len() == crate::gstate::MOVE_STATE_BODY_SIZE
         {
-            for (a, e) in acc.iter_mut().zip(entry.body.iter()) {
-                *a ^= *e;
-            }
+            out.copy_from_slice(entry.body);
+            break;
         }
     }
-    acc
+    out
 }
 
-/// Scan a metadata pair's active block for `RelocateState` tags and
-/// XOR-accumulate their bodies. The pair's contribution to the
-/// filesystem-global relocate-gstate; compaction folds this into the
-/// new commit so the contribution survives.
+/// Read a metadata pair's `RelocateState` contribution: the body of
+/// the latest committed `RelocateState` tag, or all-zero when none
+/// exists. Same latest-total-wins convention as
+/// [`scan_pair_move_state`]; see there for the derivation (review C4).
 fn scan_pair_relocate_state(
     pair: &MetadataPair<'_>,
 ) -> [u8; crate::gstate::RELOCATE_STATE_BODY_SIZE] {
-    let mut acc = [0u8; crate::gstate::RELOCATE_STATE_BODY_SIZE];
-    for entry in pair.reader.iter_tags() {
+    let mut out = [0u8; crate::gstate::RELOCATE_STATE_BODY_SIZE];
+    for entry in pair.reader.iter_tags_rev() {
         if entry.tag.tag_type() == crate::tag::TagType::RelocateState
             && entry.body.len() == crate::gstate::RELOCATE_STATE_BODY_SIZE
         {
-            for (a, e) in acc.iter_mut().zip(entry.body.iter()) {
-                *a ^= *e;
-            }
+            out.copy_from_slice(entry.body);
+            break;
         }
     }
-    acc
+    out
 }
 
 /// CCRC tag (8 bytes). Used by callers to decide whether to append in
@@ -2717,18 +2729,19 @@ impl<S: Storage> Fs<S> {
         self.apply_op_to_pair(parent, &op, buf_a, buf_b)
     }
 
-    /// Apply a `WriteOp` to a metadata pair, optionally piggybacking
-    /// a `MoveState` tag on the same commit. Used by cross-directory
-    /// rename to encode in-flight gstate atomically with the user-
-    /// visible change.
+    /// Apply a `WriteOp` to a metadata pair, optionally folding a
+    /// `MoveState` delta into the pair's contribution on the same
+    /// commit. Used by cross-directory rename to encode in-flight
+    /// gstate atomically with the user-visible change.
     ///
-    /// On the append path, the MoveState tag is emitted alongside the
-    /// op in the same commit. On the compact path, the pair's
-    /// pre-existing accumulated MoveState contribution is XOR-folded
-    /// with `extra_move_state` and emitted as one net MoveState in
-    /// the compacted block; without this the gstate would be lost
-    /// whenever a cross-dir rename's destination pair compacts
-    /// between the two rename commits.
+    /// `extra_move_state` is a DELTA. Both paths fold it with the
+    /// pair's existing contribution and emit the pair's new TOTAL
+    /// (the C convention; review C4, see [`crate::gstate`]): the
+    /// append path emits the folded total as a new tag (shadowing the
+    /// previous total under the reader's latest-tag-wins scan, even
+    /// when the new total is all-zero), and the compact path emits
+    /// the net total as the rebuilt block's single gstate tag
+    /// (omitting an all-zero net: absence reads as zero).
     fn apply_op_to_pair_with_movestate(
         &mut self,
         pair_addr: BlockPair,
@@ -2825,7 +2838,16 @@ impl<S: Storage> Fs<S> {
                 let mut commit =
                     crate::meta::Commit::new_appending(active_buf, committed_end, next_ptag)?;
                 emit_op(&mut commit, op)?;
-                if let Some(body) = extra_move_state {
+                // Gstate tags carry the pair's new TOTAL contribution
+                // (the C convention; review C4): fold the existing
+                // total with the caller's delta. An all-zero result
+                // is still emitted; it must shadow the prior non-zero
+                // total under the reader's latest-tag-wins scan.
+                if let Some(extra) = extra_move_state {
+                    let mut body = pair_existing_ms;
+                    for (n, e) in body.iter_mut().zip(extra.iter()) {
+                        *n ^= *e;
+                    }
                     commit.tag(
                         crate::tag::Tag::new(
                             true,
@@ -2836,7 +2858,11 @@ impl<S: Storage> Fs<S> {
                         &body,
                     )?;
                 }
-                if let Some(body) = extra_relocate_state {
+                if let Some(extra) = extra_relocate_state {
+                    let mut body = pair_existing_rs;
+                    for (n, e) in body.iter_mut().zip(extra.iter()) {
+                        *n ^= *e;
+                    }
                     commit.tag(
                         crate::tag::Tag::new(
                             true,
@@ -3873,6 +3899,54 @@ impl<S: Storage> Fs<S> {
         Ok(())
     }
 
+    /// Drop `dropped` from the global metadata-pair thread: re-point
+    /// `pred_pair`'s tail past it (to the dropped pair's own tail, or
+    /// clear the tail at the list end), **stealing** the dropped
+    /// pair's gstate contributions into the same commit.
+    ///
+    /// This is the C reference's `lfs_dir_drop` (`lfs.c:1831`,
+    /// commented `// steal state`), and the steal is load-bearing
+    /// (review C7): a pair can carry a non-zero `MoveState` total that
+    /// is balanced globally (a completed rename out of the directory
+    /// leaves equal totals on source and destination). Dropping the
+    /// pair without folding its total into the survivor leaves the
+    /// reachable aggregate permanently non-zero; every subsequent
+    /// mount then decodes a pending move against the dead pair, and
+    /// once that pair's content no longer covers the decoded id the
+    /// image fails to mount at all. Routing every thread-drop through
+    /// this helper makes the steal structural (review D5): a future
+    /// drop site cannot forget it.
+    ///
+    /// The steal rides the un-thread commit, which is the moment the
+    /// pair leaves the reachable set; a crash before it leaves the
+    /// pair thread-reachable (its contribution still counted), a
+    /// crash after it has the contribution already folded into
+    /// `pred_pair`. Both gstate kinds are stolen; the same argument
+    /// applies to `RelocateState`.
+    fn unthread_and_steal(
+        &mut self,
+        pred_pair: BlockPair,
+        dropped: BlockPair,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<(), Error> {
+        self.storage.read(dropped.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+        self.storage.read(dropped.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        let (dropped_tail, stolen_ms, stolen_rs) = {
+            let p = MetadataPair::parse(dropped.a, &*buf_a, dropped.b, &*buf_b)?;
+            (
+                p.reader.tail().map(|t| (t, p.reader.is_hard_tail())),
+                scan_pair_move_state(&p),
+                scan_pair_relocate_state(&p),
+            )
+        };
+        let new_tail =
+            dropped_tail.or(Some((BlockPair::new(BlockAddress::NONE, BlockAddress::NONE), false)));
+        let ms = (stolen_ms != [0u8; crate::gstate::MOVE_STATE_BODY_SIZE]).then_some(stolen_ms);
+        let rs = (stolen_rs != [0u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]).then_some(stolen_rs);
+        self.apply_op_to_pair_inner(pred_pair, &WriteOp::Noop, ms, rs, new_tail, &[], buf_a, buf_b)
+    }
+
     /// Remove an empty directory at `path`.
     ///
     /// Verifies the entry is a Directory and its metadata pair has no
@@ -3935,41 +4009,20 @@ impl<S: Storage> Fs<S> {
             return Err(Error::NotEmpty);
         }
 
-        // Read the removed directory's own tail (its successor in the
-        // global metadata-pair list) so the thread predecessor can be
-        // re-pointed past it.
-        self.storage.read(dir_pair.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(dir_pair.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        let dir_tail: Option<(BlockPair, bool)> = {
-            let p = MetadataPair::parse(dir_pair.a, &*buf_a, dir_pair.b, &*buf_b)?;
-            p.reader.tail().map(|t| (t, p.reader.is_hard_tail()))
-        };
-
         // Remove the entry from the parent (drops the directory from the
         // tree). Then un-thread it: re-point the thread predecessor's tail
         // past the removed pair so the global list stays consistent for
-        // the C reference. A crash between the two leaves the pair in the
-        // thread but not the tree (an orphan), which mount-time deorphan
-        // recovery must reconcile; that recovery is the remaining
-        // lfs-xmx slice (ADR-0012).
+        // the C reference, stealing the dropped pair's gstate
+        // contribution into the same commit (review C7; the C
+        // reference's `lfs_dir_drop` "steal state"). A crash between
+        // the two leaves the pair in the thread but not the tree (an
+        // orphan), which mount-time deorphan recovery reconciles with
+        // the same stealing drop.
         self.remove_from_pair(parent, leaf.as_bytes(), buf_a, buf_b)?;
         if let Some((pred_pair, _is_hard)) =
             find_thread_predecessor(&mut self.storage, self.root, dir_pair, buf_a, buf_b)?
         {
-            // Re-point past the removed dir: to its successor, or clear
-            // the tail (NONE sentinel) if it was the list end.
-            let new_tail =
-                dir_tail.or(Some((BlockPair::new(BlockAddress::NONE, BlockAddress::NONE), false)));
-            self.apply_op_to_pair_inner(
-                pred_pair,
-                &WriteOp::Noop,
-                None,
-                None,
-                new_tail,
-                &[],
-                buf_a,
-                buf_b,
-            )?;
+            self.unthread_and_steal(pred_pair, dir_pair, buf_a, buf_b)?;
         }
         Ok(())
     }
@@ -4465,26 +4518,10 @@ impl<S: Storage> Fs<S> {
             }
             // `next` is threaded but not a live tree pair: a crash orphan.
             // Re-point `cur` past it (to the orphan's own successor, or
-            // clear if it was the list end), then re-check `cur` for
-            // consecutive orphans without advancing.
-            self.storage.read(next.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-            self.storage.read(next.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-            let orphan_tail = {
-                let p = MetadataPair::parse(next.a, &*buf_a, next.b, &*buf_b)?;
-                p.reader.tail().map(|t| (t, p.reader.is_hard_tail()))
-            };
-            let new_tail = orphan_tail
-                .or(Some((BlockPair::new(BlockAddress::NONE, BlockAddress::NONE), false)));
-            self.apply_op_to_pair_inner(
-                cur,
-                &WriteOp::Noop,
-                None,
-                None,
-                new_tail,
-                &[],
-                buf_a,
-                buf_b,
-            )?;
+            // clear if it was the list end), stealing the orphan's
+            // gstate contribution (review C7/D5), then re-check `cur`
+            // for consecutive orphans without advancing.
+            self.unthread_and_steal(cur, next, buf_a, buf_b)?;
             self.used_cache = None; // the orphan's blocks are now free
         }
         Ok(())
