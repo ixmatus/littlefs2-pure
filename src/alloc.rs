@@ -648,12 +648,15 @@ pub fn alloc_blocks_cached<S: Storage>(
 ///
 /// Companion to [`alloc_blocks_cached`] for the wear-levelling relocation
 /// path, where the second scratch buffer holds the compacted bytes and
-/// only one buffer is free for a rescan. Same over-approximation safety.
+/// only one buffer is free for a rescan. Same over-approximation safety
+/// and the same `exclude_chain` contract: an in-flight CTZ chain is
+/// walked and marked only on the rescan path (review C9).
 pub fn alloc_one_block_cached_single_buf<S: Storage>(
     storage: &mut S,
     root: BlockPair,
     cache: &mut Option<Bitmap>,
     excluded: &[BlockAddress],
+    exclude_chain: Option<(u32, u32)>,
     buf: &mut [u8],
 ) -> Result<BlockAddress, Error> {
     let mut out = [BlockAddress::NONE; 1];
@@ -664,6 +667,13 @@ pub fn alloc_one_block_cached_single_buf<S: Storage>(
     }
     let mut fresh = Bitmap::EMPTY;
     scan_used_with_single_buf(storage, root, &mut fresh, buf)?;
+    // The rescan only sees committed (root-reachable) blocks; mark any
+    // in-flight chain the commit is publishing before choosing
+    // (review C9: without this, a commit-internal retry rescan handed
+    // the relocation the very chain blocks being published).
+    if let Some((head, size)) = exclude_chain {
+        walk_ctz_chain(storage, head, size, &mut fresh)?;
+    }
     take_free_blocks(&mut fresh, excluded, &mut out, S::BLOCK_COUNT)?;
     *cache = Some(fresh);
     Ok(out[0])

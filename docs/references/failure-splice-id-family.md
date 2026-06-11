@@ -2,7 +2,7 @@
 slug: failure-splice-id-family
 category: failure-museum
 citation: "littlefs2-pure post mortem: the raw-id versus live-id confusion family (2026-06 deep review C1, C2, C5, H1); shipped v1.0.0 through v1.2.0, fixed in the ADR-0015 arc (tracker ids lfs-2dg, lfs-3z8, lfs-fb2, lfs-r88 at the time)"
-canonical: REVIEW-v1.2.0-2026-06-10.md and docs/decisions/0015-shared-splice-core-and-attr-replay.md (this repository)
+canonical: docs/reviews/2026-06-10-deep-adversarial-review.md and docs/decisions/0015-shared-splice-core-and-attr-replay.md (this repository)
 doi: none
 archived: none (internal artifact, committed in tree)
 archive_date: none

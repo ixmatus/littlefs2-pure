@@ -173,6 +173,29 @@ int main(int argc, char **argv) {
             snprintf(path, sizeof path, "/d/f%02d", i);
             rc = verify_file(&lfs, path, (const uint8_t *)"x", 1);
         }
+    } else if (strcmp(argv[2], "remove") == 0) {
+        // Delete-tag wire compatibility (review C3): the image holds
+        // /aa = "keep-me" and a REMOVED /bb. Before the fix the
+        // crate's writer emitted entry deletes with the reserved
+        // length sentinel 0x3FF where the C reference writes size 0;
+        // lfs_dir_fetchmatch's exact-compare besttag invalidation
+        // (lfs.c:1244) then never matches the delete, so the C
+        // reference resolves /bb to its NEIGHBOR /aa, serves its
+        // content, and an lfs_remove("/bb") would destroy /aa. The
+        // scenario therefore requires BOTH: /aa intact AND /bb
+        // genuinely absent under the C reference's view.
+        rc = verify_file(&lfs, "/aa", (const uint8_t *)"keep-me", 7);
+        if (rc == 0) {
+            struct lfs_info info;
+            int st = lfs_stat(&lfs, "/bb", &info);
+            if (st != LFS_ERR_NOENT) {
+                fprintf(stderr,
+                        "verify_image: /bb should be deleted but lfs_stat "
+                        "returned %d (the delete tag is invisible to the C "
+                        "reference)\n", st);
+                rc = 1;
+            }
+        }
     } else if (strcmp(argv[2], "split_root") == 0) {
         // The root pair {0,1} split; every entry must resolve, including
         // those the writer placed in the root's HardTail continuation.
