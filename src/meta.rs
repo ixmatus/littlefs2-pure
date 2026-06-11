@@ -336,6 +336,29 @@ impl<'a> MetadataReader<'a> {
     pub fn iter_tags(&self) -> TagIter<'a> {
         TagIter { block: self.block, offset: 0, end: self.committed_end, ptag: 0xFFFF_FFFF }
     }
+
+    /// Iterate over tags in *reverse* commit order (newest first), from
+    /// the verified region of the block.
+    ///
+    /// Mirrors the backward walk in the C reference's `lfs_dir_getslice`
+    /// (`lfs.c:706`): starting from the committed end with the running
+    /// XOR base, each step recovers the previous tag's decoded value by
+    /// XORing the raw on-disk word of the current tag against the
+    /// current decoded value, then steps back by the previous tag's
+    /// `dsize`. The valid bit (bit 31) is masked off every yielded tag,
+    /// exactly as the C reference masks with `0x7fffffff`: the region
+    /// was already CCRC-verified forward, and the bit's parity varies
+    /// per commit, so it carries no information for a backward
+    /// consumer. [`Tag::is_valid`] is therefore `false` on yielded
+    /// tags; match on type, id, and length only.
+    ///
+    /// This is the substrate for splice-diff (`gdiff`) queries: walking
+    /// newest-to-oldest, the *first* tag matching an id-adjusted query
+    /// is the live one, with no per-slot state.
+    #[must_use]
+    pub fn iter_tags_rev(&self) -> TagIterRev<'a> {
+        TagIterRev { block: self.block, off: self.committed_end, ntag: self.next_ptag }
+    }
 }
 
 /// Scan the committed region for the latest Tail tag (Soft or Hard)
@@ -622,6 +645,48 @@ pub struct TagIter<'a> {
     offset: usize,
     end: usize,
     ptag: u32,
+}
+
+/// Iterator over tags in *reverse* commit order. Returned by
+/// [`MetadataReader::iter_tags_rev`]; see there for the decoding
+/// derivation against the C reference.
+#[derive(Clone, Debug)]
+pub struct TagIterRev<'a> {
+    block: &'a [u8],
+    /// Offset just past the tag that will be yielded next.
+    off: usize,
+    /// Decoded value of the tag that will be yielded next (the running
+    /// XOR base; `next_ptag` at construction).
+    ntag: u32,
+}
+
+impl<'a> Iterator for TagIterRev<'a> {
+    type Item = TagEntry<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let cur = Tag::from_bits(self.ntag & 0x7FFF_FFFF);
+        let dsize = cur.dsize();
+        // Stop at the revision header: the next tag word would start
+        // before offset 4. Matches the C reference's loop condition
+        // `off >= sizeof(lfs_tag_t) + lfs_tag_dsize(ntag)`.
+        if self.off < 4 + dsize {
+            return None;
+        }
+        self.off -= dsize;
+        // Recover the previous tag's decoded value: on disk,
+        // raw[i] = decoded[i] XOR decoded[i-1], so
+        // decoded[i-1] = raw[i] XOR decoded[i]. Bit 31 is masked; see
+        // `iter_tags_rev`.
+        let raw = u32::from_be_bytes([
+            self.block[self.off],
+            self.block[self.off + 1],
+            self.block[self.off + 2],
+            self.block[self.off + 3],
+        ]);
+        self.ntag = (raw ^ self.ntag) & 0x7FFF_FFFF;
+        let body = &self.block[self.off + 4..self.off + dsize];
+        Some(TagEntry { tag: cur, body })
+    }
 }
 
 /// Signed revision comparison.

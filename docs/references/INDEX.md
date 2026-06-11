@@ -31,6 +31,7 @@ Post mortems are written at fix time, in the same slice as the fix; crash consis
 
 - [failure-fcrc-rollback](failure-fcrc-rollback.md) — the FCRC reader rollback that discarded durable commits (v1.0.2 to v1.1.0)
 - [failure-setlen-nor](failure-setlen-nor.md) — shrink then extend ANDed bytes into stale NOR cells (fixed v1.1.0)
+- [failure-splice-id-family](failure-splice-id-family.md) — one raw-id versus live-id confusion, five copies, four Criticals (2026-06 review C1/C2/C5/H1; fixed in the ADR-0015 arc)
 
 ## Named gaps
 

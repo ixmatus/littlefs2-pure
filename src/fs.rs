@@ -213,43 +213,9 @@ fn gather_live_slots(
         let id = tag.id() as usize;
         let body_off = (entry.body.as_ptr() as usize).saturating_sub(base);
         let body_len = entry.body.len();
-        match tag.tag_type() {
-            TagType::Create => {
-                if count >= MAX_LIVE_ENTRIES {
-                    return Err(Error::OutOfRange);
-                }
-                if id > count {
-                    return Err(Error::Corrupt);
-                }
-                let mut i = count;
-                while i > id {
-                    slots[i] = slots[i - 1];
-                    i -= 1;
-                }
-                slots[id] = SlotOffsets::EMPTY;
-                count += 1;
-            }
-            TagType::Delete => {
-                if id >= count {
-                    return Err(Error::Corrupt);
-                }
-                let mut i = id;
-                while i + 1 < count {
-                    slots[i] = slots[i + 1];
-                    i += 1;
-                }
-                slots[count - 1] = SlotOffsets::EMPTY;
-                count -= 1;
-            }
-            TagType::RegularFile | TagType::Directory | TagType::Superblock => {
-                if id >= count {
-                    if id == count && count < MAX_LIVE_ENTRIES {
-                        slots[id] = SlotOffsets::EMPTY;
-                        count += 1;
-                    } else {
-                        return Err(Error::Corrupt);
-                    }
-                }
+        match crate::dir::splice_step(slots, &mut count, SlotOffsets::EMPTY, tag)? {
+            crate::dir::SpliceStep::Consumed => {}
+            crate::dir::SpliceStep::Name(id) => {
                 slots[id].name_off = u16::try_from(body_off).map_err(|_| Error::OutOfRange)?;
                 slots[id].name_len = u16::try_from(body_len).map_err(|_| Error::OutOfRange)?;
                 slots[id].name_kind = match tag.tag_type() {
@@ -259,17 +225,26 @@ fn gather_live_slots(
                     _ => unreachable!(),
                 };
             }
-            TagType::InlineStruct | TagType::CtzStruct | TagType::DirStruct if id < count => {
-                slots[id].struct_off = u16::try_from(body_off).map_err(|_| Error::OutOfRange)?;
-                slots[id].struct_len = u16::try_from(body_len).map_err(|_| Error::OutOfRange)?;
-                slots[id].struct_kind = match tag.tag_type() {
-                    TagType::InlineStruct => 0,
-                    TagType::CtzStruct => 1,
-                    TagType::DirStruct => 2,
-                    _ => unreachable!(),
-                };
-            }
-            _ => {}
+            crate::dir::SpliceStep::Other => match tag.tag_type() {
+                // STRUCT tags may precede the NAME that establishes
+                // their id's count in a C-compacted log (review H1);
+                // park them and let a later NAME claim the slot.
+                TagType::InlineStruct | TagType::CtzStruct | TagType::DirStruct
+                    if id < MAX_LIVE_ENTRIES =>
+                {
+                    slots[id].struct_off =
+                        u16::try_from(body_off).map_err(|_| Error::OutOfRange)?;
+                    slots[id].struct_len =
+                        u16::try_from(body_len).map_err(|_| Error::OutOfRange)?;
+                    slots[id].struct_kind = match tag.tag_type() {
+                        TagType::InlineStruct => 0,
+                        TagType::CtzStruct => 1,
+                        TagType::DirStruct => 2,
+                        _ => unreachable!(),
+                    };
+                }
+                _ => {}
+            },
         }
     }
     Ok(count)
@@ -409,10 +384,280 @@ fn emit_op(commit: &mut crate::meta::Commit<'_>, op: &WriteOp<'_>) -> Result<(),
     Ok(())
 }
 
+/// How a [`WriteOp`] manifests on one emitted slot during a compaction
+/// rebuild. [`slot_plan`] is the single, exhaustive derivation site
+/// (review D4): a future `WriteOp` variant fails to compile there
+/// until its compaction effect is declared, which closes the
+/// silent-drop class behind review C1 (`SetAttr` / `RemoveAttr` fell
+/// through a `_ => {}` wildcard, so a `set_attr` landing on a full
+/// block compacted, persisted nothing, and returned `Ok`).
+#[derive(Clone, Copy)]
+struct SlotPlan<'a> {
+    /// Skip this entry entirely (it is `Remove`'s target).
+    drop_entry: bool,
+    /// Emit a second NAME tag after the copied one
+    /// (`RenameInPlace`'s new name); the latest NAME shadows at read
+    /// time.
+    extra_name: Option<(crate::tag::TagType, &'a [u8])>,
+    /// Replace the slot's STRUCT tag type and body.
+    struct_override: Option<(crate::tag::TagType, OverrideBody<'a>)>,
+    /// Suppress this attr id during the source-log attr replay (the
+    /// in-flight `SetAttr` / `RemoveAttr` supersedes the stored
+    /// value).
+    attr_suppress: Option<u8>,
+    /// Emit this attr value after the replay (`SetAttr`'s new value;
+    /// the C reference merges the triggering commit's attrs the same
+    /// way in `lfs_dir_compact`).
+    attr_append: Option<(u8, &'a [u8])>,
+}
+
+/// A STRUCT body override: either caller-provided bytes (`Update`'s
+/// inline content) or two little-endian words materialized at emission
+/// (`UpdateCtz`'s `(head, size)`, `UpdateDirStruct`'s pair address).
+#[derive(Clone, Copy)]
+enum OverrideBody<'a> {
+    Slice(&'a [u8]),
+    Words(u32, u32),
+}
+
+impl SlotPlan<'static> {
+    const NONE: Self = Self {
+        drop_entry: false,
+        extra_name: None,
+        struct_override: None,
+        attr_suppress: None,
+        attr_append: None,
+    };
+}
+
+/// Derive `op`'s effect on the emitted slot at combined index `i`.
+/// Exhaustive over [`WriteOp`] with no wildcard arm by design; see
+/// [`SlotPlan`].
+fn slot_plan<'a>(op: &WriteOp<'a>, i: u16) -> SlotPlan<'a> {
+    use crate::tag::TagType;
+    match *op {
+        WriteOp::Update { id, content } if id == i => SlotPlan {
+            struct_override: Some((TagType::InlineStruct, OverrideBody::Slice(content))),
+            ..SlotPlan::NONE
+        },
+        WriteOp::UpdateCtz { id, head_block, total_size } if id == i => SlotPlan {
+            struct_override: Some((
+                TagType::CtzStruct,
+                OverrideBody::Words(head_block, total_size),
+            )),
+            ..SlotPlan::NONE
+        },
+        WriteOp::UpdateDirStruct { id, new_pair } if id == i => SlotPlan {
+            struct_override: Some((
+                TagType::DirStruct,
+                OverrideBody::Words(new_pair.a.as_u32(), new_pair.b.as_u32()),
+            )),
+            ..SlotPlan::NONE
+        },
+        WriteOp::Remove { id } if id == i => SlotPlan { drop_entry: true, ..SlotPlan::NONE },
+        WriteOp::RenameInPlace { id, name_type, new_name } if id == i => {
+            SlotPlan { extra_name: Some((name_type, new_name)), ..SlotPlan::NONE }
+        }
+        WriteOp::SetAttr { id, attr_id, value } if id == i => SlotPlan {
+            attr_suppress: Some(attr_id),
+            attr_append: Some((attr_id, value)),
+            ..SlotPlan::NONE
+        },
+        WriteOp::RemoveAttr { id, attr_id } if id == i => {
+            // The rebuilt block simply omits the attr; no delete
+            // marker is needed because there is no older tag left to
+            // shadow.
+            SlotPlan { attr_suppress: Some(attr_id), ..SlotPlan::NONE }
+        }
+        // Create-family ops and Noop touch no existing slot; the
+        // guarded arms above fall through here when `i` is not their
+        // target. Listed exhaustively so a new variant cannot compile
+        // without declaring its compaction effect.
+        WriteOp::Create { .. }
+        | WriteOp::CreateCtz { .. }
+        | WriteOp::CreateDir { .. }
+        | WriteOp::Noop
+        | WriteOp::Update { .. }
+        | WriteOp::UpdateCtz { .. }
+        | WriteOp::UpdateDirStruct { .. }
+        | WriteOp::Remove { .. }
+        | WriteOp::RenameInPlace { .. }
+        | WriteOp::SetAttr { .. }
+        | WriteOp::RemoveAttr { .. } => SlotPlan::NONE,
+    }
+}
+
+/// Where [`emit_compact_range`] sends its tags: a real [`crate::meta::Commit`]
+/// (the compaction write path) or a byte counter (the split-point size
+/// estimate). One emission function feeding both is what guarantees
+/// the estimate and the writer cannot drift (review D3); they were
+/// previously parallel constructions required to agree byte-for-byte
+/// by comment alone.
+enum TagSink<'x, 'b> {
+    Commit(&'x mut crate::meta::Commit<'b>),
+    Count(&'x mut usize),
+}
+
+impl TagSink<'_, '_> {
+    fn tag(&mut self, tag: crate::tag::Tag, body: &[u8]) -> Result<(), Error> {
+        match self {
+            TagSink::Commit(c) => c.tag(tag, body),
+            TagSink::Count(n) => {
+                **n += tag.dsize();
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Emit the combined-sequence sub-range `[lo, hi)` of a compaction
+/// rebuild: the live slots `slots[lo..min(hi, count)]` followed by the
+/// op's virtual new entry at combined index `count` when it falls in
+/// range. Per entry: a `Create` tag, the NAME, the STRUCT (with `op`'s
+/// substitutions applied), and the entry's live user attributes
+/// replayed from the source log (review C1; the C reference's
+/// `lfs_dir_compact` replays all unique tags per live id, attributes
+/// included). `emit_id` restarts at 0 for every range, so a split
+/// continuation's entries get local ids 0.. (the reader concatenates
+/// them across the HardTail chain).
+///
+/// `source_buf` is the full source (active) block; the attr replay
+/// re-parses it, which is cheap relative to the compaction itself.
+fn emit_compact_range(
+    sink: &mut TagSink<'_, '_>,
+    source_buf: &[u8],
+    slots: &[SlotOffsets; MAX_LIVE_ENTRIES],
+    count: usize,
+    op: &WriteOp<'_>,
+    lo: usize,
+    hi: usize,
+) -> Result<(), Error> {
+    use crate::tag::{Tag, TagType};
+
+    let reader = crate::meta::MetadataReader::new(source_buf)?;
+    let mut emit_id: u16 = 0;
+    for (i, s) in slots.iter().enumerate().take(hi.min(count)).skip(lo) {
+        let plan = slot_plan(op, i as u16);
+        if plan.drop_entry {
+            continue; // drop this entry; do not bump emit_id
+        }
+        if s.name_kind == 0xff || s.struct_kind == 0xff {
+            return Err(Error::Corrupt);
+        }
+        let name_type = match s.name_kind {
+            0 => TagType::RegularFile,
+            1 => TagType::Directory,
+            2 => TagType::Superblock,
+            _ => return Err(Error::Corrupt),
+        };
+        let struct_type = match s.struct_kind {
+            0 => TagType::InlineStruct,
+            1 => TagType::CtzStruct,
+            2 => TagType::DirStruct,
+            _ => return Err(Error::Corrupt),
+        };
+        let name = &source_buf[s.name_off as usize..s.name_off as usize + s.name_len as usize];
+        sink.tag(Tag::new(true, TagType::Create, emit_id, 0), &[])?;
+        sink.tag(Tag::new(true, name_type, emit_id, s.name_len), name)?;
+        if let Some((nt, new_name)) = plan.extra_name {
+            // RenameInPlace: a second NAME at the same id; the newer
+            // one shadows at read time.
+            sink.tag(Tag::new(true, nt, emit_id, new_name.len() as u16), new_name)?;
+        }
+        match plan.struct_override {
+            Some((st, OverrideBody::Slice(body))) => {
+                sink.tag(Tag::new(true, st, emit_id, body.len() as u16), body)?;
+            }
+            Some((st, OverrideBody::Words(w0, w1))) => {
+                let mut body = [0u8; 8];
+                body[0..4].copy_from_slice(&w0.to_le_bytes());
+                body[4..8].copy_from_slice(&w1.to_le_bytes());
+                sink.tag(Tag::new(true, st, emit_id, 8), &body)?;
+            }
+            None => {
+                let struct_body = &source_buf
+                    [s.struct_off as usize..s.struct_off as usize + s.struct_len as usize];
+                sink.tag(Tag::new(true, struct_type, emit_id, s.struct_len), struct_body)?;
+            }
+        }
+        // Replay the entry's live attributes (latest value per attr
+        // id, splice-correct, delete markers consume their id), minus
+        // the one the in-flight op supersedes.
+        crate::dir::for_each_live_attr(&reader, i as u16, |a, body| {
+            if plan.attr_suppress == Some(a) {
+                return Ok(());
+            }
+            sink.tag(Tag::new(true, TagType::UserAttr(a), emit_id, body.len() as u16), body)
+        })?;
+        if let Some((a, v)) = plan.attr_append {
+            sink.tag(Tag::new(true, TagType::UserAttr(a), emit_id, v.len() as u16), v)?;
+        }
+        emit_id += 1;
+    }
+
+    // Append the new entry, but only when its combined index `count`
+    // falls in `[lo, hi)`. The new entry has the highest index, so a
+    // split always places it in the upper-half continuation; the lower
+    // half emits no new entry. Its local id is `emit_id` (the entries
+    // emitted in this range), which equals the op's `id` for the
+    // single-pair `[0, total)` case the debug-asserts check. The match
+    // is exhaustive with no wildcard (review D4).
+    if lo <= count && count < hi {
+        match *op {
+            WriteOp::Create { id, name, content } => {
+                debug_assert!(
+                    lo > 0 || id == emit_id,
+                    "single-pair Create id must equal emit count"
+                );
+                sink.tag(Tag::new(true, TagType::Create, emit_id, 0), &[])?;
+                sink.tag(Tag::new(true, TagType::RegularFile, emit_id, name.len() as u16), name)?;
+                sink.tag(
+                    Tag::new(true, TagType::InlineStruct, emit_id, content.len() as u16),
+                    content,
+                )?;
+            }
+            WriteOp::CreateCtz { id, name, head_block, total_size } => {
+                debug_assert!(
+                    lo > 0 || id == emit_id,
+                    "single-pair CreateCtz id must equal emit count"
+                );
+                sink.tag(Tag::new(true, TagType::Create, emit_id, 0), &[])?;
+                sink.tag(Tag::new(true, TagType::RegularFile, emit_id, name.len() as u16), name)?;
+                let mut body = [0u8; 8];
+                body[0..4].copy_from_slice(&head_block.to_le_bytes());
+                body[4..8].copy_from_slice(&total_size.to_le_bytes());
+                sink.tag(Tag::new(true, TagType::CtzStruct, emit_id, 8), &body)?;
+            }
+            WriteOp::CreateDir { id, name, dir_pair } => {
+                debug_assert!(
+                    lo > 0 || id == emit_id,
+                    "single-pair CreateDir id must equal emit count"
+                );
+                sink.tag(Tag::new(true, TagType::Create, emit_id, 0), &[])?;
+                sink.tag(Tag::new(true, TagType::Directory, emit_id, name.len() as u16), name)?;
+                let mut body = [0u8; 8];
+                body[0..4].copy_from_slice(&dir_pair.a.as_u32().to_le_bytes());
+                body[4..8].copy_from_slice(&dir_pair.b.as_u32().to_le_bytes());
+                sink.tag(Tag::new(true, TagType::DirStruct, emit_id, 8), &body)?;
+            }
+            WriteOp::Update { .. }
+            | WriteOp::UpdateCtz { .. }
+            | WriteOp::UpdateDirStruct { .. }
+            | WriteOp::Remove { .. }
+            | WriteOp::RenameInPlace { .. }
+            | WriteOp::SetAttr { .. }
+            | WriteOp::RemoveAttr { .. }
+            | WriteOp::Noop => {}
+        }
+    }
+    Ok(())
+}
+
 /// Build a compacted commit on `alt_buf`: replay every live entry from
-/// `slots[..count]` (reading source bytes from `source_buf`) and apply
-/// `op` (either creating a new entry at the end or replacing an
-/// existing entry's struct body). Returns the total bytes written.
+/// `slots[..count]` (reading source bytes from `source_buf`, user
+/// attributes included) and apply `op` (creating a new entry at the
+/// end, replacing an existing entry's struct body, or merging an
+/// in-flight attr change). Returns the total bytes written.
 /// `alt_buf` is pre-filled with `0xFF` (erased state).
 #[allow(clippy::too_many_arguments)]
 fn build_compact_commit(
@@ -437,165 +682,11 @@ fn build_compact_commit(
     }
     let mut commit = crate::meta::Commit::new(alt_buf, new_revision)?;
 
-    // Emit only the combined-sequence sub-range `[lo, hi)`: the live
-    // slots `slots[lo..min(hi, count)]` followed by the virtual new entry
-    // at index `count` when it falls in range. A split builds the lower
-    // half with `[0, split)` and the continuation with `[split, total)`;
-    // the prior single-pair callers pass `[0, total)`. `emit_id` restarts
-    // at 0 for every range, so a continuation's entries get local ids
-    // 0.. (the reader concatenates them across the HardTail chain).
-    let mut emit_id: u16 = 0;
-    for (i, s) in slots.iter().enumerate().take(hi.min(count)).skip(lo) {
-        if let WriteOp::Remove { id: remove_id } = *op {
-            if (i as u16) == remove_id {
-                continue; // drop this entry; do not bump emit_id
-            }
-        }
-        if s.name_kind == 0xff || s.struct_kind == 0xff {
-            return Err(Error::Corrupt);
-        }
-        let name_type = match s.name_kind {
-            0 => TagType::RegularFile,
-            1 => TagType::Directory,
-            2 => TagType::Superblock,
-            _ => return Err(Error::Corrupt),
-        };
-        let struct_type = match s.struct_kind {
-            0 => TagType::InlineStruct,
-            1 => TagType::CtzStruct,
-            2 => TagType::DirStruct,
-            _ => return Err(Error::Corrupt),
-        };
-        let name = &source_buf[s.name_off as usize..s.name_off as usize + s.name_len as usize];
-        commit.tag(crate::tag::Tag::new(true, TagType::Create, emit_id, 0), &[])?;
-        commit.tag(crate::tag::Tag::new(true, name_type, emit_id, s.name_len), name)?;
+    // The live-entry emission (entries, structs, attrs, the op's new
+    // entry) is shared with the split-point size estimate; see
+    // `emit_compact_range` (review D3).
+    emit_compact_range(&mut TagSink::Commit(&mut commit), source_buf, slots, count, op, lo, hi)?;
 
-        // If this is the target of an Update, substitute the new content
-        // for the struct body. Otherwise copy the source's struct as-is.
-        if let WriteOp::Update { id: update_id, content } = *op {
-            if (i as u16) == update_id {
-                commit.tag(
-                    crate::tag::Tag::new(
-                        true,
-                        TagType::InlineStruct,
-                        emit_id,
-                        content.len() as u16,
-                    ),
-                    content,
-                )?;
-                emit_id += 1;
-                continue;
-            }
-        }
-        // UpdateCtz overrides the entry's struct body with the new
-        // (head_block, total_size). Without this case, an UpdateCtz
-        // that triggers compaction copies the prior struct body and
-        // silently drops the update.
-        if let WriteOp::UpdateCtz { id: update_id, head_block, total_size } = *op {
-            if (i as u16) == update_id {
-                let mut body = [0u8; 8];
-                body[0..4].copy_from_slice(&head_block.to_le_bytes());
-                body[4..8].copy_from_slice(&total_size.to_le_bytes());
-                commit.tag(crate::tag::Tag::new(true, TagType::CtzStruct, emit_id, 8), &body)?;
-                emit_id += 1;
-                continue;
-            }
-        }
-        // UpdateDirStruct overrides the entry's DirStruct body with the
-        // new pair address. Used by wear-levelling pair relocation to
-        // re-point a parent's child reference inside the same compact.
-        if let WriteOp::UpdateDirStruct { id: update_id, new_pair } = *op {
-            if (i as u16) == update_id {
-                let mut body = [0u8; 8];
-                body[0..4].copy_from_slice(&new_pair.a.as_u32().to_le_bytes());
-                body[4..8].copy_from_slice(&new_pair.b.as_u32().to_le_bytes());
-                commit.tag(crate::tag::Tag::new(true, TagType::DirStruct, emit_id, 8), &body)?;
-                emit_id += 1;
-                continue;
-            }
-        }
-        // RenameInPlace overrides the NAME emitted above by emitting a
-        // newer NAME after, but for compact we want to emit just one
-        // NAME. Backtrack: re-emit the slot from scratch using the new
-        // name. We've already emitted Create + NAME(old); emit a
-        // newer NAME(new) which shadows the old at read time. The
-        // STRUCT below follows normally.
-        if let WriteOp::RenameInPlace { id: rename_id, name_type, new_name } = *op {
-            if (i as u16) == rename_id {
-                commit.tag(
-                    crate::tag::Tag::new(true, name_type, emit_id, new_name.len() as u16),
-                    new_name,
-                )?;
-                // Fall through to emit struct body unchanged.
-            }
-        }
-        let struct_body =
-            &source_buf[s.struct_off as usize..s.struct_off as usize + s.struct_len as usize];
-        commit.tag(crate::tag::Tag::new(true, struct_type, emit_id, s.struct_len), struct_body)?;
-        emit_id += 1;
-    }
-
-    // Append the new entry, but only when its combined index `count`
-    // falls in `[lo, hi)`. The new entry has the highest index, so a
-    // split always places it in the upper-half continuation; the lower
-    // half emits no new entry. Its local id is `emit_id` (the entries
-    // emitted in this range), which equals the op's `id` for the
-    // single-pair `[0, total)` case the debug-assert checks.
-    if lo <= count && count < hi {
-        match *op {
-            WriteOp::Create { id, name, content } => {
-                debug_assert!(
-                    lo > 0 || id == emit_id,
-                    "single-pair Create id must equal emit count"
-                );
-                commit.tag(crate::tag::Tag::new(true, TagType::Create, emit_id, 0), &[])?;
-                commit.tag(
-                    crate::tag::Tag::new(true, TagType::RegularFile, emit_id, name.len() as u16),
-                    name,
-                )?;
-                commit.tag(
-                    crate::tag::Tag::new(
-                        true,
-                        TagType::InlineStruct,
-                        emit_id,
-                        content.len() as u16,
-                    ),
-                    content,
-                )?;
-            }
-            WriteOp::CreateCtz { id, name, head_block, total_size } => {
-                debug_assert!(
-                    lo > 0 || id == emit_id,
-                    "single-pair CreateCtz id must equal emit count"
-                );
-                commit.tag(crate::tag::Tag::new(true, TagType::Create, emit_id, 0), &[])?;
-                commit.tag(
-                    crate::tag::Tag::new(true, TagType::RegularFile, emit_id, name.len() as u16),
-                    name,
-                )?;
-                let mut body = [0u8; 8];
-                body[0..4].copy_from_slice(&head_block.to_le_bytes());
-                body[4..8].copy_from_slice(&total_size.to_le_bytes());
-                commit.tag(crate::tag::Tag::new(true, TagType::CtzStruct, emit_id, 8), &body)?;
-            }
-            WriteOp::CreateDir { id, name, dir_pair } => {
-                debug_assert!(
-                    lo > 0 || id == emit_id,
-                    "single-pair CreateDir id must equal emit count"
-                );
-                commit.tag(crate::tag::Tag::new(true, TagType::Create, emit_id, 0), &[])?;
-                commit.tag(
-                    crate::tag::Tag::new(true, TagType::Directory, emit_id, name.len() as u16),
-                    name,
-                )?;
-                let mut body = [0u8; 8];
-                body[0..4].copy_from_slice(&dir_pair.a.as_u32().to_le_bytes());
-                body[4..8].copy_from_slice(&dir_pair.b.as_u32().to_le_bytes());
-                commit.tag(crate::tag::Tag::new(true, TagType::DirStruct, emit_id, 8), &body)?;
-            }
-            _ => {}
-        }
-    }
     // If the caller passed a MoveState body (typically the pair's
     // pre-compaction accumulated gstate XOR any new contribution),
     // emit it as a single tag so the compacted block carries the
@@ -879,59 +970,25 @@ fn op_adds_entry(op: &WriteOp<'_>) -> bool {
 const SPLIT_RESERVE: usize = 40;
 
 /// Wire size of the live entries in the combined-sequence range
-/// `[lo, hi)` exactly as [`build_compact_commit`] would emit them, plus
-/// the virtual new entry (combined index `count`) when it falls in the
-/// range for a Create-family op. Excludes the revision header, gstate,
-/// tail, and CCRC — those are covered by [`SPLIT_RESERVE`].
+/// `[lo, hi)` exactly as [`build_compact_commit`] would emit them
+/// (user attributes included), plus the virtual new entry (combined
+/// index `count`) when it falls in the range for a Create-family op.
+/// Excludes the revision header, gstate, tail, and CCRC — those are
+/// covered by [`SPLIT_RESERVE`].
 ///
-/// This MUST mirror `build_compact_commit`'s per-entry emission so the
-/// split-point estimate matches the bytes the compactor actually writes;
-/// the two are edited together. Per entry: a `Create` tag (4) + a NAME
-/// tag (`4 + name_len`) + a STRUCT tag (`4 + struct_len`). An `Update`
-/// substitutes the struct body length; `UpdateCtz` / `UpdateDirStruct`
-/// substitute 8; `RenameInPlace` adds a second NAME tag; `Remove` drops
-/// its target.
+/// The estimate and the emitter are the same function over different
+/// [`TagSink`]s (review D3), so they cannot drift.
 fn compact_range_size(
+    source_buf: &[u8],
     slots: &[SlotOffsets; MAX_LIVE_ENTRIES],
     count: usize,
     op: &WriteOp<'_>,
     lo: usize,
     hi: usize,
-) -> usize {
+) -> Result<usize, Error> {
     let mut size = 0usize;
-    let hi_slots = hi.min(count);
-    for (i, s) in slots.iter().enumerate().take(hi_slots).skip(lo) {
-        // Remove drops its target entirely (matches the compactor's skip).
-        if let WriteOp::Remove { id } = *op {
-            if i as u16 == id {
-                continue;
-            }
-        }
-        // Create tag (4) + NAME tag (4 + name_len), always emitted.
-        let mut entry = 4 + (4 + s.name_len as usize);
-        // RenameInPlace emits a second NAME (the new name) before STRUCT.
-        if let WriteOp::RenameInPlace { id, new_name, .. } = *op {
-            if i as u16 == id {
-                entry += 4 + new_name.len();
-            }
-        }
-        // STRUCT body: substituted for an Update-family target, else the
-        // source slot's own struct length.
-        let struct_len = match *op {
-            WriteOp::Update { id, content } if i as u16 == id => content.len(),
-            WriteOp::UpdateCtz { id, .. } if i as u16 == id => 8,
-            WriteOp::UpdateDirStruct { id, .. } if i as u16 == id => 8,
-            _ => s.struct_len as usize,
-        };
-        entry += 4 + struct_len;
-        size += entry;
-    }
-    // The appended new entry lands at combined index `count` for a
-    // Create-family op (the highest index, so always the upper half).
-    if lo <= count && count < hi && op_adds_entry(op) {
-        size += op_dsize_of(op) - 8;
-    }
-    size
+    emit_compact_range(&mut TagSink::Count(&mut size), source_buf, slots, count, op, lo, hi)?;
+    Ok(size)
 }
 
 /// Pick the split index over the combined-sequence range `[begin, end)`,
@@ -951,25 +1008,26 @@ fn compact_range_size(
 /// otherwise the index where the upper portion `[split, end)` moves to a
 /// continuation pair and the lower portion `[begin, split)` stays.
 fn compute_split_index<S: Storage>(
+    source_buf: &[u8],
     slots: &[SlotOffsets; MAX_LIVE_ENTRIES],
     count: usize,
     op: &WriteOp<'_>,
     begin: usize,
     end: usize,
-) -> usize {
+) -> Result<usize, Error> {
     let budget = core::cmp::min(
         S::BLOCK_SIZE.saturating_sub(SPLIT_RESERVE),
         (S::BLOCK_SIZE / 2).next_multiple_of(S::PROG_SIZE),
     );
     let mut split = begin;
     while end - split > 1 {
-        let size = compact_range_size(slots, count, op, split, end);
+        let size = compact_range_size(source_buf, slots, count, op, split, end)?;
         if (end - split) < 0xff && size <= budget {
             break;
         }
         split += (end - split) / 2;
     }
-    split
+    Ok(split)
 }
 
 /// `true` if every byte of `buf` is `0xFF`. This is the erased state
@@ -1116,8 +1174,19 @@ fn find_parent_in_tree<S: Storage>(
         storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
         let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
 
+        // Splice-corrected candidate (review C5). A matching DirStruct
+        // tag carries the id the entry had at *write* time; every
+        // Create/Delete committed after it renumbers the live entries,
+        // so the raw id must be carried forward through the rest of
+        // the log. This is the C reference's `tempbesttag` discipline
+        // in `lfs_dir_fetchmatch` (lfs.c:1241ff, 1280ff): latest
+        // content match wins; an identical-id DirStruct with different
+        // contents means the match was overwritten; a Delete at the
+        // candidate id kills it; a splice at or below it shifts it.
+        let mut cand: Option<u16> = None;
         for entry in pair.reader.iter_tags() {
-            match entry.tag.tag_type() {
+            let tag = entry.tag;
+            match tag.tag_type() {
                 crate::tag::TagType::DirStruct if entry.body.len() == 8 => {
                     let a = u32::from_le_bytes([
                         entry.body[0],
@@ -1133,7 +1202,13 @@ fn find_parent_in_tree<S: Storage>(
                     ]);
                     let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
                     if child == target {
-                        return Ok(Some((pair_addr, entry.tag.id())));
+                        cand = Some(tag.id());
+                        continue;
+                    }
+                    if cand == Some(tag.id()) {
+                        // The candidate's entry now points elsewhere;
+                        // the earlier match was overwritten.
+                        cand = None;
                     }
                     // An out-of-range DirStruct body cannot be the
                     // target (a real allocated pair) and must never be
@@ -1144,6 +1219,22 @@ fn find_parent_in_tree<S: Storage>(
                         }
                         queue[tail] = child;
                         tail += 1;
+                    }
+                }
+                crate::tag::TagType::Create => {
+                    if let Some(c) = cand {
+                        if tag.id() <= c {
+                            cand = Some(c + 1);
+                        }
+                    }
+                }
+                crate::tag::TagType::Delete => {
+                    if let Some(c) = cand {
+                        if tag.id() == c {
+                            cand = None;
+                        } else if tag.id() < c {
+                            cand = Some(c - 1);
+                        }
                     }
                 }
                 crate::tag::TagType::HardTail | crate::tag::TagType::SoftTail
@@ -1172,6 +1263,9 @@ fn find_parent_in_tree<S: Storage>(
                 }
                 _ => {}
             }
+        }
+        if let Some(c) = cand {
+            return Ok(Some((pair_addr, c)));
         }
     }
 
@@ -2347,35 +2441,28 @@ impl<S: Storage> Fs<S> {
         buf_b: &mut [u8],
     ) -> Result<usize, Error> {
         let (parent, leaf) = self.resolve_parent(path, buf_a, buf_b)?;
-        self.storage.read(parent.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(parent.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        let pair = MetadataPair::parse(parent.a, &*buf_a, parent.b, &*buf_b)?;
-        let id = crate::dir::lookup(&pair, leaf.as_bytes()).ok_or(Error::NotFound)?.entry.id;
-        // Walk the committed tag stream; latest UserAttr(attr_id) at
-        // `id` wins. Delete-marker length means "removed."
-        let mut latest: Option<&[u8]> = None;
-        let mut removed = false;
-        for entry in pair.reader.iter_tags() {
-            if entry.tag.id() != id {
-                continue;
-            }
-            if entry.tag.tag_type() == crate::tag::TagType::UserAttr(attr_id) {
-                if entry.tag.is_special_length() {
-                    removed = true;
-                    latest = None;
-                } else {
-                    latest = Some(entry.body);
-                    removed = false;
-                }
+        // Chase the parent's HardTail chain, exactly as `set_attr`
+        // does: an entry in a split directory's continuation pair has
+        // readable attributes too (review H5). On return the scratch
+        // buffers hold the owning pair.
+        let (target, id) = match self.seek_entry_in_chain(parent, leaf.as_bytes(), buf_a, buf_b)? {
+            ChainSeek::Found { pair, id, .. } => (pair, id),
+            ChainSeek::Absent { .. } => return Err(Error::NotFound),
+        };
+        let pair = MetadataPair::parse(target.a, &*buf_a, target.b, &*buf_b)?;
+        // Splice-diff query (review C2): `id` is the entry's *current*
+        // live id; the committed tags carry the raw ids of their write
+        // time. `attr_get` walks the log backward adjusting for every
+        // intervening Create/Delete, the C reference's
+        // `lfs_dir_getslice` algorithm.
+        match crate::dir::attr_get(&pair.reader, id, attr_id) {
+            None => Ok(0),
+            Some(body) => {
+                let n = body.len().min(out.len());
+                out[..n].copy_from_slice(&body[..n]);
+                Ok(n)
             }
         }
-        if removed || latest.is_none() {
-            return Ok(0);
-        }
-        let body = latest.unwrap();
-        let n = body.len().min(out.len());
-        out[..n].copy_from_slice(&body[..n]);
-        Ok(n)
     }
 
     /// Rename an entry in place within its current directory.
@@ -2935,7 +3022,10 @@ impl<S: Storage> Fs<S> {
         // keeps its address) — but with an extra fullness guard below,
         // because a root continuation chain cannot be reclaimed. Splitting
         // degrades gracefully when it cannot proceed.
-        let split = compute_split_index::<S>(slots, count, op, 0, total);
+        let split = {
+            let source_buf: &[u8] = if active_is_a { &*buf_a } else { &*buf_b };
+            compute_split_index::<S>(source_buf, slots, count, op, 0, total)?
+        };
         let mut do_split = split > 0;
         if do_split {
             // Bound the reachable-pair count before splitting. The split
@@ -4792,6 +4882,17 @@ mod split_point_tests {
     use super::{compact_range_size, compute_split_index, SlotOffsets, WriteOp, MAX_LIVE_ENTRIES};
     use crate::storage::Storage;
 
+    /// An empty committed source block (revision header only, rest
+    /// erased): parses cleanly, carries no tags, so the attr replay
+    /// contributes nothing and slot name/struct slices read 0xFF
+    /// filler. The size math under test is the per-entry tag layout,
+    /// which does not depend on body contents.
+    fn empty_source() -> [u8; 256] {
+        let mut buf = [0xFFu8; 256];
+        buf[0..4].copy_from_slice(&1u32.to_le_bytes());
+        buf
+    }
+
     struct Dev256;
     impl Storage for Dev256 {
         type Error = ();
@@ -4844,7 +4945,8 @@ mod split_point_tests {
         let slots = filled(1, 200, 200);
         // A 2-entry combined sequence whose single existing slot is huge:
         // the loop can split at most down to one entry per side.
-        let n = compute_split_index::<Dev256>(&slots, 1, &WriteOp::Noop, 0, 1);
+        let n = compute_split_index::<Dev256>(&empty_source(), &slots, 1, &WriteOp::Noop, 0, 1)
+            .unwrap();
         assert_eq!(n, 0, "a single-entry range never splits");
     }
 
@@ -4856,12 +4958,12 @@ mod split_point_tests {
         // Each live slot: 12 + 4 + 1 = 17. New entry (op_dsize_of - 8):
         // 4 + (4+4) + (4+1) = 17. Range [0,4) over count=3 includes all
         // three live slots plus the virtual new entry.
-        assert_eq!(compact_range_size(&slots, 3, &op, 0, 4), 3 * 17 + 17);
+        assert_eq!(compact_range_size(&empty_source(), &slots, 3, &op, 0, 4).unwrap(), 3 * 17 + 17);
         // Upper sub-range [2,4): one live slot + the new entry.
-        assert_eq!(compact_range_size(&slots, 3, &op, 2, 4), 17 + 17);
+        assert_eq!(compact_range_size(&empty_source(), &slots, 3, &op, 2, 4).unwrap(), 17 + 17);
         // The new entry is excluded from a lower range that stops before
         // its index.
-        assert_eq!(compact_range_size(&slots, 3, &op, 0, 3), 3 * 17);
+        assert_eq!(compact_range_size(&empty_source(), &slots, 3, &op, 0, 3).unwrap(), 3 * 17);
     }
 
     #[test]
@@ -4869,7 +4971,10 @@ mod split_point_tests {
         // 3 entries plus a create = 68 bytes < 128 budget: no split.
         let slots = filled(3, 4, 1);
         let op = WriteOp::Create { id: 3, name: b"f003", content: b"x" };
-        assert_eq!(compute_split_index::<Dev256>(&slots, 3, &op, 0, 4), 0);
+        assert_eq!(
+            compute_split_index::<Dev256>(&empty_source(), &slots, 3, &op, 0, 4).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -4878,11 +4983,11 @@ mod split_point_tests {
         // Inner loop: split 0 -> 6 (upper [6,12) = 5*17 + 17 = 102 <= 128).
         let slots = filled(11, 4, 1);
         let op = WriteOp::Create { id: 11, name: b"f011", content: b"x" };
-        let split = compute_split_index::<Dev256>(&slots, 11, &op, 0, 12);
+        let split = compute_split_index::<Dev256>(&empty_source(), &slots, 11, &op, 0, 12).unwrap();
         assert_eq!(split, 6);
         // Both halves must fit the budget after the chosen split.
-        assert!(compact_range_size(&slots, 11, &op, 0, split) <= BUDGET);
-        assert!(compact_range_size(&slots, 11, &op, split, 12) <= BUDGET);
+        assert!(compact_range_size(&empty_source(), &slots, 11, &op, 0, split).unwrap() <= BUDGET);
+        assert!(compact_range_size(&empty_source(), &slots, 11, &op, split, 12).unwrap() <= BUDGET);
     }
 
     #[test]
@@ -4890,7 +4995,7 @@ mod split_point_tests {
         let slots = filled(4, 4, 1);
         let op = WriteOp::Remove { id: 1 };
         // Four 17-byte slots, one removed -> three remain: 51 bytes.
-        assert_eq!(compact_range_size(&slots, 4, &op, 0, 4), 3 * 17);
+        assert_eq!(compact_range_size(&empty_source(), &slots, 4, &op, 0, 4).unwrap(), 3 * 17);
     }
 
     #[test]
@@ -4903,7 +5008,7 @@ mod split_point_tests {
         };
         // Slot 0 carries Create(4) + NAME(4+4) + NAME(4+14) + STRUCT(4+1)
         // = 35; slot 1 is a plain 17-byte entry.
-        assert_eq!(compact_range_size(&slots, 2, &op, 0, 2), 35 + 17);
+        assert_eq!(compact_range_size(&empty_source(), &slots, 2, &op, 0, 2).unwrap(), 35 + 17);
     }
 
     #[test]
@@ -4913,6 +5018,10 @@ mod split_point_tests {
         // returns begin (no further split).
         let slots = filled(6, 4, 1);
         // 6 * 17 = 102 <= 128: the lower half fits, no further split.
-        assert_eq!(compute_split_index::<Dev256>(&slots, 6, &WriteOp::Noop, 0, 6), 0);
+        assert_eq!(
+            compute_split_index::<Dev256>(&empty_source(), &slots, 6, &WriteOp::Noop, 0, 6)
+                .unwrap(),
+            0
+        );
     }
 }
