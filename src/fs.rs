@@ -1934,9 +1934,25 @@ impl<S: Storage> Fs<S> {
     /// until [`crate::file::File::sync`] / `close`, amortizing the
     /// metadata-pair touch over a session of writes).
     ///
-    /// Existing chain blocks are never re-erased. The bytes packed
-    /// into the existing tail block go through NOR sub-window programs;
-    /// overflow allocates only the blocks needed for the remainder.
+    /// Existing chain blocks are never re-erased.
+    ///
+    /// # Committed-tail discipline (review C8)
+    ///
+    /// The committed tail block is programmed at most once per append,
+    /// as the LAST device action before sync, after every fallible
+    /// step (bounds checks, allocation, overflow-block writes) has
+    /// succeeded — a failure must never leave programmed cells past
+    /// the committed EOF, because the metadata still says `old_size`
+    /// and the next append would AND different bytes over them on
+    /// NOR, corrupting acknowledged data. And the fill region is
+    /// verified actually erased first: a previous append torn by
+    /// power loss leaves residue there that no metadata records. A
+    /// dirty region routes the tail through copy-on-write to a fresh
+    /// block instead (the same countermeasure `shrink_ctz_head` uses;
+    /// the C reference never programs a committed data block twice,
+    /// `lfs_ctz_extend`, lfs.c:2891ff). The clean in-place fill is
+    /// kept as the common case for ADR-0011's write-amplification
+    /// win.
     pub(crate) fn stream_ctz_extend(
         &mut self,
         ctz: crate::ctz::CtzStruct,
@@ -1955,14 +1971,23 @@ impl<S: Storage> Fs<S> {
         if (n_old as usize) > MAX_CTZ_WRITE_BLOCKS {
             return Err(Error::OutOfRange);
         }
+        // All bounds checks up front (review C8): nothing may program
+        // before every fallible step is known to be reachable.
+        let new_total = old_size + data.len() as u32;
+        let new_n = block_count(new_total, bs);
+        if (new_n as usize) > MAX_CTZ_WRITE_BLOCKS {
+            return Err(Error::OutOfRange);
+        }
 
-        // Step 1: pack as much of `data` as fits into the existing tail
-        // block's unused content region. The tail block *is* the chain
-        // head, so its address is known without walking the chain. The
-        // free region there is still 0xFF (never programmed since erase),
-        // so the NOR-aligned wrapper can program through this offset.
+        // Step 1: plan the tail fill. The tail block *is* the chain
+        // head, so its address is known without walking the chain.
+        // `deferred_fill` carries a clean in-place fill to execute
+        // after the overflow writes; a dirty region is rebuilt
+        // copy-on-write right here (fresh blocks are safe to write
+        // early: a failure merely orphans them).
         let mut data_consumed: usize = 0;
-        let mut head_phys = ctz.head_block.as_u32();
+        let mut tail_addr = ctz.head_block;
+        let mut deferred_fill: Option<(u32, u32, usize)> = None;
         if n_old > 0 {
             let tail_idx = n_old - 1;
             let header = 4 * skip_pointers_in_block(tail_idx);
@@ -1974,25 +1999,75 @@ impl<S: Storage> Fs<S> {
             let fill = (room as usize).min(data.len());
             if fill > 0 {
                 let tail_phys = ctz.head_block.as_u32();
-                self.storage
-                    .program(tail_phys, header + bytes_used, &data[..fill])
-                    .map_err(|_| Error::Io)?;
+                let off = (header + bytes_used) as usize;
+                // Dirty check: is the fill region actually erased?
+                let clean = {
+                    self.storage.read(tail_phys, 0, buf_a).map_err(|_| Error::Io)?;
+                    buf_a[off..off + fill].iter().all(|&x| x == 0xFF)
+                };
+                if clean {
+                    deferred_fill = Some((tail_phys, off as u32, fill));
+                } else {
+                    // Copy-on-write: rebuild the committed tail plus
+                    // the fill on a fresh block. The un-committed
+                    // chain is named so a rescan cannot hand out its
+                    // blocks; worn candidates are excluded and
+                    // retried, bounded.
+                    let exclude_chain = Some((ctz.head_block.as_u32(), old_size));
+                    let mut excluded = [BlockAddress::NONE; MAX_BAD_BLOCK_RETRIES];
+                    let mut ex_len = 0usize;
+                    loop {
+                        let mut one = [BlockAddress::NONE; 1];
+                        crate::alloc::alloc_blocks_cached(
+                            &mut self.storage,
+                            self.root,
+                            &mut self.used_cache,
+                            &excluded[..ex_len],
+                            exclude_chain,
+                            &mut one,
+                            buf_a,
+                            buf_b,
+                        )?;
+                        let fresh = one[0];
+                        // Rebuild the image: committed bytes verbatim
+                        // (the skip-pointer header references the
+                        // unchanged earlier chain), residue cleared,
+                        // fill appended.
+                        self.storage
+                            .read(ctz.head_block.as_u32(), 0, buf_a)
+                            .map_err(|_| Error::Io)?;
+                        for x in &mut buf_a[off..] {
+                            *x = 0xFF;
+                        }
+                        buf_a[off..off + fill].copy_from_slice(&data[..fill]);
+                        if self.storage.erase(fresh.as_u32()).is_ok()
+                            && self
+                                .storage
+                                .program(fresh.as_u32(), 0, &buf_a[..S::BLOCK_SIZE])
+                                .is_ok()
+                        {
+                            tail_addr = fresh;
+                            break;
+                        }
+                        if ex_len >= MAX_BAD_BLOCK_RETRIES {
+                            return Err(Error::Io);
+                        }
+                        excluded[ex_len] = fresh;
+                        ex_len += 1;
+                        self.used_cache = None;
+                    }
+                }
                 data_consumed = fill;
-                head_phys = tail_phys;
             }
         }
+        let mut head_phys = tail_addr.as_u32();
 
         // Step 2: allocate new chain blocks for the remainder. Each new
         // block stores skip pointers to earlier blocks: newly allocated
         // ones come from `new_blocks`; existing ones are resolved by an
-        // O(log n) `seek_block` from the head rather than a full chain
-        // walk.
+        // O(log n) `seek_block` from the (possibly copy-on-written) tail
+        // rather than a full chain walk.
         if data_consumed < data.len() {
-            let new_total = old_size + data.len() as u32;
-            let new_n = block_count(new_total, bs);
-            if (new_n as usize) > MAX_CTZ_WRITE_BLOCKS {
-                return Err(Error::OutOfRange);
-            }
             let new_count = (new_n - n_old) as usize;
 
             // The existing chain may not be committed to its metadata
@@ -2002,8 +2077,7 @@ impl<S: Storage> Fs<S> {
             // path the allocator skips the walk entirely (those blocks
             // were marked when handed out), so the append no longer pays
             // an O(n) chain collect; the walk happens only on a rescan.
-            let exclude_chain =
-                if n_old > 0 { Some((ctz.head_block.as_u32(), old_size)) } else { None };
+            let exclude_chain = if n_old > 0 { Some((tail_addr.as_u32(), old_size)) } else { None };
             let remaining = &data[data_consumed..];
 
             // Bad-block retry. A worn overflow block (its erase or program
@@ -2042,13 +2116,13 @@ impl<S: Storage> Fs<S> {
                         let target_phys = if target_idx >= n_old as usize {
                             new_blocks[target_idx - n_old as usize].as_u32()
                         } else {
-                            seek_block(
-                                &mut self.storage,
-                                ctz.head_block,
-                                n_old - 1,
-                                target_idx as u32,
-                            )?
-                            .as_u32()
+                            // Seek from `tail_addr`: when the tail was
+                            // copy-on-written, index n_old - 1 must
+                            // resolve to the NEW tail; its copied
+                            // header reaches the unchanged earlier
+                            // blocks.
+                            seek_block(&mut self.storage, tail_addr, n_old - 1, target_idx as u32)?
+                                .as_u32()
                         };
                         let off = 4 * k;
                         buf_a[off..off + 4].copy_from_slice(&target_phys.to_le_bytes());
@@ -2076,6 +2150,15 @@ impl<S: Storage> Fs<S> {
                 head_phys = new_blocks[new_count - 1].as_u32();
                 break;
             }
+        }
+
+        // Step 3: the clean in-place fill of the COMMITTED tail block,
+        // last (review C8): every fallible step above has succeeded, so
+        // the only way these cells get programmed without the metadata
+        // update following is a power loss, which the next append's
+        // dirty check turns into a copy-on-write.
+        if let Some((tail_phys, off, fill)) = deferred_fill {
+            self.storage.program(tail_phys, off, &data[..fill]).map_err(|_| Error::Io)?;
         }
 
         self.storage.sync().map_err(|_| Error::Io)?;
