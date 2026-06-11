@@ -23,7 +23,8 @@ littlefs2-pure/
 ├── KNOWN_ISSUES.md             gaps against v1.0
 ├── docs/
 │   ├── PLAN.md                 phased implementation roadmap
-│   └── decisions/              ADRs (Parnell's docs/decisions/NNNN-slug.md convention)
+│   ├── decisions/              ADRs (Parnell's docs/decisions/NNNN-slug.md convention)
+│   └── references/             citation registry, one file per external source (see below)
 ├── src/
 │   ├── lib.rs                  crate root, module decls, no_std
 │   ├── error.rs                Error enum, Result alias
@@ -126,3 +127,7 @@ Conformance has a heavy build (the C reference must compile in CI). When that la
 ## When to update memory versus this file
 
 Project state that decays fast (current phase, in flight branches, blocking issues) belongs in the per project memory under `~/.claude/projects/-Users-parnell-Development-littlefs2-pure/memory/`. Architectural invariants and tooling commands belong here. If a memory entry would still be true in six months, it probably belongs in this file or in an ADR instead.
+
+## Reference registry (docs/references/)
+
+This crate implements an external on-disk format; the reference registry is part of the deliverable, not an afterthought. After any slice that cites a source (the upstream specification, a paper, a parity vector set, the C reference's behavior, a flash vendor app note), append or update `docs/references/<slug>.md` with the global accretion schema: citation, canonical URL or document number, Wayback archived URL saved at citation time, retrieval date, sha256 for binaries, license, vendor status (vendored, pointer only, legally cannot), and the code or test paths it grounds. The upstream `SPEC.md` and `DESIGN.md` are moving git documents, so every citation pins the exact upstream commit hash and archives the cited revision; the rot mode is silent content drift, not disappearance. The C reference stays a behavioral oracle, never a code template. Parity vector sets always get entries, including the oracle revision they were generated against and their coverage gaps; the gaps feed the README disclosure's named failure mode (crash sequences the simulation did not generate). Mining mandate: bead `lfs-8eh`.

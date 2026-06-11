@@ -39,6 +39,7 @@ read or fork the work.
 **What this does not promise.** AI collaboration does not transfer responsibility. The author is accountable for what ships under his name. The disciplines above narrow the failure surface; they
 do not eliminate it. In particular, this process is most exposed to subtle bugs that a careful human reading of the code would catch but tests, types, and crash simulation would not. For a
 power-loss-safe filesystem that specifically includes crash sequences the simulation did not generate, or on-disk format drift from the upstream C reference that byte-level tests did not catch.
+The reference registry keeps that boundary inspectable: [`conformance-vector-corpus`](docs/references/conformance-vector-corpus.md) inventories which scenarios the golden vectors exercise and which they do not, and [`VERIFICATION-MAP.md`](docs/references/VERIFICATION-MAP.md) names each verification artifact's blind spot.
 Issues are welcome and will be triaged as time allows; no SLA is offered. This README describes the project's development process and is not a warranty; see the LICENSE file for the legal terms
 governing use.
 
