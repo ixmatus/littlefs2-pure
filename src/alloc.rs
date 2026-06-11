@@ -138,82 +138,54 @@ fn gather_live_structs(
     for entry in reader.iter_tags() {
         let tag = entry.tag;
         let id = tag.id() as usize;
-        match tag.tag_type() {
-            TagType::Create => {
-                if count >= max {
-                    return Err(Error::OutOfRange);
+        match crate::dir::splice_step(out, &mut count, LiveStruct::NONE, tag)? {
+            // The NAME itself bears no blocks; the shared splice core
+            // has already extended the count over its id.
+            crate::dir::SpliceStep::Consumed | crate::dir::SpliceStep::Name(_) => {}
+            crate::dir::SpliceStep::Other => match tag.tag_type() {
+                // STRUCT tags may precede the NAME that establishes
+                // their id's count in a C-compacted log (review H1);
+                // park them and let a later NAME claim the slot. An
+                // unclaimed parked slot beyond the final count is
+                // never read out.
+                TagType::CtzStruct if id < max && entry.body.len() == 8 => {
+                    out[id] = LiveStruct {
+                        kind: 1,
+                        w0: u32::from_le_bytes([
+                            entry.body[0],
+                            entry.body[1],
+                            entry.body[2],
+                            entry.body[3],
+                        ]),
+                        w1: u32::from_le_bytes([
+                            entry.body[4],
+                            entry.body[5],
+                            entry.body[6],
+                            entry.body[7],
+                        ]),
+                    };
                 }
-                if id > count {
-                    return Err(Error::Corrupt);
+                TagType::DirStruct if id < max && entry.body.len() == 8 => {
+                    out[id] = LiveStruct {
+                        kind: 2,
+                        w0: u32::from_le_bytes([
+                            entry.body[0],
+                            entry.body[1],
+                            entry.body[2],
+                            entry.body[3],
+                        ]),
+                        w1: u32::from_le_bytes([
+                            entry.body[4],
+                            entry.body[5],
+                            entry.body[6],
+                            entry.body[7],
+                        ]),
+                    };
                 }
-                let mut i = count;
-                while i > id {
-                    out[i] = out[i - 1];
-                    i -= 1;
-                }
-                out[id] = LiveStruct::NONE;
-                count += 1;
-            }
-            TagType::Delete => {
-                if id >= count {
-                    return Err(Error::Corrupt);
-                }
-                let mut i = id;
-                while i + 1 < count {
-                    out[i] = out[i + 1];
-                    i += 1;
-                }
-                out[count - 1] = LiveStruct::NONE;
-                count -= 1;
-            }
-            TagType::RegularFile | TagType::Directory | TagType::Superblock => {
-                // The NAME labels an existing slot, extends the live set by
-                // one when it names the next id, or is corrupt past that.
-                if id == count && count < max {
-                    out[id] = LiveStruct::NONE;
-                    count += 1;
-                } else if id >= count {
-                    return Err(Error::Corrupt);
-                }
-                // The NAME itself bears no blocks.
-            }
-            TagType::CtzStruct if id < count && entry.body.len() == 8 => {
-                out[id] = LiveStruct {
-                    kind: 1,
-                    w0: u32::from_le_bytes([
-                        entry.body[0],
-                        entry.body[1],
-                        entry.body[2],
-                        entry.body[3],
-                    ]),
-                    w1: u32::from_le_bytes([
-                        entry.body[4],
-                        entry.body[5],
-                        entry.body[6],
-                        entry.body[7],
-                    ]),
-                };
-            }
-            TagType::DirStruct if id < count && entry.body.len() == 8 => {
-                out[id] = LiveStruct {
-                    kind: 2,
-                    w0: u32::from_le_bytes([
-                        entry.body[0],
-                        entry.body[1],
-                        entry.body[2],
-                        entry.body[3],
-                    ]),
-                    w1: u32::from_le_bytes([
-                        entry.body[4],
-                        entry.body[5],
-                        entry.body[6],
-                        entry.body[7],
-                    ]),
-                };
-            }
-            // InlineStruct (incl. the superblock geometry) bears no
-            // separate blocks; nothing to record.
-            _ => {}
+                // InlineStruct (incl. the superblock geometry) bears no
+                // separate blocks; nothing to record.
+                _ => {}
+            },
         }
     }
     Ok(count)

@@ -25,8 +25,197 @@
 //! [`crate::Fs::resolve`] handles it for path walks and
 //! [`crate::Fs::list_dir`] handles it for enumeration.
 
-use crate::meta::{MetadataPair, TagIter};
+use crate::meta::{MetadataPair, MetadataReader, TagIter};
 use crate::tag::TagType;
+
+/// Outcome of feeding one tag through [`splice_step`].
+pub(crate) enum SpliceStep {
+    /// The tag was a splice (Create / Delete) and has been applied to
+    /// the slot array; the caller has nothing further to do.
+    Consumed,
+    /// The tag was a NAME (RegularFile / Directory / Superblock) at the
+    /// given live id; the count now covers it. The caller stores its
+    /// name and kind into the slot, *without* resetting any other slot
+    /// fields (a STRUCT tag for this id may already be parked there;
+    /// see the id-density note below).
+    Name(usize),
+    /// Any other tag type; the caller decides (STRUCT storage, etc.).
+    Other,
+}
+
+/// Shared splice state machine: the one Create / Delete / NAME
+/// renumbering core all four live-entry walkers feed tags through
+/// ([`live_entries`], [`lookup`], `fs::gather_live_slots`,
+/// `alloc::gather_live_structs`). Review finding H1 lived in the
+/// divergence risk of four hand-rolled copies; this is the single
+/// derivation, checked against `lfs_dir_fetchmatch` (`lfs.c:1233ff`).
+///
+/// # Id density (review H1)
+///
+/// The C reference accepts a NAME tag at *any* id and grows the entry
+/// count to `max(id + 1, count)` (`lfs.c`, `tempcount` handling): C
+/// compaction emits surviving tags in log order, which after a rename
+/// is not ascending-id order, and an entry's STRUCT can precede the
+/// NAME tags that establish the count. Therefore:
+///
+/// - a NAME at `id >= count` sets `count = id + 1` (not Corrupt), and
+///   does not clear the slots it newly covers: a STRUCT already parked
+///   there must survive;
+/// - callers must store STRUCT tags for any `id < MAX_LIVE_ENTRIES`,
+///   parked until a later NAME covers the id (slots beyond the final
+///   count are simply never read out).
+///
+/// Parked slots cannot be displaced by splice shifts before their NAME
+/// arrives: tags reference live ids at write time, so an id can only
+/// exceed the running count inside a compacted prefix, and a compacted
+/// prefix contains no splice tags.
+///
+/// Splice tags keep their strict bounds checks (`Create` beyond the
+/// count, `Delete` of a nonexistent id): the C reference never writes
+/// such logs, so they remain genuine corruption signals.
+pub(crate) fn splice_step<T: Copy>(
+    slots: &mut [T; MAX_LIVE_ENTRIES],
+    count: &mut usize,
+    empty: T,
+    tag: crate::tag::Tag,
+) -> Result<SpliceStep, crate::error::Error> {
+    let id = tag.id() as usize;
+    match tag.tag_type() {
+        TagType::Create => {
+            if *count >= MAX_LIVE_ENTRIES {
+                return Err(crate::error::Error::OutOfRange);
+            }
+            if id > *count {
+                return Err(crate::error::Error::Corrupt);
+            }
+            let mut i = *count;
+            while i > id {
+                slots[i] = slots[i - 1];
+                i -= 1;
+            }
+            slots[id] = empty;
+            *count += 1;
+            Ok(SpliceStep::Consumed)
+        }
+        TagType::Delete => {
+            if id >= *count {
+                return Err(crate::error::Error::Corrupt);
+            }
+            let mut i = id;
+            while i + 1 < *count {
+                slots[i] = slots[i + 1];
+                i += 1;
+            }
+            slots[*count - 1] = empty;
+            *count -= 1;
+            Ok(SpliceStep::Consumed)
+        }
+        TagType::RegularFile | TagType::Directory | TagType::Superblock => {
+            if id >= MAX_LIVE_ENTRIES {
+                return Err(crate::error::Error::OutOfRange);
+            }
+            if id >= *count {
+                *count = id + 1;
+            }
+            Ok(SpliceStep::Name(id))
+        }
+        _ => Ok(SpliceStep::Other),
+    }
+}
+
+/// Read the live value of user attribute `attr_id` on the entry whose
+/// *current* live id is `live_id`, splice-correct (review C2).
+///
+/// Walks the committed log newest-to-oldest carrying a splice diff,
+/// the exact algorithm of the C reference's `lfs_dir_getslice`
+/// (`lfs.c:706-748`): at each step `adj = live_id - gdiff` is the id
+/// the target entry had at that point in the log. A Create at `adj`
+/// means the walk reached the entry's own creation (no older tag can
+/// belong to it); a splice at or below `adj` shifts the diff; the
+/// first `UserAttr(attr_id)` tag at `adj` is the live value, with the
+/// `0x3FF` length sentinel meaning "removed".
+///
+/// Returns `None` for absent and removed alike, matching `get_attr`'s
+/// `Ok(0)` contract.
+pub(crate) fn attr_get<'a>(
+    reader: &MetadataReader<'a>,
+    live_id: u16,
+    attr_id: u8,
+) -> Option<&'a [u8]> {
+    let mut gdiff: i32 = 0;
+    for entry in reader.iter_tags_rev() {
+        let tag = entry.tag;
+        let id = i32::from(tag.id());
+        let adj = i32::from(live_id) - gdiff;
+        match tag.tag_type() {
+            TagType::Create if id <= adj => {
+                if id == adj {
+                    // Found where the entry was created; nothing older
+                    // can belong to it.
+                    return None;
+                }
+                gdiff += 1;
+            }
+            TagType::Delete if id <= adj => {
+                gdiff -= 1;
+            }
+            TagType::UserAttr(a) if a == attr_id && id == adj => {
+                return if tag.is_special_length() { None } else { Some(entry.body) };
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Invoke `f(attr_id, body)` for every *live* user attribute of the
+/// entry whose current live id is `live_id`, newest-first.
+///
+/// Same splice-diff walk as [`attr_get`], with a 256-bit seen bitmap
+/// so only the latest tag per `attr_id` is considered; delete-marker
+/// tags consume their `attr_id` without invoking `f`. This is the
+/// compaction replay source (review C1): the C reference's
+/// `lfs_dir_compact` replays all unique tags per live id, attributes
+/// included (`lfs_dir_traverse` filter, `lfs.c:1988ff`).
+pub(crate) fn for_each_live_attr<'a, E, F>(
+    reader: &MetadataReader<'a>,
+    live_id: u16,
+    mut f: F,
+) -> Result<(), E>
+where
+    F: FnMut(u8, &'a [u8]) -> Result<(), E>,
+{
+    let mut seen = [0u32; 8];
+    let mut gdiff: i32 = 0;
+    for entry in reader.iter_tags_rev() {
+        let tag = entry.tag;
+        let id = i32::from(tag.id());
+        let adj = i32::from(live_id) - gdiff;
+        match tag.tag_type() {
+            TagType::Create if id <= adj => {
+                if id == adj {
+                    break;
+                }
+                gdiff += 1;
+            }
+            TagType::Delete if id <= adj => {
+                gdiff -= 1;
+            }
+            TagType::UserAttr(a) if id == adj => {
+                let word = (a >> 5) as usize;
+                let bit = 1u32 << (a & 31);
+                if seen[word] & bit == 0 {
+                    seen[word] |= bit;
+                    if !tag.is_special_length() {
+                        f(a, entry.body)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
 
 /// One directory entry: an id, a name, and a kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,47 +331,10 @@ where
 
     for entry in pair.reader.iter_tags() {
         let tag = entry.tag;
-        let id = tag.id() as usize;
-        match tag.tag_type() {
-            TagType::Create => {
-                if count >= MAX_LIVE_ENTRIES {
-                    return Err(crate::error::Error::OutOfRange);
-                }
-                if id > count {
-                    return Err(crate::error::Error::Corrupt);
-                }
-                let mut i = count;
-                while i > id {
-                    slots[i] = slots[i - 1];
-                    i -= 1;
-                }
-                slots[id] = None;
-                count += 1;
-            }
-            TagType::Delete => {
-                if id >= count {
-                    return Err(crate::error::Error::Corrupt);
-                }
-                let mut i = id;
-                while i + 1 < count {
-                    slots[i] = slots[i + 1];
-                    i += 1;
-                }
-                slots[count - 1] = None;
-                count -= 1;
-            }
-            TagType::RegularFile | TagType::Directory | TagType::Superblock => {
-                if id >= count {
-                    // A NAME tag without a prior Create is allowed at the
-                    // boundary `id == count` (legacy commits without an
-                    // explicit Create implicitly bump the count). Reject
-                    // anything beyond.
-                    if id == count && count < MAX_LIVE_ENTRIES {
-                        count += 1;
-                    } else {
-                        return Err(crate::error::Error::Corrupt);
-                    }
-                }
+        match splice_step(&mut slots, &mut count, None, tag)? {
+            // STRUCT / CCRC / FCRC / etc. don't affect the roster.
+            SpliceStep::Consumed | SpliceStep::Other => {}
+            SpliceStep::Name(id) => {
                 // The Superblock NAME counts toward the entry count
                 // (id 0 of the root pair) but is not emitted to the
                 // caller's callback. Track it as a `None` slot so the
@@ -196,7 +348,6 @@ where
                 };
                 slots[id] = kind.map(|k| DirEntry { id: id as u16, name: entry.body, kind: k });
             }
-            _ => {} // STRUCT / CCRC / FCRC / etc. don't affect the entry roster.
         }
     }
 
@@ -310,40 +461,10 @@ pub fn lookup<'a>(pair: &MetadataPair<'a>, name: &[u8]) -> Option<Resolved<'a>> 
     for entry in pair.reader.iter_tags() {
         let tag = entry.tag;
         let id = tag.id() as usize;
-        match tag.tag_type() {
-            TagType::Create => {
-                if count >= MAX_LIVE_ENTRIES || id > count {
-                    return None;
-                }
-                let mut i = count;
-                while i > id {
-                    slots[i] = slots[i - 1];
-                    i -= 1;
-                }
-                slots[id] = LookupSlot::EMPTY;
-                count += 1;
-            }
-            TagType::Delete => {
-                if id >= count {
-                    return None;
-                }
-                let mut i = id;
-                while i + 1 < count {
-                    slots[i] = slots[i + 1];
-                    i += 1;
-                }
-                slots[count - 1] = LookupSlot::EMPTY;
-                count -= 1;
-            }
-            TagType::RegularFile | TagType::Directory | TagType::Superblock => {
-                if id >= count {
-                    if id == count && count < MAX_LIVE_ENTRIES {
-                        slots[id] = LookupSlot::EMPTY;
-                        count += 1;
-                    } else {
-                        return None;
-                    }
-                }
+        match splice_step(&mut slots, &mut count, LookupSlot::EMPTY, tag) {
+            Err(_) => return None,
+            Ok(SpliceStep::Consumed) => {}
+            Ok(SpliceStep::Name(id)) => {
                 slots[id].name = Some(entry.body);
                 slots[id].kind = match tag.tag_type() {
                     TagType::RegularFile => Some(EntryKind::RegularFile),
@@ -352,12 +473,17 @@ pub fn lookup<'a>(pair: &MetadataPair<'a>, name: &[u8]) -> Option<Resolved<'a>> 
                     _ => unreachable!(),
                 };
             }
-            ty @ (TagType::InlineStruct | TagType::CtzStruct | TagType::DirStruct)
-                if id < count =>
-            {
-                slots[id].struct_data = Some((ty, entry.body));
-            }
-            _ => {}
+            Ok(SpliceStep::Other) => match tag.tag_type() {
+                // STRUCT tags may precede the NAME that establishes
+                // their id's count in a C-compacted log (review H1);
+                // park them and let a later NAME claim the slot.
+                ty @ (TagType::InlineStruct | TagType::CtzStruct | TagType::DirStruct)
+                    if id < MAX_LIVE_ENTRIES =>
+                {
+                    slots[id].struct_data = Some((ty, entry.body));
+                }
+                _ => {}
+            },
         }
     }
 
