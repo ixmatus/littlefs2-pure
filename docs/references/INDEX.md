@@ -4,6 +4,8 @@ One line per entry; content lives in the entries, never here. Schema and convent
 
 ## Spec and conformance
 
+- [spec-littlefs-v2](spec-littlefs-v2.md) — the on disk format specification at pinned revision d01280e (v2.9.3); the format version story (writes 2.1, reads 2.0 and 2.1)
+- [design-littlefs](design-littlefs.md) — Haster's design rationale at the same pin; per structure map with ADR divergences; documentation exemplar
 
 ## Oracle
 
