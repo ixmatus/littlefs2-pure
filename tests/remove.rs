@@ -175,3 +175,44 @@ fn exists_returns_false_for_missing() {
     let mut b = common::make_buffer();
     assert!(!fs.exists(Path::new("/not-here").unwrap(), &mut a, &mut b).unwrap());
 }
+
+/// Review C3 wire pin, independent of the C toolchain: an entry
+/// delete must be encoded with length 0 (the C reference's encoding
+/// at every delete site), never the reserved 0x3FF sentinel, which
+/// `lfs_dir_fetchmatch`'s exact-compare invalidation cannot match.
+#[test]
+fn delete_tag_wire_length_is_zero() {
+    let mut storage = MemStorage::new();
+    let mut scratch = common::make_buffer();
+    littlefs2_pure::Fs::format(&mut storage, &mut scratch).unwrap();
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
+    let mut fs = littlefs2_pure::Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
+    fs.write_to_path(littlefs2_pure::Path::new("/aa").unwrap(), b"keep", &mut a, &mut b).unwrap();
+    fs.write_to_path(littlefs2_pure::Path::new("/bb").unwrap(), b"gone", &mut a, &mut b).unwrap();
+    fs.remove_at_path(littlefs2_pure::Path::new("/bb").unwrap(), &mut a, &mut b).unwrap();
+
+    // Scan the root pair's committed tags for the Delete.
+    let mut storage = fs.into_storage();
+    let mut found = false;
+    for blk in [0u32, 1] {
+        let mut block = common::make_buffer();
+        littlefs2_pure::storage::Storage::read(&mut storage, blk, 0, &mut block).unwrap();
+        let Ok(reader) = littlefs2_pure::meta::MetadataReader::new(&block) else { continue };
+        for entry in reader.iter_tags() {
+            if entry.tag.tag_type() == littlefs2_pure::tag::TagType::Delete {
+                assert_eq!(
+                    entry.tag.length(),
+                    0,
+                    "C3: entry delete encoded with length {:#x}; the C reference \
+                     writes 0 and cannot see anything else",
+                    entry.tag.length(),
+                );
+                found = true;
+            }
+        }
+    }
+    assert!(found, "expected a committed Delete tag in the root pair");
+}

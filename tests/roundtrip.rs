@@ -189,3 +189,32 @@ fn roundtrip_split_root() {
     invoke_verifier(&verifier, &img, "split_root");
     let _ = std::fs::remove_file(&img);
 }
+
+/// Review C3: an image holding a removed entry must read correctly
+/// under the C reference. The crate's writer emitted entry deletes
+/// with the reserved length sentinel `0x3FF` where the C reference
+/// writes size 0; the C reader's exact-compare besttag invalidation
+/// never matched such a delete, so `/bb` resolved to its neighbor
+/// `/aa` (and a C-side `lfs_remove("/bb")` would destroy `/aa`). The
+/// `remove` scenario asserts `/aa` is intact AND `/bb` is absent.
+#[test]
+fn roundtrip_removed_entry() {
+    let Some(verifier) = require_verifier() else { return };
+    let mut storage = MemStorage::new();
+    let mut scratch = common::make_buffer();
+    Fs::format(&mut storage, &mut scratch).unwrap();
+    {
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
+        let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
+        fs.write_to_path(Path::new("/aa").unwrap(), b"keep-me", &mut a, &mut b).unwrap();
+        fs.write_to_path(Path::new("/bb").unwrap(), b"doomed", &mut a, &mut b).unwrap();
+        fs.remove_at_path(Path::new("/bb").unwrap(), &mut a, &mut b).unwrap();
+        storage = fs.into_storage();
+    }
+    let img = dump_image(&storage, "remove");
+    invoke_verifier(&verifier, &img, "remove");
+    let _ = std::fs::remove_file(&img);
+}

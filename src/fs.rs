@@ -273,8 +273,10 @@ pub(crate) enum WriteOp<'a> {
     /// are preserved by the existing tags. The previous STRUCT (inline
     /// or CTZ) is replaced; any old CTZ chain becomes orphan.
     UpdateCtz { id: u16, head_block: u32, total_size: u32 },
-    /// Remove the entry at `id`. Append path emits a `Delete` tag;
-    /// compact path skips the slot and renumbers subsequent ids down.
+    /// Remove the entry at `id`. Append path emits a `Delete` tag
+    /// (length 0, the C reference's entry-delete encoding; review
+    /// C3); compact path skips the slot and renumbers subsequent ids
+    /// down.
     Remove { id: u16 },
     /// Create a new subdirectory entry at `id` with NAME `name` and
     /// `DirStruct` body pointing at `dir_pair`.
@@ -344,11 +346,21 @@ fn emit_op(commit: &mut crate::meta::Commit<'_>, op: &WriteOp<'_>) -> Result<(),
             commit.tag(Tag::new(true, TagType::CtzStruct, id, 8), &body)?;
         }
         WriteOp::Remove { id } => {
-            // Delete tag's length field is the special sentinel 0x3FF
-            // (no body). Subsequent entries with higher ids renumber
-            // down at read time via `dir::live_entries`'s splice
-            // handling.
-            commit.tag(Tag::new(true, TagType::Delete, id, 0x3FF), &[])?;
+            // Entry deletes carry length 0, matching every delete the
+            // C reference writes (`lfs_remove`, `lfs_rename`,
+            // `lfs_fs_demove`, `lfs_dir_drop`: all
+            // `LFS_MKTAG(LFS_TYPE_DELETE, id, 0)`). The reserved
+            // sentinel 0x3FF used here before review C3 was invisible
+            // to `lfs_dir_fetchmatch`'s exact-compare besttag
+            // invalidation (lfs.c:1244), so a C mount resolved the
+            // deleted name to its NEIGHBOR entry and a C-side remove
+            // destroyed that neighbor. This crate's own reader
+            // dispatches deletes on the id alone and accepts both
+            // encodings, so pre-fix images stay readable. Pinned by
+            // the `remove` roundtrip scenario. Subsequent entries
+            // with higher ids renumber down at read time via
+            // `dir::live_entries`'s splice handling.
+            commit.tag(Tag::new(true, TagType::Delete, id, 0), &[])?;
         }
         WriteOp::CreateDir { id, name, dir_pair } => {
             commit.tag(Tag::new(true, TagType::Create, id, 0), &[])?;
