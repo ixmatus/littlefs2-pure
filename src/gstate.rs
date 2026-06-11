@@ -1,5 +1,5 @@
-//! Filesystem-global state, XOR-accumulated across every metadata
-//! pair's `MoveState` tags.
+//! Filesystem-global state, XOR-accumulated across the per-pair
+//! contributions of every reachable metadata pair.
 //!
 //! LittleFS tracks at most one in-flight cross-directory move at a
 //! time via a 12-byte "gstate" field encoded as a triple of LE `u32`s:
@@ -9,17 +9,37 @@
 //! 2. The source pair's first block address.
 //! 3. The source pair's second block address.
 //!
-//! Each cross-directory rename's two commits (Create-in-dst,
-//! Delete-in-src) emit the SAME `MoveState` body, so they XOR to zero
-//! after both land. Crash between them: the accumulated gstate is
-//! non-zero, and mount-time recovery decodes the in-flight move and
-//! completes it.
+//! # The two accumulation levels (review C4)
 //!
-//! Compaction preserves a pair's net `MoveState` contribution by
-//! accumulating every committed `MoveState` body during replay and
-//! emitting one balanced `MoveState` in the compacted block; without
-//! that, a compaction landing between the rename's two commits would
-//! corrupt the gstate.
+//! The convention is the C reference's, and the two levels differ:
+//!
+//! - **Within one pair's log**, every committed gstate tag is the
+//!   pair's new TOTAL contribution: writers fold the pair's existing
+//!   contribution into each tag they commit, and the reader takes the
+//!   single latest tag (`fs::scan_pair_move_state`). XOR-of-all-tags
+//!   is WRONG here: a valid C log holding two MOVESTATE tags (two
+//!   moves into the same directory, no intervening compaction)
+//!   mis-accumulates into a phantom move under that reading.
+//!   An explicit all-zero body is a real total ("returned to zero")
+//!   and shadows earlier non-zero tags.
+//! - **Across pairs**, the global gstate is the XOR of the per-pair
+//!   contributions (`fs::accumulate_gstate`).
+//!
+//! Each cross-directory rename's two commits (Create-in-dst,
+//! Delete-in-src) fold the SAME delta body into their pair's total,
+//! so the global XOR returns to zero after both land. Crash between
+//! them: the aggregate is non-zero, and mount-time recovery decodes
+//! the in-flight move and completes it.
+//!
+//! Compaction preserves a pair's contribution by re-emitting its net
+//! total as the compacted block's single gstate tag (an all-zero net
+//! is simply omitted: absence reads as zero). Dropping a pair from
+//! the reachable set (rmdir's un-thread, the deorphan reclaim) STEALS
+//! its contribution into the survivor's commit
+//! (`fs::unthread_and_steal`, the C reference's `lfs_dir_drop`);
+//! without the steal, a globally balanced but per-pair non-zero
+//! contribution would leave the aggregate permanently non-zero
+//! (review C7).
 
 use crate::block::{BlockAddress, BlockPair};
 use crate::tag::{Tag, TagType};

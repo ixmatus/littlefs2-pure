@@ -559,13 +559,18 @@ fn relocation_atomic_across_every_power_loss() {
 }
 
 /// BFS the reachable metadata-pair forest from the root and
-/// XOR-accumulate every committed `RelocateState` body, mirroring the
-/// kernel's private `accumulate_gstate` walk using only the public API.
+/// XOR-accumulate each pair's `RelocateState` contribution, mirroring
+/// the kernel's private `accumulate_gstate` walk using only the
+/// public API.
 ///
-/// For each visited pair only the active block's tag stream contributes
-/// (matching `MetadataPair::parse`, which exposes the higher-revision
-/// block's reader). Children are followed via live `DirStruct` tags and
-/// the pair's tail, exactly as `accumulate_gstate` does.
+/// A pair's contribution is the body of its *latest* committed
+/// `RelocateState` tag (the C convention: every written tag is the
+/// pair's new total, latest wins; review C4). Cross-pair accumulation
+/// stays XOR. For each visited pair only the active block's tag
+/// stream contributes (matching `MetadataPair::parse`, which exposes
+/// the higher-revision block's reader). Children are followed via
+/// live `DirStruct` tags and the pair's tail, exactly as
+/// `accumulate_gstate` does.
 fn relocate_state_xor_from_root<S: Storage>(
     fs: &mut Fs<S>,
     root: BlockPair,
@@ -589,14 +594,16 @@ fn relocate_state_xor_from_root<S: Storage>(
         fs.storage_mut().read(pair_addr.b.as_u32(), 0, &mut b).expect("read b");
         let pair = MetadataPair::parse(pair_addr.a, &a, pair_addr.b, &b).expect("pair parses");
 
+        let mut latest = [0u8; RELOCATE_STATE_BODY_SIZE];
         for entry in pair.reader.iter_tags() {
             if entry.tag.tag_type() == TagType::RelocateState
                 && entry.body.len() == RELOCATE_STATE_BODY_SIZE
             {
-                for (acc_b, e) in acc.iter_mut().zip(entry.body.iter()) {
-                    *acc_b ^= *e;
-                }
+                latest.copy_from_slice(entry.body);
             }
+        }
+        for (acc_b, e) in acc.iter_mut().zip(latest.iter()) {
+            *acc_b ^= *e;
         }
 
         // Enqueue children via live DirStruct entries plus the tail,
