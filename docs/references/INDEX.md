@@ -9,6 +9,7 @@ One line per entry; content lives in the entries, never here. Schema and convent
 
 ## Oracle
 
+- [c-littlefs-oracle](c-littlefs-oracle.md) — C littlefs v2.9.3 as behavioral oracle, never code template; the pin verified two ways
 
 ## Algorithms and registries
 
