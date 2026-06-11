@@ -79,7 +79,7 @@ threading through the commit entry points is a separate bead
 
 ## Related
 
-- `REVIEW-v1.2.0-2026-06-10.md` finding C8; bead lfs-ay4.
+- `docs/reviews/2026-06-10-deep-adversarial-review.md` finding C8; bead lfs-ay4.
 - ADR-0011 (the in-place append this preserves), ADR-0008 (the
   documented-divergence precedent), the lfs-6o9 shrink fix (the
   copy-on-write pattern reused here).

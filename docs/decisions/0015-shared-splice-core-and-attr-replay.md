@@ -7,7 +7,7 @@
 ## Context
 
 The 2026-06 deep adversarial review of v1.2.0
-(`REVIEW-v1.2.0-2026-06-10.md`) found that four of its nine Critical
+(`docs/reviews/2026-06-10-deep-adversarial-review.md`) found that four of its nine Critical
 findings shared one root: the live-id versus raw-tag-id distinction was
 re-derived independently at five places, and each copy missed a
 different part of the C reference's countermeasures.
@@ -122,7 +122,7 @@ ADR-0008).
 
 ## Related
 
-- `REVIEW-v1.2.0-2026-06-10.md` findings C1, C2, C5, H1, H5; design
+- `docs/reviews/2026-06-10-deep-adversarial-review.md` findings C1, C2, C5, H1, H5; design
   observations D1, D2, D3, D4.
 - Beads: lfs-2dg, lfs-3z8, lfs-fb2, lfs-r88 (this arc); lfs-e7i (H5,
   the chain-aware `get_attr` half landed here, the attr test suite is

@@ -135,7 +135,7 @@ validate gstate decoding (review D8) remains open.
 
 ## Related
 
-- `REVIEW-v1.2.0-2026-06-10.md` findings C4, C6, C7, H3, H4; design
+- `docs/reviews/2026-06-10-deep-adversarial-review.md` findings C4, C6, C7, H3, H4; design
   observations D5, D6, D8.
 - Beads: lfs-w7w, lfs-njj (closed in the first slice), lfs-bkq,
   lfs-gfm, lfs-les (this slice).
