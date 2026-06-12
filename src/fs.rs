@@ -1067,6 +1067,34 @@ fn op_dsize_of(op: &WriteOp<'_>) -> usize {
     }
 }
 
+/// Re-read a just-programmed region and CRC-compare it against the
+/// bytes that were sent, the C reference's post-commit validation
+/// (`lfs_dir_commitcrc` re-reads every commit through `lfs_bd_crc`;
+/// review H2). Without it, a program that silently corrupted cells
+/// reports durable success and the corruption surfaces only at the
+/// next mount of that pair.
+///
+/// `region` doubles as the read-back destination (the kernel has no
+/// third block buffer): on a match the buffer holds the on-disk bytes,
+/// which equal what it held before the call; on a mismatch the caller
+/// must treat the buffer as clobbered and fall into its worn-block
+/// path, every one of which rebuilds the buffer before reuse.
+///
+/// Alignment: every caller verifies a region it just programmed, so
+/// `off`/`len` are `PROG_SIZE`-aligned, and `BLOCK_SIZE` being a
+/// multiple of `PROG_SIZE` (itself at least `READ_SIZE`) makes the
+/// read legal under the [`Storage`] geometry contract.
+fn verify_programmed<S: Storage>(
+    storage: &mut S,
+    block: BlockAddress,
+    off: usize,
+    region: &mut [u8],
+) -> bool {
+    let expected = crate::crc::update(crate::crc::INIT, region);
+    storage.read(block.as_u32(), off as u32, region).is_ok()
+        && crate::crc::update(crate::crc::INIT, region) == expected
+}
+
 /// True when `op` adds a new entry, so the combined entry sequence has
 /// one more element (at index `count`) than the live entry count.
 /// Create-family ops append an entry; every other op transforms or
@@ -2478,6 +2506,14 @@ impl<S: Storage> Fs<S> {
             commit.bytes_written()
         };
         self.storage.program(new_dir.a.as_u32(), 0, &buf_a[..new_end]).map_err(|_| Error::Io)?;
+        // Review H2: the new directory's init commit gets the same
+        // read-back every other commit gets. A verify failure reports
+        // `Io` exactly like a program failure on this path; the
+        // allocated pair stays an unreferenced orphan. `buf_a` is
+        // re-read below before its next use.
+        if !verify_programmed(&mut self.storage, new_dir.a, 0, &mut buf_a[..new_end]) {
+            return Err(Error::Io);
+        }
         self.storage.sync().map_err(|_| Error::Io)?;
 
         // Re-read the target pair to compute the new id from the live
@@ -3112,6 +3148,12 @@ impl<S: Storage> Fs<S> {
             // `forced_victim` branch in `compact_and_program`). The live
             // entries `slots` reference sit below `committed_end`, which the
             // append never overwrites, so they stay valid for the compaction.
+            // A program that returns Ok but lands corrupted bytes is
+            // indistinguishable from success without the read-back
+            // (review H2); a verify failure falls through to the same
+            // worn-block eviction as a program failure. The verify
+            // clobbers only `[committed_end..new_end)`, and the live
+            // entries `slots` reference sit below `committed_end`.
             did_append = self
                 .storage
                 .program(
@@ -3119,7 +3161,13 @@ impl<S: Storage> Fs<S> {
                     committed_end as u32,
                     &active_buf[committed_end..new_end],
                 )
-                .is_ok();
+                .is_ok()
+                && verify_programmed(
+                    &mut self.storage,
+                    active_addr,
+                    committed_end,
+                    &mut active_buf[committed_end..new_end],
+                );
         }
         if !did_append {
             let new_revision = old_revision.wrapping_add(1);
@@ -3472,12 +3520,23 @@ impl<S: Storage> Fs<S> {
 
         let alt_bytes_len = new_end;
         let alt_write_ok = {
-            let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+            let alt_buf: &mut [u8] = if active_is_a { buf_b } else { buf_a };
             self.storage.erase(alternate_addr.as_u32()).is_ok()
                 && self
                     .storage
                     .program(alternate_addr.as_u32(), 0, &alt_buf[..alt_bytes_len])
                     .is_ok()
+                // Review H2: a silently corrupted program must take the
+                // worn-alternate relocation below, not report success.
+                // On mismatch the build buffer is clobbered with disk
+                // bytes; `relocate_compact_to_fresh` rebuilds it from
+                // the untouched source buffer.
+                && verify_programmed(
+                    &mut self.storage,
+                    alternate_addr,
+                    0,
+                    &mut alt_buf[..alt_bytes_len],
+                )
         };
 
         if !alt_write_ok {
@@ -3529,9 +3588,15 @@ impl<S: Storage> Fs<S> {
         // the relocation this cycle. Wear levelling is opportunistic and
         // re-fires at the next cycle.
         let fresh_write_ok = {
-            let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+            let alt_buf: &mut [u8] = if active_is_a { buf_b } else { buf_a };
             self.storage.erase(fresh.as_u32()).is_ok()
                 && self.storage.program(fresh.as_u32(), 0, &alt_buf[..alt_bytes_len]).is_ok()
+                // Review H2: a corrupted fresh copy must abandon the
+                // relocation (the alternate already anchors a durable,
+                // verified commit), not propagate a bad pair address.
+                // On mismatch the buffer is clobbered; the cancel path
+                // below re-reads the pair from storage before use.
+                && verify_programmed(&mut self.storage, fresh, 0, &mut alt_buf[..alt_bytes_len])
         };
         if fresh_write_ok {
             Ok(Some(new_pair))
@@ -3722,9 +3787,14 @@ impl<S: Storage> Fs<S> {
                 )?
             };
             let write_ok = {
-                let build_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+                let build_buf: &mut [u8] = if active_is_a { buf_b } else { buf_a };
                 self.storage.erase(fresh.as_u32()).is_ok()
                     && self.storage.program(fresh.as_u32(), 0, &build_buf[..new_end]).is_ok()
+                    // Review H2: a fresh candidate that corrupts its
+                    // bytes silently is as worn as one that errors;
+                    // the retry below excludes it and rebuilds the
+                    // (now clobbered) build buffer for the next one.
+                    && verify_programmed(&mut self.storage, fresh, 0, &mut build_buf[..new_end])
             };
             if write_ok {
                 // The fresh block is now in use; drop the stale lookahead.
@@ -3923,9 +3993,13 @@ impl<S: Storage> Fs<S> {
                 )?
             };
             let a_ok = {
-                let build_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+                let build_buf: &mut [u8] = if active_is_a { buf_b } else { buf_a };
                 self.storage.erase(ca.as_u32()).is_ok()
                     && self.storage.program(ca.as_u32(), 0, &build_buf[..cont_len]).is_ok()
+                    // Review H2: an unverified continuation would be
+                    // linearized into the chain by the lower-half
+                    // commit below. The retry rebuilds the buffer.
+                    && verify_programmed(&mut self.storage, ca, 0, &mut build_buf[..cont_len])
             };
             // Block B stays erased as the continuation's alternate so a stale
             // image there cannot masquerade as a newer revision.
@@ -3991,9 +4065,18 @@ impl<S: Storage> Fs<S> {
             )?
         };
         let low_ok = {
-            let build_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+            let build_buf: &mut [u8] = if active_is_a { buf_b } else { buf_a };
             self.storage.erase(alternate_addr.as_u32()).is_ok()
                 && self.storage.program(alternate_addr.as_u32(), 0, &build_buf[..low_len]).is_ok()
+                // Review H2: this program is the split's linearization
+                // point; a silent corruption here must divert to the
+                // worn-alternate relocation, which rebuilds the buffer.
+                && verify_programmed(
+                    &mut self.storage,
+                    alternate_addr,
+                    0,
+                    &mut build_buf[..low_len],
+                )
         };
         if low_ok {
             // A continuation born here is a new reachable pair; drop the
@@ -4629,6 +4712,13 @@ impl<S: Storage> Fs<S> {
         // cycles are spent on the all-0xFF tail.
         storage.erase(0).map_err(|_| Error::Io)?;
         storage.program(0, 0, &scratch[..new_end]).map_err(|_| Error::Io)?;
+        // Review H2: verify the superblock commit like every other
+        // commit. Block 0 is the fixed mount anchor and cannot
+        // relocate, so a silent corruption here is a hard `Io` error,
+        // not a candidate for the worn-block fallback.
+        if !verify_programmed(storage, BlockAddress::new(0), 0, &mut scratch[..new_end]) {
+            return Err(Error::Io);
+        }
         // Erase block 1 to leave it as a fresh alternate.
         storage.erase(1).map_err(|_| Error::Io)?;
         storage.sync().map_err(|_| Error::Io)?;
