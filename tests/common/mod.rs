@@ -321,19 +321,22 @@ impl Storage for MemStorage {
 }
 
 /// Storage adapter that simulates a power loss at a configurable
-/// program-call boundary. After the `trigger_at`-th `program` call,
-/// the device is "powered off": all subsequent `program` calls and
-/// `erase` calls are no-ops (the bytes already on disk are
+/// program-call boundary. The `trigger_at`-th `program` call (and
+/// every later one) fails without writing; `erase` calls after the
+/// trigger are also rejected (the bytes already on disk are
 /// preserved). Reads pass through unchanged. Use
 /// [`TornWriteStorage::new`] to construct.
 ///
-/// Construction note: the underlying NOR semantics are still
-/// enforced by the inner storage (typically [`MemStorage`] for
-/// these tests). The torn adapter sits OUTSIDE the NOR-aligned
-/// wrapper so the power loss can land mid-PROG_SIZE-window if the
-/// wrapper flushes; in practice the existing kernel does whole-
-/// `program_size` flushes, so the test mostly exercises program-
-/// call-boundary torns.
+/// Fidelity note (review H7 / M6): the model is *program-call*
+/// granularity over a plain [`MemStorage`]. The inner storage does
+/// NOT enforce NOR semantics (it permits re-programming without an
+/// intervening erase), and because the adapter sits outside any
+/// [`littlefs2_pure::NorAlignedStorage`] wrapper, the boundaries it
+/// tears at are the kernel's program calls, not device prog-window
+/// landings; a partial-program landing (some bytes of one program
+/// persisted) is never modeled. Extending the sweeps to run through
+/// `NorAlignedStorage` with partial-program landings is tracked as
+/// review coverage item V4 (bead lfs-hki).
 pub struct TornWriteStorage {
     pub inner: MemStorage,
     /// Tripping point: after this many `program` calls, power is
@@ -506,4 +509,81 @@ pub fn build_superblock_block(
     buf[off + 4..off + 8].copy_from_slice(&running_crc.to_le_bytes());
 
     buf
+}
+
+/// Outcome of one torn-write sweep iteration (review H7/V3): either
+/// the tear hit `Fs::format` (the device never held a complete
+/// filesystem, so nothing about crash atomicity can be asserted), or
+/// format completed and the image at power loss is returned.
+pub enum TornRun {
+    /// The tear landed inside `Fs::format`.
+    TornFormat,
+    /// Format completed before the tear; the device held a valid
+    /// filesystem from that point on, so the returned image MUST
+    /// remount. Mount via [`mount_image_strict`].
+    Image(alloc::vec::Vec<u8>),
+}
+
+/// Run `scenario` against a freshly formatted filesystem with a power
+/// loss at the `trigger`-th program call, counted from the first
+/// program `Fs::format` issues (so the sweep range must span
+/// format's calls plus the scenario's; see [`torn_call_counts`]).
+///
+/// Strong semantics (review H7): once format has completed, every
+/// later failure is the scenario's to absorb. The post-format mount
+/// happens before any tear can have landed elsewhere, so it must
+/// succeed; a panic here is a harness bug, not a kernel finding.
+pub fn run_torn_scenario<F>(trigger: usize, scenario: F) -> TornRun
+where
+    F: FnOnce(&mut littlefs2_pure::Fs<TornWriteStorage>),
+{
+    let mut torn = TornWriteStorage::new(MemStorage::new(), trigger);
+    let mut scratch = make_buffer();
+    if littlefs2_pure::Fs::format(&mut torn, &mut scratch).is_err() {
+        return TornRun::TornFormat;
+    }
+    let mut buf_a = make_buffer();
+    let mut buf_b = make_buffer();
+    let mut fs = littlefs2_pure::Fs::mount(torn, &mut buf_a, &mut buf_b)
+        .expect("mount immediately after a completed format must succeed");
+    scenario(&mut fs);
+    TornRun::Image(fs.into_storage().into_inner().data)
+}
+
+/// Mount an image produced by [`run_torn_scenario`]'s `Image` arm.
+///
+/// This is the load-bearing assertion of every torn sweep: the image
+/// held a valid filesystem before the tear, and a torn write must
+/// leave it mountable as the pre-state or the post-state — an
+/// unmountable image is a bricked device, the exact outcome the
+/// sweeps exist to rule out. The pre-H7 sweeps silently `continue`d
+/// here, so "torn write bricks the filesystem" passed.
+pub fn mount_image_strict(image: alloc::vec::Vec<u8>, ctx: &str) -> littlefs2_pure::Fs<MemStorage> {
+    let mut buf_a = make_buffer();
+    let mut buf_b = make_buffer();
+    littlefs2_pure::Fs::mount(MemStorage { data: image }, &mut buf_a, &mut buf_b)
+        .unwrap_or_else(|e| panic!("{ctx}: torn write left an unmountable image: {e:?}"))
+}
+
+/// `(format_calls, scenario_calls)`: how many program calls
+/// `Fs::format` issues, and how many `scenario` adds after it, both
+/// measured on an untorn device. A sweep covering crash atomicity for
+/// the scenario must run triggers through
+/// `1..=format_calls + scenario_calls + margin`; arming over the
+/// scenario count alone under-covers the tail (review L10).
+pub fn torn_call_counts<F>(scenario: F) -> (usize, usize)
+where
+    F: FnOnce(&mut littlefs2_pure::Fs<TornWriteStorage>),
+{
+    let mut torn = TornWriteStorage::new(MemStorage::new(), usize::MAX);
+    let mut scratch = make_buffer();
+    littlefs2_pure::Fs::format(&mut torn, &mut scratch).unwrap();
+    let format_calls = torn.program_count;
+    let mut buf_a = make_buffer();
+    let mut buf_b = make_buffer();
+    let mut fs = littlefs2_pure::Fs::mount(torn, &mut buf_a, &mut buf_b).unwrap();
+    let pre = fs.storage().program_count;
+    scenario(&mut fs);
+    let post = fs.storage().program_count;
+    (format_calls, post - pre)
 }

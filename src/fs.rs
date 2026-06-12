@@ -250,18 +250,120 @@ fn gather_live_slots(
     Ok(count)
 }
 
+/// Live user attributes captured from a source pair, serialized into
+/// a caller-owned stack buffer as consecutive
+/// `[attr_id, len_lo, len_hi, value...]` records. Built by
+/// [`stage_live_attrs`]; carried by the Create-family [`WriteOp`]s so
+/// a cross-directory rename's destination commit re-emits the moved
+/// entry's attributes atomically with its NAME and STRUCT (review H6,
+/// the C reference's `LFS_FROM_MOVE` traversal, which replays all
+/// unique tags of the moved id). Serialized rather than a slice of
+/// slices so one stack pool bounds the whole capture without a second
+/// fixed-size pointer array.
+#[derive(Clone, Copy)]
+pub(crate) struct StagedAttrs<'a> {
+    /// Well-formed by construction in `stage_live_attrs`: each record
+    /// header's length field never overruns the buffer.
+    records: &'a [u8],
+}
+
+impl StagedAttrs<'_> {
+    /// No attributes; what every caller other than the rename
+    /// destination commit passes.
+    pub(crate) const EMPTY: StagedAttrs<'static> = StagedAttrs { records: &[] };
+}
+
+impl<'a> StagedAttrs<'a> {
+    fn iter(&self) -> StagedAttrIter<'a> {
+        StagedAttrIter { rest: self.records }
+    }
+
+    /// On-disk dsize of the staged attrs: one 4-byte tag plus the
+    /// value per record.
+    fn dsize(&self) -> usize {
+        self.iter().map(|(_, v)| 4 + v.len()).sum()
+    }
+}
+
+struct StagedAttrIter<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> Iterator for StagedAttrIter<'a> {
+    type Item = (u8, &'a [u8]);
+
+    fn next(&mut self) -> Option<(u8, &'a [u8])> {
+        if self.rest.len() < 3 {
+            return None;
+        }
+        let attr_id = self.rest[0];
+        let len = u16::from_le_bytes([self.rest[1], self.rest[2]]) as usize;
+        if self.rest.len() < 3 + len {
+            return None;
+        }
+        let (value, tail) = self.rest[3..].split_at(len);
+        self.rest = tail;
+        Some((attr_id, value))
+    }
+}
+
+/// Stack budget for the attribute payload a cross-directory rename
+/// stages, in bytes (each attribute costs its value length plus a
+/// 3-byte record header). The same order as `rename`'s existing
+/// 1 KiB struct-body stage; entries carrying more attribute bytes
+/// than this rename with an explicit [`Error::OutOfRange`] rather
+/// than silently dropping attributes (the pre-H6 behavior). The C
+/// reference streams the source pair through its block caches during
+/// the destination commit and has no such bound; lifting it here
+/// needs a commit-time storage-backed attr stream, a 2.x candidate.
+const RENAME_ATTR_STAGE: usize = 1024;
+
+/// Serialize the live user attributes of `live_id` from `reader` into
+/// `stage` (the [`StagedAttrs`] record format), returning the staged
+/// view. Returns [`Error::OutOfRange`] when the attributes exceed the
+/// stage; see [`Fs::rename`] for the documented bound.
+fn stage_live_attrs<'s>(
+    reader: &crate::meta::MetadataReader<'_>,
+    live_id: u16,
+    stage: &'s mut [u8],
+) -> Result<StagedAttrs<'s>, Error> {
+    let mut used = 0usize;
+    crate::dir::for_each_live_attr(reader, live_id, |attr_id, body| {
+        let need = 3 + body.len();
+        if stage.len() - used < need {
+            return Err(Error::OutOfRange);
+        }
+        stage[used] = attr_id;
+        stage[used + 1..used + 3].copy_from_slice(&(body.len() as u16).to_le_bytes());
+        stage[used + 3..used + need].copy_from_slice(body);
+        used += need;
+        Ok(())
+    })?;
+    Ok(StagedAttrs { records: &stage[..used] })
+}
+
 /// A pending write operation. Used by [`Fs::write_inline_to_root`],
 /// [`Fs::remove_from_root`], and the CTZ write path to dispatch
 /// through the same append-vs-compact machinery.
 #[derive(Clone, Copy)]
 pub(crate) enum WriteOp<'a> {
     /// Create a new entry at `id` (the next free id) with NAME `name`
-    /// and InlineStruct `content`.
-    Create { id: u16, name: &'a [u8], content: &'a [u8] },
+    /// and InlineStruct `content`. `moved_attrs` carries the entry's
+    /// user attributes when the create is the destination half of a
+    /// cross-directory rename (review H6); plain creates pass
+    /// [`StagedAttrs::EMPTY`].
+    Create { id: u16, name: &'a [u8], content: &'a [u8], moved_attrs: StagedAttrs<'a> },
     /// Create a new entry at `id` whose content lives in a CTZ chain
     /// at `head_block` (the chain's tail block, per LittleFS
     /// convention). `total_size` is the file's byte length.
-    CreateCtz { id: u16, name: &'a [u8], head_block: u32, total_size: u32 },
+    /// `moved_attrs` as in [`WriteOp::Create`].
+    CreateCtz {
+        id: u16,
+        name: &'a [u8],
+        head_block: u32,
+        total_size: u32,
+        moved_attrs: StagedAttrs<'a>,
+    },
     /// Update the existing entry at `id` by appending a new
     /// InlineStruct with `content`. The NAME and entry kind are
     /// preserved by the existing tags in the commit log. If the prior
@@ -279,8 +381,9 @@ pub(crate) enum WriteOp<'a> {
     /// down.
     Remove { id: u16 },
     /// Create a new subdirectory entry at `id` with NAME `name` and
-    /// `DirStruct` body pointing at `dir_pair`.
-    CreateDir { id: u16, name: &'a [u8], dir_pair: BlockPair },
+    /// `DirStruct` body pointing at `dir_pair`. `moved_attrs` as in
+    /// [`WriteOp::Create`].
+    CreateDir { id: u16, name: &'a [u8], dir_pair: BlockPair, moved_attrs: StagedAttrs<'a> },
     /// Update the NAME tag of the entry at `id` to `new_name`. The
     /// entry's kind (`name_type`) is preserved; the STRUCT tag is
     /// untouched. Used by [`Fs::rename_in_dir`].
@@ -362,18 +465,24 @@ pub(crate) enum ChainSeek {
 fn emit_op(commit: &mut crate::meta::Commit<'_>, op: &WriteOp<'_>) -> Result<(), Error> {
     use crate::tag::{Tag, TagType};
     match *op {
-        WriteOp::Create { id, name, content } => {
+        WriteOp::Create { id, name, content, moved_attrs } => {
             commit.tag(Tag::new(true, TagType::Create, id, 0), &[])?;
             commit.tag(Tag::new(true, TagType::RegularFile, id, name.len() as u16), name)?;
             commit.tag(Tag::new(true, TagType::InlineStruct, id, content.len() as u16), content)?;
+            for (a, v) in moved_attrs.iter() {
+                commit.tag(Tag::new(true, TagType::UserAttr(a), id, v.len() as u16), v)?;
+            }
         }
-        WriteOp::CreateCtz { id, name, head_block, total_size } => {
+        WriteOp::CreateCtz { id, name, head_block, total_size, moved_attrs } => {
             commit.tag(Tag::new(true, TagType::Create, id, 0), &[])?;
             commit.tag(Tag::new(true, TagType::RegularFile, id, name.len() as u16), name)?;
             let mut body = [0u8; 8];
             body[0..4].copy_from_slice(&head_block.to_le_bytes());
             body[4..8].copy_from_slice(&total_size.to_le_bytes());
             commit.tag(Tag::new(true, TagType::CtzStruct, id, 8), &body)?;
+            for (a, v) in moved_attrs.iter() {
+                commit.tag(Tag::new(true, TagType::UserAttr(a), id, v.len() as u16), v)?;
+            }
         }
         WriteOp::Update { id, content } => {
             commit.tag(Tag::new(true, TagType::InlineStruct, id, content.len() as u16), content)?;
@@ -401,13 +510,16 @@ fn emit_op(commit: &mut crate::meta::Commit<'_>, op: &WriteOp<'_>) -> Result<(),
             // `dir::live_entries`'s splice handling.
             commit.tag(Tag::new(true, TagType::Delete, id, 0), &[])?;
         }
-        WriteOp::CreateDir { id, name, dir_pair } => {
+        WriteOp::CreateDir { id, name, dir_pair, moved_attrs } => {
             commit.tag(Tag::new(true, TagType::Create, id, 0), &[])?;
             commit.tag(Tag::new(true, TagType::Directory, id, name.len() as u16), name)?;
             let mut body = [0u8; 8];
             body[0..4].copy_from_slice(&dir_pair.a.as_u32().to_le_bytes());
             body[4..8].copy_from_slice(&dir_pair.b.as_u32().to_le_bytes());
             commit.tag(Tag::new(true, TagType::DirStruct, id, 8), &body)?;
+            for (a, v) in moved_attrs.iter() {
+                commit.tag(Tag::new(true, TagType::UserAttr(a), id, v.len() as u16), v)?;
+            }
         }
         WriteOp::RenameInPlace { id, name_type, new_name } => {
             // Append a NAME tag at the existing id with the new
@@ -655,7 +767,7 @@ fn emit_compact_range(
     // is exhaustive with no wildcard (review D4).
     if lo <= count && count < hi {
         match *op {
-            WriteOp::Create { id, name, content } => {
+            WriteOp::Create { id, name, content, moved_attrs } => {
                 debug_assert!(
                     lo > 0 || id == emit_id,
                     "single-pair Create id must equal emit count"
@@ -666,8 +778,11 @@ fn emit_compact_range(
                     Tag::new(true, TagType::InlineStruct, emit_id, content.len() as u16),
                     content,
                 )?;
+                for (a, v) in moved_attrs.iter() {
+                    sink.tag(Tag::new(true, TagType::UserAttr(a), emit_id, v.len() as u16), v)?;
+                }
             }
-            WriteOp::CreateCtz { id, name, head_block, total_size } => {
+            WriteOp::CreateCtz { id, name, head_block, total_size, moved_attrs } => {
                 debug_assert!(
                     lo > 0 || id == emit_id,
                     "single-pair CreateCtz id must equal emit count"
@@ -678,8 +793,11 @@ fn emit_compact_range(
                 body[0..4].copy_from_slice(&head_block.to_le_bytes());
                 body[4..8].copy_from_slice(&total_size.to_le_bytes());
                 sink.tag(Tag::new(true, TagType::CtzStruct, emit_id, 8), &body)?;
+                for (a, v) in moved_attrs.iter() {
+                    sink.tag(Tag::new(true, TagType::UserAttr(a), emit_id, v.len() as u16), v)?;
+                }
             }
-            WriteOp::CreateDir { id, name, dir_pair } => {
+            WriteOp::CreateDir { id, name, dir_pair, moved_attrs } => {
                 debug_assert!(
                     lo > 0 || id == emit_id,
                     "single-pair CreateDir id must equal emit count"
@@ -690,6 +808,9 @@ fn emit_compact_range(
                 body[0..4].copy_from_slice(&dir_pair.a.as_u32().to_le_bytes());
                 body[4..8].copy_from_slice(&dir_pair.b.as_u32().to_le_bytes());
                 sink.tag(Tag::new(true, TagType::DirStruct, emit_id, 8), &body)?;
+                for (a, v) in moved_attrs.iter() {
+                    sink.tag(Tag::new(true, TagType::UserAttr(a), emit_id, v.len() as u16), v)?;
+                }
             }
             WriteOp::Update { .. }
             | WriteOp::UpdateCtz { .. }
@@ -1056,15 +1177,46 @@ fn op_dsize_of(op: &WriteOp<'_>) -> usize {
     match *op {
         WriteOp::Update { content, .. } => (4 + content.len()) + 8,
         WriteOp::UpdateCtz { .. } | WriteOp::UpdateDirStruct { .. } => (4 + 8) + 8,
-        WriteOp::Create { name, content, .. } => 4 + (4 + name.len()) + (4 + content.len()) + 8,
-        WriteOp::CreateCtz { name, .. } | WriteOp::CreateDir { name, .. } => {
-            4 + (4 + name.len()) + (4 + 8) + 8
+        WriteOp::Create { name, content, moved_attrs, .. } => {
+            4 + (4 + name.len()) + (4 + content.len()) + moved_attrs.dsize() + 8
+        }
+        WriteOp::CreateCtz { name, moved_attrs, .. }
+        | WriteOp::CreateDir { name, moved_attrs, .. } => {
+            4 + (4 + name.len()) + (4 + 8) + moved_attrs.dsize() + 8
         }
         WriteOp::Remove { .. } | WriteOp::RemoveAttr { .. } => 4 + 8,
         WriteOp::RenameInPlace { new_name, .. } => (4 + new_name.len()) + 8,
         WriteOp::SetAttr { value, .. } => (4 + value.len()) + 8,
         WriteOp::Noop => 8,
     }
+}
+
+/// Re-read a just-programmed region and CRC-compare it against the
+/// bytes that were sent, the C reference's post-commit validation
+/// (`lfs_dir_commitcrc` re-reads every commit through `lfs_bd_crc`;
+/// review H2). Without it, a program that silently corrupted cells
+/// reports durable success and the corruption surfaces only at the
+/// next mount of that pair.
+///
+/// `region` doubles as the read-back destination (the kernel has no
+/// third block buffer): on a match the buffer holds the on-disk bytes,
+/// which equal what it held before the call; on a mismatch the caller
+/// must treat the buffer as clobbered and fall into its worn-block
+/// path, every one of which rebuilds the buffer before reuse.
+///
+/// Alignment: every caller verifies a region it just programmed, so
+/// `off`/`len` are `PROG_SIZE`-aligned, and `BLOCK_SIZE` being a
+/// multiple of `PROG_SIZE` (itself at least `READ_SIZE`) makes the
+/// read legal under the [`Storage`] geometry contract.
+fn verify_programmed<S: Storage>(
+    storage: &mut S,
+    block: BlockAddress,
+    off: usize,
+    region: &mut [u8],
+) -> bool {
+    let expected = crate::crc::update(crate::crc::INIT, region);
+    storage.read(block.as_u32(), off as u32, region).is_ok()
+        && crate::crc::update(crate::crc::INIT, region) == expected
 }
 
 /// True when `op` adds a new entry, so the combined entry sequence has
@@ -1645,7 +1797,13 @@ impl<S: Storage> Fs<S> {
             if new_id == crate::tag::ID_NONE {
                 return Err(Error::OutOfRange);
             }
-            WriteOp::CreateCtz { id: new_id, name, head_block, total_size }
+            WriteOp::CreateCtz {
+                id: new_id,
+                name,
+                head_block,
+                total_size,
+                moved_attrs: StagedAttrs::EMPTY,
+            }
         };
 
         // Pass the just-allocated chain as inflight so the wear-level
@@ -2478,6 +2636,14 @@ impl<S: Storage> Fs<S> {
             commit.bytes_written()
         };
         self.storage.program(new_dir.a.as_u32(), 0, &buf_a[..new_end]).map_err(|_| Error::Io)?;
+        // Review H2: the new directory's init commit gets the same
+        // read-back every other commit gets. A verify failure reports
+        // `Io` exactly like a program failure on this path; the
+        // allocated pair stays an unreferenced orphan. `buf_a` is
+        // re-read below before its next use.
+        if !verify_programmed(&mut self.storage, new_dir.a, 0, &mut buf_a[..new_end]) {
+            return Err(Error::Io);
+        }
         self.storage.sync().map_err(|_| Error::Io)?;
 
         // Re-read the target pair to compute the new id from the live
@@ -2496,7 +2662,12 @@ impl<S: Storage> Fs<S> {
         if new_id == crate::tag::ID_NONE {
             return Err(Error::OutOfRange);
         }
-        let op = WriteOp::CreateDir { id: new_id, name: dir_name_bytes, dir_pair: new_dir };
+        let op = WriteOp::CreateDir {
+            id: new_id,
+            name: dir_name_bytes,
+            dir_pair: new_dir,
+            moved_attrs: StagedAttrs::EMPTY,
+        };
         // Re-point the target pair's tail at the new dir (SoftTail),
         // inserting it into the global list right after the parent. Rides
         // the same atomic commit as the DirStruct.
@@ -2731,6 +2902,16 @@ impl<S: Storage> Fs<S> {
     /// their existing metadata pair; cross-directory rename does not
     /// move file content or rehash anything.
     ///
+    /// The entry's user attributes move with it, riding the
+    /// destination `Create` commit atomically (review H6; the C
+    /// reference's `LFS_FROM_MOVE` replays all unique tags of the
+    /// moved id). One documented divergence: the attributes stage
+    /// through a fixed 1 KiB stack pool, so an entry whose live
+    /// attribute payload exceeds [`RENAME_ATTR_STAGE`] fails the
+    /// rename with [`Error::OutOfRange`] (attributes intact, nothing
+    /// moved) where the C reference, which streams the source pair
+    /// through its block caches, would succeed.
+    ///
     /// # Cycle prevention
     ///
     /// Rejects with [`Error::InvalidPath`] if `old_path` is a strict
@@ -2793,9 +2974,18 @@ impl<S: Storage> Fs<S> {
             ChainSeek::Absent { .. } => return Err(Error::NotFound),
         };
         let mut src_body = [0u8; 1024];
+        // The moved entry's live user attributes ride the destination
+        // Create commit (review H6; the C reference's `LFS_FROM_MOVE`
+        // replays all unique tags of the moved id, so attributes move
+        // atomically with the entry). Staged through a stack pool like
+        // `src_body`: the destination commit cannot read the source
+        // pair (both scratch buffers hold the destination by then),
+        // and the kernel owns no third block buffer.
+        let mut attr_stage = [0u8; RENAME_ATTR_STAGE];
         let src_id;
         let src_struct_type;
         let src_body_len;
+        let staged_attr_len;
         {
             let p = MetadataPair::parse(src_owner.a, &*buf_a, src_owner.b, &*buf_b)?;
             let r = crate::dir::lookup(&p, old_leaf_bytes).ok_or(Error::NotFound)?;
@@ -2807,7 +2997,9 @@ impl<S: Storage> Fs<S> {
             src_id = r.entry.id;
             src_struct_type = r.struct_type;
             src_body_len = n;
+            staged_attr_len = stage_live_attrs(&p.reader, src_id, &mut attr_stage)?.records.len();
         }
+        let moved_attrs = StagedAttrs { records: &attr_stage[..staged_attr_len] };
 
         // Reject if the destination already exists anywhere in the
         // destination parent's chain; compute the new entry id from the
@@ -2831,6 +3023,7 @@ impl<S: Storage> Fs<S> {
                 id: new_id,
                 name: new_leaf_bytes,
                 content: &src_body[..src_body_len],
+                moved_attrs,
             },
             crate::tag::TagType::CtzStruct => {
                 if src_body_len != 8 {
@@ -2840,7 +3033,13 @@ impl<S: Storage> Fs<S> {
                     u32::from_le_bytes([src_body[0], src_body[1], src_body[2], src_body[3]]);
                 let total_size =
                     u32::from_le_bytes([src_body[4], src_body[5], src_body[6], src_body[7]]);
-                WriteOp::CreateCtz { id: new_id, name: new_leaf_bytes, head_block, total_size }
+                WriteOp::CreateCtz {
+                    id: new_id,
+                    name: new_leaf_bytes,
+                    head_block,
+                    total_size,
+                    moved_attrs,
+                }
             }
             crate::tag::TagType::DirStruct => {
                 if src_body_len != 8 {
@@ -2852,6 +3051,7 @@ impl<S: Storage> Fs<S> {
                     id: new_id,
                     name: new_leaf_bytes,
                     dir_pair: BlockPair::new(BlockAddress::new(a), BlockAddress::new(b)),
+                    moved_attrs,
                 }
             }
             _ => return Err(Error::Corrupt),
@@ -3112,6 +3312,12 @@ impl<S: Storage> Fs<S> {
             // `forced_victim` branch in `compact_and_program`). The live
             // entries `slots` reference sit below `committed_end`, which the
             // append never overwrites, so they stay valid for the compaction.
+            // A program that returns Ok but lands corrupted bytes is
+            // indistinguishable from success without the read-back
+            // (review H2); a verify failure falls through to the same
+            // worn-block eviction as a program failure. The verify
+            // clobbers only `[committed_end..new_end)`, and the live
+            // entries `slots` reference sit below `committed_end`.
             did_append = self
                 .storage
                 .program(
@@ -3119,7 +3325,13 @@ impl<S: Storage> Fs<S> {
                     committed_end as u32,
                     &active_buf[committed_end..new_end],
                 )
-                .is_ok();
+                .is_ok()
+                && verify_programmed(
+                    &mut self.storage,
+                    active_addr,
+                    committed_end,
+                    &mut active_buf[committed_end..new_end],
+                );
         }
         if !did_append {
             let new_revision = old_revision.wrapping_add(1);
@@ -3472,12 +3684,23 @@ impl<S: Storage> Fs<S> {
 
         let alt_bytes_len = new_end;
         let alt_write_ok = {
-            let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+            let alt_buf: &mut [u8] = if active_is_a { buf_b } else { buf_a };
             self.storage.erase(alternate_addr.as_u32()).is_ok()
                 && self
                     .storage
                     .program(alternate_addr.as_u32(), 0, &alt_buf[..alt_bytes_len])
                     .is_ok()
+                // Review H2: a silently corrupted program must take the
+                // worn-alternate relocation below, not report success.
+                // On mismatch the build buffer is clobbered with disk
+                // bytes; `relocate_compact_to_fresh` rebuilds it from
+                // the untouched source buffer.
+                && verify_programmed(
+                    &mut self.storage,
+                    alternate_addr,
+                    0,
+                    &mut alt_buf[..alt_bytes_len],
+                )
         };
 
         if !alt_write_ok {
@@ -3529,9 +3752,15 @@ impl<S: Storage> Fs<S> {
         // the relocation this cycle. Wear levelling is opportunistic and
         // re-fires at the next cycle.
         let fresh_write_ok = {
-            let alt_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+            let alt_buf: &mut [u8] = if active_is_a { buf_b } else { buf_a };
             self.storage.erase(fresh.as_u32()).is_ok()
                 && self.storage.program(fresh.as_u32(), 0, &alt_buf[..alt_bytes_len]).is_ok()
+                // Review H2: a corrupted fresh copy must abandon the
+                // relocation (the alternate already anchors a durable,
+                // verified commit), not propagate a bad pair address.
+                // On mismatch the buffer is clobbered; the cancel path
+                // below re-reads the pair from storage before use.
+                && verify_programmed(&mut self.storage, fresh, 0, &mut alt_buf[..alt_bytes_len])
         };
         if fresh_write_ok {
             Ok(Some(new_pair))
@@ -3722,9 +3951,14 @@ impl<S: Storage> Fs<S> {
                 )?
             };
             let write_ok = {
-                let build_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+                let build_buf: &mut [u8] = if active_is_a { buf_b } else { buf_a };
                 self.storage.erase(fresh.as_u32()).is_ok()
                     && self.storage.program(fresh.as_u32(), 0, &build_buf[..new_end]).is_ok()
+                    // Review H2: a fresh candidate that corrupts its
+                    // bytes silently is as worn as one that errors;
+                    // the retry below excludes it and rebuilds the
+                    // (now clobbered) build buffer for the next one.
+                    && verify_programmed(&mut self.storage, fresh, 0, &mut build_buf[..new_end])
             };
             if write_ok {
                 // The fresh block is now in use; drop the stale lookahead.
@@ -3923,9 +4157,13 @@ impl<S: Storage> Fs<S> {
                 )?
             };
             let a_ok = {
-                let build_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+                let build_buf: &mut [u8] = if active_is_a { buf_b } else { buf_a };
                 self.storage.erase(ca.as_u32()).is_ok()
                     && self.storage.program(ca.as_u32(), 0, &build_buf[..cont_len]).is_ok()
+                    // Review H2: an unverified continuation would be
+                    // linearized into the chain by the lower-half
+                    // commit below. The retry rebuilds the buffer.
+                    && verify_programmed(&mut self.storage, ca, 0, &mut build_buf[..cont_len])
             };
             // Block B stays erased as the continuation's alternate so a stale
             // image there cannot masquerade as a newer revision.
@@ -3991,9 +4229,18 @@ impl<S: Storage> Fs<S> {
             )?
         };
         let low_ok = {
-            let build_buf: &[u8] = if active_is_a { &*buf_b } else { &*buf_a };
+            let build_buf: &mut [u8] = if active_is_a { buf_b } else { buf_a };
             self.storage.erase(alternate_addr.as_u32()).is_ok()
                 && self.storage.program(alternate_addr.as_u32(), 0, &build_buf[..low_len]).is_ok()
+                // Review H2: this program is the split's linearization
+                // point; a silent corruption here must divert to the
+                // worn-alternate relocation, which rebuilds the buffer.
+                && verify_programmed(
+                    &mut self.storage,
+                    alternate_addr,
+                    0,
+                    &mut build_buf[..low_len],
+                )
         };
         if low_ok {
             // A continuation born here is a new reachable pair; drop the
@@ -4555,7 +4802,10 @@ impl<S: Storage> Fs<S> {
                 if new_id == crate::tag::ID_NONE {
                     return Err(Error::OutOfRange);
                 }
-                (last_pair, WriteOp::Create { id: new_id, name, content })
+                (
+                    last_pair,
+                    WriteOp::Create { id: new_id, name, content, moved_attrs: StagedAttrs::EMPTY },
+                )
             }
         };
         self.apply_op_to_pair(target, &op, buf_a, buf_b)
@@ -4629,6 +4879,13 @@ impl<S: Storage> Fs<S> {
         // cycles are spent on the all-0xFF tail.
         storage.erase(0).map_err(|_| Error::Io)?;
         storage.program(0, 0, &scratch[..new_end]).map_err(|_| Error::Io)?;
+        // Review H2: verify the superblock commit like every other
+        // commit. Block 0 is the fixed mount anchor and cannot
+        // relocate, so a silent corruption here is a hard `Io` error,
+        // not a candidate for the worn-block fallback.
+        if !verify_programmed(storage, BlockAddress::new(0), 0, &mut scratch[..new_end]) {
+            return Err(Error::Io);
+        }
         // Erase block 1 to leave it as a fresh alternate.
         storage.erase(1).map_err(|_| Error::Io)?;
         storage.sync().map_err(|_| Error::Io)?;
@@ -5245,7 +5502,10 @@ mod split_point_tests {
     //! geometry the budget reads. Geometry matches `tests/pending_dir_split.rs`
     //! (256-byte blocks, 16-byte prog), the reproduce-first target.
 
-    use super::{compact_range_size, compute_split_index, SlotOffsets, WriteOp, MAX_LIVE_ENTRIES};
+    use super::{
+        compact_range_size, compute_split_index, SlotOffsets, StagedAttrs, WriteOp,
+        MAX_LIVE_ENTRIES,
+    };
     use crate::storage::Storage;
 
     /// An empty committed source block (revision header only, rest
@@ -5320,7 +5580,12 @@ mod split_point_tests {
     fn range_size_create_family() {
         // name "fNNN" = 4 bytes, inline content "x" = 1 byte.
         let slots = filled(3, 4, 1);
-        let op = WriteOp::Create { id: 3, name: b"f003", content: b"x" };
+        let op = WriteOp::Create {
+            id: 3,
+            name: b"f003",
+            content: b"x",
+            moved_attrs: StagedAttrs::EMPTY,
+        };
         // Each live slot: 12 + 4 + 1 = 17. New entry (op_dsize_of - 8):
         // 4 + (4+4) + (4+1) = 17. Range [0,4) over count=3 includes all
         // three live slots plus the virtual new entry.
@@ -5336,7 +5601,12 @@ mod split_point_tests {
     fn small_directory_does_not_split() {
         // 3 entries plus a create = 68 bytes < 128 budget: no split.
         let slots = filled(3, 4, 1);
-        let op = WriteOp::Create { id: 3, name: b"f003", content: b"x" };
+        let op = WriteOp::Create {
+            id: 3,
+            name: b"f003",
+            content: b"x",
+            moved_attrs: StagedAttrs::EMPTY,
+        };
         assert_eq!(
             compute_split_index::<Dev256>(&empty_source(), &slots, 3, &op, 0, 4).unwrap(),
             0
@@ -5348,7 +5618,12 @@ mod split_point_tests {
         // 11 existing 17-byte entries + a 12th (create) = 204 bytes > 128.
         // Inner loop: split 0 -> 6 (upper [6,12) = 5*17 + 17 = 102 <= 128).
         let slots = filled(11, 4, 1);
-        let op = WriteOp::Create { id: 11, name: b"f011", content: b"x" };
+        let op = WriteOp::Create {
+            id: 11,
+            name: b"f011",
+            content: b"x",
+            moved_attrs: StagedAttrs::EMPTY,
+        };
         let split = compute_split_index::<Dev256>(&empty_source(), &slots, 11, &op, 0, 12).unwrap();
         assert_eq!(split, 6);
         // Both halves must fit the budget after the chosen split.

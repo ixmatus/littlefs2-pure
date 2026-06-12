@@ -108,18 +108,6 @@ fn assert_no_thread_orphan(data: &[u8]) {
     }
 }
 
-fn count_program_calls<F: FnOnce(&mut Fs<TornWriteStorage>)>(scenario: F) -> usize {
-    let mut torn = TornWriteStorage::new(MemStorage::new(), usize::MAX);
-    let mut scratch = buf();
-    Fs::format(&mut torn, &mut scratch).unwrap();
-    let mut ba = buf();
-    let mut bb = buf();
-    let mut fs = Fs::mount(torn, &mut ba, &mut bb).unwrap();
-    let pre = fs.storage().program_count;
-    scenario(&mut fs);
-    fs.storage().program_count - pre
-}
-
 #[test]
 fn torn_rmdir_unthread_is_deorphaned_on_remount() {
     let scenario = |fs: &mut Fs<TornWriteStorage>| {
@@ -129,40 +117,52 @@ fn torn_rmdir_unthread_is_deorphaned_on_remount() {
         let _ = fs.mkdir(Path::new("/b").unwrap(), &mut a, &mut b);
         let _ = fs.rmdir(Path::new("/a").unwrap(), &mut a, &mut b);
     };
-    let total = count_program_calls(scenario);
-    assert!(total > 0);
+    let (fmt_calls, scenario_calls) = common::torn_call_counts(scenario);
+    assert!(scenario_calls > 0);
 
-    for trigger in 1..=total + 2 {
-        let mut torn = TornWriteStorage::new(MemStorage::new(), trigger);
-        let mut scratch = buf();
-        if Fs::format(&mut torn, &mut scratch).is_err() {
-            continue; // format torn; nothing to check
-        }
-        let inner = {
-            let mut ba = buf();
-            let mut bb = buf();
-            match Fs::mount(torn, &mut ba, &mut bb) {
-                Ok(mut fs) => {
-                    scenario(&mut fs);
-                    fs.into_storage().into_inner()
-                }
-                Err(_) => continue,
+    for trigger in 1..=fmt_calls + scenario_calls + 2 {
+        let image = match common::run_torn_scenario(trigger, scenario) {
+            common::TornRun::TornFormat => {
+                assert!(
+                    trigger <= fmt_calls,
+                    "trigger {trigger}: format reported torn past its own \
+                     {fmt_calls} program calls"
+                );
+                continue;
             }
+            common::TornRun::Image(image) => image,
         };
 
-        // Remount: deorphan runs here. It must succeed and leave a
-        // consistent thread.
-        let mut ba = buf();
-        let mut bb = buf();
-        // A torn-format-like state that fails to remount is acceptable.
-        let Ok(mut fs) = Fs::mount(inner, &mut ba, &mut bb) else {
-            continue;
-        };
-        // /b must still resolve (it was never removed).
+        // Remount: deorphan recovery runs here. Strong semantics
+        // (review H7): the image held a valid filesystem before the
+        // tear, so it MUST mount; the pre-H7 sweep silently
+        // `continue`d past unmountable images.
+        let mut fs =
+            common::mount_image_strict(image, &format!("rmdir unthread sweep trigger {trigger}"));
         let mut a = buf();
         let mut b = buf();
-        let _ = fs.exists(Path::new("/b").unwrap(), &mut a, &mut b);
+        // Load-bearing existence checks (review M5: the pre-fix sweep
+        // discarded this result with `let _`). Both queries must
+        // answer cleanly; any (a, b) combination is a legitimate
+        // prefix state of mkdir/mkdir/rmdir, so the assertions are
+        // that the answers are coherent and stable, and that the
+        // thread holds no orphan.
+        let a_exists = fs.exists(Path::new("/a").unwrap(), &mut a, &mut b).unwrap();
+        let b_exists = fs.exists(Path::new("/b").unwrap(), &mut a, &mut b).unwrap();
         let data = fs.into_storage();
         assert_no_thread_orphan(&data.data);
+
+        // Recovery is idempotent: a second mount answers the same.
+        let mut fs = common::mount_image_strict(
+            data.data,
+            &format!("rmdir unthread sweep trigger {trigger}, second remount"),
+        );
+        let a2 = fs.exists(Path::new("/a").unwrap(), &mut a, &mut b).unwrap();
+        let b2 = fs.exists(Path::new("/b").unwrap(), &mut a, &mut b).unwrap();
+        assert_eq!(
+            (a_exists, b_exists),
+            (a2, b2),
+            "trigger {trigger}: directory state must be stable across remounts"
+        );
     }
 }

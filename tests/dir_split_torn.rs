@@ -10,11 +10,14 @@
 //!
 //! Scenario: `mkdir /d` then write enough small files into `/d` to force
 //! at least one split. Tearing at every program-call boundary and
-//! remounting, the filesystem must always mount to a consistent state:
-//! `/d` enumerates without error, every entry that survives reads back
-//! its content, no entry is duplicated, and no pair reachable by following
-//! tails from the root is missing from the tree (no leaked continuation).
-//! A second remount is stable (recovery is idempotent).
+//! remounting, the filesystem must always mount (strong semantics,
+//! review H7: once format completed, an unmountable post-tear image is
+//! a bricked device and an immediate failure) to an exact prefix of
+//! the operation sequence: `/d` absent, or `/d` holding exactly
+//! `f00..f(k-1)` for some `k`, each entry reading back its content,
+//! no entry duplicated, and no pair reachable by following tails from
+//! the root missing from the tree (no leaked continuation). A second
+//! remount is stable (recovery is idempotent).
 
 use littlefs2_pure::meta::MetadataReader;
 use littlefs2_pure::{BlockPair, Fs, Path};
@@ -42,18 +45,6 @@ fn scenario(fs: &mut Fs<TornWriteStorage>) {
         let s = format!("/d/f{i:02}");
         let _ = fs.write_to_path(Path::new(&s).unwrap(), b"x", &mut a, &mut b);
     }
-}
-
-fn count_program_calls() -> usize {
-    let mut torn = TornWriteStorage::new(MemStorage::new(), usize::MAX);
-    let mut scratch = buf();
-    Fs::format(&mut torn, &mut scratch).unwrap();
-    let mut ba = buf();
-    let mut bb = buf();
-    let mut fs = Fs::mount(torn, &mut ba, &mut bb).unwrap();
-    let pre = fs.storage().program_count;
-    scenario(&mut fs);
-    fs.storage().program_count - pre
 }
 
 /// Parse the active block of `pair` from a raw image, returning its live
@@ -182,8 +173,8 @@ fn enumerate_dir(fs: &mut Fs<MemStorage>) -> Option<Vec<Vec<u8>>> {
 
 #[test]
 fn torn_directory_split_is_atomic_across_every_power_loss() {
-    let total = count_program_calls();
-    assert!(total > 0);
+    let (fmt_calls, scenario_calls) = common::torn_call_counts(scenario);
+    assert!(scenario_calls > 0);
     // The scenario must actually split: a single 256-byte pair cannot hold
     // 16 entries, so a clean (untorn) run produces a multi-pair directory.
     {
@@ -210,47 +201,52 @@ fn torn_directory_split_is_atomic_across_every_power_loss() {
         assert!(ok >= 14, "scenario should fill past one pair (got {ok})");
     }
 
-    for trigger in 1..=total + 2 {
-        let mut torn = TornWriteStorage::new(MemStorage::new(), trigger);
-        let mut scratch = buf();
-        if Fs::format(&mut torn, &mut scratch).is_err() {
-            continue; // torn format; nothing to check
-        }
-        let inner = {
-            let mut ba = buf();
-            let mut bb = buf();
-            match Fs::mount(torn, &mut ba, &mut bb) {
-                Ok(mut fs) => {
-                    scenario(&mut fs);
-                    fs.into_storage().into_inner()
-                }
-                Err(_) => continue,
+    for trigger in 1..=fmt_calls + scenario_calls + 2 {
+        let image = match common::run_torn_scenario(trigger, scenario) {
+            common::TornRun::TornFormat => {
+                assert!(
+                    trigger <= fmt_calls,
+                    "trigger {trigger}: format reported torn past its own \
+                     {fmt_calls} program calls"
+                );
+                continue;
             }
+            common::TornRun::Image(image) => image,
         };
 
-        // Raw image bytes (MemStorage is not Clone; reconstruct from the
-        // public `data` field for each independent mount).
-        let image = inner.data;
-
-        // First remount: recovery runs here. A torn image that fails to
-        // mount is acceptable (the chip is in a partial-format-like state).
+        // First remount: recovery runs here. Strong semantics (review
+        // H7): the image held a valid filesystem before the tear, so
+        // it MUST mount; the pre-H7 sweep silently `continue`d past
+        // unmountable images, accepting bricked devices.
         let names_a = {
-            let mut ba = buf();
-            let mut bb = buf();
-            let Ok(mut fs) = Fs::mount(MemStorage { data: image.clone() }, &mut ba, &mut bb) else {
-                continue;
-            };
+            let mut fs = common::mount_image_strict(
+                image.clone(),
+                &format!("split sweep trigger {trigger}, first remount"),
+            );
             let names = enumerate_dir(&mut fs);
+            // The surviving directory must be an exact prefix of the
+            // write sequence: each commit is atomic and the writes are
+            // sequential, so any other set means a write half-landed.
+            if let Some(names) = &names {
+                for (i, name) in names.iter().enumerate() {
+                    assert_eq!(
+                        name,
+                        format!("f{i:02}").as_bytes(),
+                        "trigger {trigger}: surviving entries must be an exact \
+                         prefix of the write sequence, got {names:?}"
+                    );
+                }
+            }
             let data = fs.into_storage();
             assert_no_thread_orphan(&data.data);
             names
         };
 
         // Second remount: state is stable (recovery is idempotent).
-        let mut ba = buf();
-        let mut bb = buf();
-        let mut fs = Fs::mount(MemStorage { data: image }, &mut ba, &mut bb)
-            .expect("re-mount of a once-mounted image");
+        let mut fs = common::mount_image_strict(
+            image,
+            &format!("split sweep trigger {trigger}, second remount"),
+        );
         let names_b = enumerate_dir(&mut fs);
         assert_eq!(names_a, names_b, "directory state must be stable across remounts");
     }
