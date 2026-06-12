@@ -22,65 +22,34 @@
 //! responsible for not landing partial bytes; the FCRC tag the
 //! writer emits is what guards against torn-within-program scenarios
 //! at the reader side). Boundary torns are what an MCU-level power
-//! cut would produce.
+//! cut would produce. Partial-program landings through
+//! `NorAlignedStorage` are review coverage item V4 (bead lfs-hki).
+//!
+//! Strong semantics (review H7): a mount failure is acceptable ONLY
+//! while the tear can have hit `Fs::format` itself. Once format has
+//! completed, the device holds a valid filesystem, and a torn write
+//! that leaves it unmountable is a bricked device — the exact
+//! regression these sweeps exist to catch. The pre-H7 version of
+//! this file accepted `Corrupt`/`Unformatted` at every trigger.
 
 use littlefs2_pure::{Error, Fs, Path};
 
 mod common;
 use common::{MemStorage, TornWriteStorage};
 
-/// Count how many `program` calls a fresh-FS scenario triggers,
-/// without any torn-write injection. This is the upper bound on
-/// scenarios we need to test: there are this many possible
-/// power-loss points.
-fn count_program_calls<F: FnOnce(&mut Fs<TornWriteStorage>)>(scenario: F) -> usize {
-    let storage = MemStorage::new();
-    let mut torn = TornWriteStorage::new(storage, usize::MAX);
-    let mut scratch = common::make_buffer();
-    Fs::format(&mut torn, &mut scratch).unwrap();
-    let mut buf_a = common::make_buffer();
-    let mut buf_b = common::make_buffer();
-    let mut fs = Fs::mount(torn, &mut buf_a, &mut buf_b).unwrap();
-    let pre_count = fs.storage().program_count;
-    scenario(&mut fs);
-    let post_count = fs.storage().program_count;
-    post_count - pre_count
-}
-
-/// Run a scenario with power loss at the `i`-th program call
-/// (1-indexed). Returns the post-mount file content if the
-/// scenario completed; `None` if the mount fails (allowed —
-/// `Unformatted` / `Corrupt` from a torn format is acceptable;
-/// the caller asserts the appropriate variant).
-fn run_torn_at<F>(scenario: F, trigger_at: usize) -> Result<Vec<u8>, Error>
-where
-    F: FnOnce(&mut Fs<TornWriteStorage>),
-{
-    let storage = MemStorage::new();
-    let mut torn = TornWriteStorage::new(storage, trigger_at);
-
-    // First, format. If format gets torn, the chip is in a partial
-    // state and Fs::mount will return Unformatted or Corrupt.
-    let mut scratch = common::make_buffer();
-    let format_result = Fs::format(&mut torn, &mut scratch);
-    if format_result.is_err() {
-        // Format itself was torn. The chip is unformatted (still all
-        // 0xFF) or partially programmed (Corrupt). Bail.
-        return remount_and_read_log(torn);
+/// Read `/log`'s content from a mounted post-tear image. Every error
+/// here is a regression: the image mounted, so the read surface must
+/// be coherent.
+fn read_log(fs: &mut Fs<common::MemStorage>) -> Vec<u8> {
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
+    if !fs.exists(Path::new("/log").unwrap(), &mut a, &mut b).unwrap() {
+        return Vec::new();
     }
-    {
-        let mut buf_a = common::make_buffer();
-        let mut buf_b = common::make_buffer();
-        match Fs::mount(torn, &mut buf_a, &mut buf_b) {
-            Ok(mut fs) => {
-                // Run the scenario; the storage may fail mid-call.
-                scenario(&mut fs);
-                let inner = fs.into_storage();
-                remount_and_read_log(inner)
-            }
-            Err(e) => Err(e),
-        }
-    }
+    let size = fs.size_of(Path::new("/log").unwrap(), &mut a, &mut b).unwrap();
+    let mut out = vec![0u8; size as usize];
+    fs.read_at_path(Path::new("/log").unwrap(), 0, &mut out, &mut a, &mut b).unwrap();
+    out
 }
 
 fn remount_and_read_log(torn: TornWriteStorage) -> Result<Vec<u8>, Error> {
@@ -111,24 +80,30 @@ fn inline_write_atomic_across_every_power_loss() {
         let _ = fs.write_to_path(Path::new("/log").unwrap(), b"ONE", &mut a, &mut b);
     };
 
-    let total = count_program_calls(scenario);
-    assert!(total > 0, "scenario must perform at least one program call");
+    // Triggers count from format's first program (review L10: arming
+    // over the scenario count alone under-covers the tail).
+    let (fmt_calls, scenario_calls) = common::torn_call_counts(scenario);
+    assert!(scenario_calls > 0, "scenario must perform at least one program call");
 
-    for trigger in 1..=total + 5 {
-        let result = run_torn_at(scenario, trigger);
-        match result {
-            Ok(content) => {
+    for trigger in 1..=fmt_calls + scenario_calls + 5 {
+        match common::run_torn_scenario(trigger, scenario) {
+            common::TornRun::TornFormat => {
+                assert!(
+                    trigger <= fmt_calls,
+                    "trigger {trigger}: format reported torn past its own \
+                     {fmt_calls} program calls"
+                );
+            }
+            common::TornRun::Image(image) => {
+                let mut fs =
+                    common::mount_image_strict(image, &format!("inline sweep trigger {trigger}"));
+                let content = read_log(&mut fs);
                 assert!(
                     content.is_empty() || content == b"ONE",
                     "trigger {trigger}: unexpected content {content:?}; \
                      invariant violated (must be pre-state '' or post-state 'ONE')"
                 );
             }
-            // Mount errors are acceptable for torn formats and other
-            // pre-FS states (Unformatted / Corrupt). Any other error
-            // is a regression.
-            Err(Error::Unformatted | Error::Corrupt) => {}
-            Err(e) => panic!("trigger {trigger}: unexpected error {e:?}"),
         }
     }
 }
