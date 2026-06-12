@@ -305,6 +305,17 @@ fn walk_ctz_chain<S: Storage>(
     }
     let bs = S::BLOCK_SIZE as u32;
     let total = ctz::block_count(size, bs);
+    // Bound the walk before the first read (review H8). A CtzStruct
+    // size claiming more blocks than the device holds cannot describe
+    // a real chain, and an unguarded walk would issue ~size/block_size
+    // skip-pointer reads on every allocator rescan for an adversarial
+    // size. The bound is the device, not MAX_CTZ_BLOCKS: the read path
+    // caps at MAX_CTZ_BLOCKS only to size its stack array, while this
+    // walk streams, and a C-written file larger than the read cap must
+    // still be marked used or the allocator would hand out its blocks.
+    if total > S::BLOCK_COUNT {
+        return Err(Error::Corrupt);
+    }
     let mut index = total - 1;
     let mut head = head_block;
     let mut sp_buf = [0u8; 8];
