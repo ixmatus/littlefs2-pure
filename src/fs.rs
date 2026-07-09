@@ -4544,6 +4544,24 @@ impl<S: Storage> Fs<S> {
             return Err(Error::NotEmpty);
         }
 
+        // A multi-pair (HardTail-split) directory cannot be dropped by
+        // un-threading only its head: `unthread_and_steal` re-points the
+        // predecessor's tail past the head pair, which grafts the head's
+        // HardTail continuation onto the predecessor's chain, silently
+        // extending an unrelated directory with the removed directory's
+        // leftover pairs (review M1, `lfs-tx8`). The C reference refuses
+        // this case with NOTEMPTY; match it rather than corrupt the thread.
+        // (Properly dropping the whole chain is a possible future
+        // enhancement; refusing keeps the on-disk thread consistent.)
+        {
+            self.storage.read(dir_pair.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+            self.storage.read(dir_pair.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            let p = MetadataPair::parse(dir_pair.a, &*buf_a, dir_pair.b, &*buf_b)?;
+            if p.reader.is_hard_tail() {
+                return Err(Error::NotEmpty);
+            }
+        }
+
         // Remove the entry from the parent (drops the directory from the
         // tree). Then un-thread it: re-point the thread predecessor's tail
         // past the removed pair so the global list stays consistent for
