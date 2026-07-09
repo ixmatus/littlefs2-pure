@@ -4456,18 +4456,61 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
-        self.storage.read(dropped.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(dropped.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        let (dropped_tail, stolen_ms, stolen_rs) = {
-            let p = MetadataPair::parse(dropped.a, &*buf_a, dropped.b, &*buf_b)?;
-            (
-                p.reader.tail().map(|t| (t, p.reader.is_hard_tail())),
-                scan_pair_move_state(&p),
-                scan_pair_relocate_state(&p),
-            )
+        // `dropped` is the head of the removed directory, which may span
+        // several pairs linked by HardTails and end in a SoftTail thread
+        // link to the next directory. Un-threading only the head would
+        // re-point the predecessor to the head's HardTail continuation,
+        // grafting the removed directory's leftover pairs onto the
+        // predecessor's chain (review M1, `lfs-tx8`). Walk the whole
+        // HardTail chain: XOR-accumulate every pair's stolen gstate, and
+        // take the LAST pair's tail (the SoftTail to the directory's thread
+        // successor, or None) as the predecessor's new tail, so the entire
+        // directory leaves the global thread in one commit.
+        let mut stolen_ms = [0u8; crate::gstate::MOVE_STATE_BODY_SIZE];
+        let mut stolen_rs = [0u8; crate::gstate::RELOCATE_STATE_BODY_SIZE];
+        let mut current = dropped;
+        let mut walk = BrentTailWalk::new(current);
+        let successor: Option<BlockPair> = loop {
+            self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+            self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            let (tail, is_hard, ms, rs) = {
+                let p = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
+                (
+                    p.reader.tail(),
+                    p.reader.is_hard_tail(),
+                    scan_pair_move_state(&p),
+                    scan_pair_relocate_state(&p),
+                )
+            };
+            for (d, s) in stolen_ms.iter_mut().zip(ms.iter()) {
+                *d ^= *s;
+            }
+            for (d, s) in stolen_rs.iter_mut().zip(rs.iter()) {
+                *d ^= *s;
+            }
+            if is_hard {
+                // A HardTail continuation of this directory: keep walking.
+                match tail {
+                    Some(t) => {
+                        walk.advance(t)?;
+                        current = t;
+                    }
+                    // A HardTail with no target is malformed; end the chain
+                    // here with no thread successor.
+                    None => break None,
+                }
+            } else {
+                // The last pair: its tail is the thread link past the whole
+                // directory (or None at the thread's end).
+                break tail;
+            }
         };
-        let new_tail =
-            dropped_tail.or(Some((BlockPair::new(BlockAddress::NONE, BlockAddress::NONE), false)));
+        // The predecessor's new tail is a thread link (SoftTail), never a
+        // HardTail continuation of the predecessor's own directory.
+        let new_tail = Some((
+            successor.unwrap_or(BlockPair::new(BlockAddress::NONE, BlockAddress::NONE)),
+            false,
+        ));
         let ms = (stolen_ms != [0u8; crate::gstate::MOVE_STATE_BODY_SIZE]).then_some(stolen_ms);
         let rs = (stolen_rs != [0u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]).then_some(stolen_rs);
         self.apply_op_to_pair_inner(
@@ -4542,24 +4585,6 @@ impl<S: Storage> Fs<S> {
         let live_count = self.list_pair_chain(dir_pair, |_| {}, buf_a, buf_b)?;
         if live_count > 0 {
             return Err(Error::NotEmpty);
-        }
-
-        // A multi-pair (HardTail-split) directory cannot be dropped by
-        // un-threading only its head: `unthread_and_steal` re-points the
-        // predecessor's tail past the head pair, which grafts the head's
-        // HardTail continuation onto the predecessor's chain, silently
-        // extending an unrelated directory with the removed directory's
-        // leftover pairs (review M1, `lfs-tx8`). The C reference refuses
-        // this case with NOTEMPTY; match it rather than corrupt the thread.
-        // (Properly dropping the whole chain is a possible future
-        // enhancement; refusing keeps the on-disk thread consistent.)
-        {
-            self.storage.read(dir_pair.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-            self.storage.read(dir_pair.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-            let p = MetadataPair::parse(dir_pair.a, &*buf_a, dir_pair.b, &*buf_b)?;
-            if p.reader.is_hard_tail() {
-                return Err(Error::NotEmpty);
-            }
         }
 
         // Remove the entry from the parent (drops the directory from the
