@@ -5005,9 +5005,19 @@ impl<S: Storage> Fs<S> {
         // observes the duplicate state.
         let gstate = accumulate_gstate(&mut fs.storage, fs.root, block_a_buf, block_b_buf)?;
         if let Some((src_pair, src_id)) = gstate.pending_move() {
+            // The decoded source pair is an on-disk pointer from
+            // possibly-corrupt gstate; validate its bounds before recovery
+            // dereferences or writes through it, exactly as every other
+            // on-disk pair pointer is validated (review M3, `lfs-fr8`).
+            if !pair_in_bounds::<S>(src_pair) {
+                return Err(Error::Corrupt);
+            }
             fs.recover_pending_move(src_pair, src_id, block_a_buf, block_b_buf)?;
         }
         if let Some((old_pair, new_pair)) = gstate.pending_relocation() {
+            if !pair_in_bounds::<S>(old_pair) || !pair_in_bounds::<S>(new_pair) {
+                return Err(Error::Corrupt);
+            }
             fs.recover_pending_relocation(old_pair, new_pair, block_a_buf, block_b_buf)?;
         }
         // Deorphan sweep: drop any pair left in the global thread but not
