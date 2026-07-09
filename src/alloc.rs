@@ -246,7 +246,7 @@ pub fn scan_used_blocks<S: Storage>(
         // Walk each live CTZ chain; enqueue each live DirStruct child.
         for ls in &live[..count] {
             match ls.kind {
-                1 => walk_ctz_chain(storage, ls.w0, ls.w1, used)?,
+                1 => walk_ctz_chain(storage, ls.w0, ls.w1, used, buf_a)?,
                 2 => {
                     let child = BlockPair::new(BlockAddress::new(ls.w0), BlockAddress::new(ls.w1));
                     // Skip pairs already marked (visited) or in-flight.
@@ -280,6 +280,14 @@ pub fn scan_used_blocks<S: Storage>(
 
         // Enqueue child pairs for BFS.
         for child in &child_pairs[..child_count] {
+            // Dedup against the pending queue, not just the visited set
+            // (review M10, `lfs-nvw`): a pair reachable as both a DirStruct
+            // child and a tail successor is collected by two parents before
+            // it is popped and marked used, so a blind enqueue would place
+            // it in the bounded queue twice and spuriously overflow it.
+            if queue[head..tail].contains(child) {
+                continue;
+            }
             if tail >= MAX_QUEUED_PAIRS {
                 return Err(Error::OutOfRange);
             }
@@ -292,13 +300,20 @@ pub fn scan_used_blocks<S: Storage>(
 }
 
 /// Walk a CTZ chain from `head_block` (the chain's last physical
-/// block), marking every block as used. Uses a tiny stack buffer for
-/// the skip pointer reads; does not need a full block buffer.
+/// block), marking every block as used. The skip-pointer header lives in
+/// the first eight bytes at offset 0, but the [`Storage`] contract
+/// requires reads aligned to and sized as a multiple of `READ_SIZE`, so
+/// the header is fetched as a `READ_SIZE`-aligned window through the
+/// caller-provided `scratch` buffer (a full block buffer, free at every
+/// call site once the pair scan that found the chain has finished with
+/// it). The earlier 4/8-byte reads violated the alignment precondition
+/// and would fault on hardware that enforces it (review M7, `lfs-mqz`).
 fn walk_ctz_chain<S: Storage>(
     storage: &mut S,
     head_block: u32,
     size: u32,
     used: &mut Bitmap,
+    scratch: &mut [u8],
 ) -> Result<(), Error> {
     if size == 0 {
         return Ok(());
@@ -318,7 +333,6 @@ fn walk_ctz_chain<S: Storage>(
     }
     let mut index = total - 1;
     let mut head = head_block;
-    let mut sp_buf = [0u8; 8];
 
     loop {
         used.set(head)?;
@@ -326,10 +340,15 @@ fn walk_ctz_chain<S: Storage>(
             break;
         }
         let count = 2 - (index & 1);
-        storage.read(head, 0, &mut sp_buf[..4 * count as usize]).map_err(|_| Error::Io)?;
-        let ptr0 = u32::from_le_bytes([sp_buf[0], sp_buf[1], sp_buf[2], sp_buf[3]]);
+        // The header is `4 * count` bytes at offset 0; round the read up to
+        // a `READ_SIZE` multiple so it honors the alignment precondition.
+        // `scratch` is a block buffer and `READ_SIZE <= BLOCK_SIZE`, so the
+        // rounded length always fits.
+        let need = (4 * count as usize).next_multiple_of(S::READ_SIZE);
+        storage.read(head, 0, &mut scratch[..need]).map_err(|_| Error::Io)?;
+        let ptr0 = u32::from_le_bytes([scratch[0], scratch[1], scratch[2], scratch[3]]);
         if count == 2 {
-            let ptr1 = u32::from_le_bytes([sp_buf[4], sp_buf[5], sp_buf[6], sp_buf[7]]);
+            let ptr1 = u32::from_le_bytes([scratch[4], scratch[5], scratch[6], scratch[7]]);
             used.set(ptr0)?;
             head = ptr1;
             index -= 2;
@@ -508,10 +527,18 @@ pub fn scan_used_with_single_buf<S: Storage>(
         }
 
         for &(head_block, size) in &ctz_chains[..ctz_count] {
-            walk_ctz_chain(storage, head_block, size, used)?;
+            walk_ctz_chain(storage, head_block, size, used, buf)?;
         }
 
         for child in &child_pairs[..child_count] {
+            // Dedup against the pending queue, not just the visited set
+            // (review M10, `lfs-nvw`): a pair reachable as both a DirStruct
+            // child and a tail successor is collected by two parents before
+            // it is popped and marked used, so a blind enqueue would place
+            // it in the bounded queue twice and spuriously overflow it.
+            if queue[head..tail].contains(child) {
+                continue;
+            }
             if tail >= MAX_QUEUED_PAIRS {
                 return Err(Error::OutOfRange);
             }
@@ -648,7 +675,7 @@ pub fn alloc_blocks_cached<S: Storage>(
     // The rescan only sees committed (root-reachable) blocks, so mark any
     // in-flight chain the caller still owns before choosing free blocks.
     if let Some((head, size)) = exclude_chain {
-        walk_ctz_chain(storage, head, size, &mut fresh)?;
+        walk_ctz_chain(storage, head, size, &mut fresh, buf_a)?;
     }
     take_free_blocks(&mut fresh, excluded, out, S::BLOCK_COUNT)?;
     *cache = Some(fresh);
@@ -683,7 +710,7 @@ pub fn alloc_one_block_cached_single_buf<S: Storage>(
     // (review C9: without this, a commit-internal retry rescan handed
     // the relocation the very chain blocks being published).
     if let Some((head, size)) = exclude_chain {
-        walk_ctz_chain(storage, head, size, &mut fresh)?;
+        walk_ctz_chain(storage, head, size, &mut fresh, buf)?;
     }
     take_free_blocks(&mut fresh, excluded, &mut out, S::BLOCK_COUNT)?;
     *cache = Some(fresh);
