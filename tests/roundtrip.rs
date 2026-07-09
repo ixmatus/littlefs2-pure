@@ -38,21 +38,32 @@ fn verifier_path() -> PathBuf {
     PathBuf::from("tools/verify_image/build/verify_image")
 }
 
-/// Returns the verifier binary path if present, else logs a skip
-/// note and returns `None`. Tests `return` early when this returns
-/// `None`.
+/// Returns the verifier binary path if present. When it is missing the
+/// behavior forks on the `LFS_REQUIRE_VERIFIER` environment variable
+/// (review M4/V7, `lfs-4d4`/`lfs-wee`): CI sets it, so a missing verifier
+/// is a hard failure there and the bidirectional bit-accuracy gate can
+/// never be skipped into a green run; a developer machine without a C
+/// toolchain leaves it unset and each test skips with a note. Tests
+/// `return` early when this returns `None`.
 fn require_verifier() -> Option<PathBuf> {
     let p = verifier_path();
     if p.exists() {
-        Some(p)
-    } else {
-        eprintln!(
-            "round-trip test skipped: verifier binary not found at {}. \
-             Build with `make -C tools/verify_image` to enable.",
-            p.display()
-        );
-        None
+        return Some(p);
     }
+    assert!(
+        std::env::var_os("LFS_REQUIRE_VERIFIER").is_none(),
+        "LFS_REQUIRE_VERIFIER is set but the verifier binary is missing at {}. \
+         The round-trip gate must not be silently skipped in this environment; \
+         build it with `make -C tools/verify_image`.",
+        p.display()
+    );
+    eprintln!(
+        "round-trip test skipped: verifier binary not found at {}. \
+         Build with `make -C tools/verify_image` to enable, or set \
+         LFS_REQUIRE_VERIFIER=1 to make its absence a failure.",
+        p.display()
+    );
+    None
 }
 
 /// Write a 2 KiB image (MemStorage's geometry) to a temp file and
