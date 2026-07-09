@@ -102,9 +102,19 @@ impl<S: Storage> NorAlignedStorage<S> {
             return Ok(());
         }
         let block = self.cached_block.expect("dirty cache must have a target");
-        self.inner.program(block, self.cached_off, &self.cache[..S::PROG_SIZE])?;
+        // Clear the dirty state and invalidate the window up front, so a
+        // failed program does not leave a dirty window that every later
+        // flush retries with the same failing program: one worn block would
+        // otherwise poison every subsequent flush (review M8, `lfs-ru2`).
+        // The error propagates to the caller; the kernel treats a program
+        // failure as a worn block and relocates the data elsewhere, so the
+        // discarded window's bytes are rewritten on a fresh block.
         self.dirty = false;
-        Ok(())
+        let r = self.inner.program(block, self.cached_off, &self.cache[..S::PROG_SIZE]);
+        if r.is_err() {
+            self.cached_block = None;
+        }
+        r
     }
 
     fn load_window(&mut self, block: u32, window_off: u32) -> Result<(), S::Error> {

@@ -1614,6 +1614,12 @@ impl<S: Storage> Fs<S> {
     /// body is replaced); an existing CTZ entry shrunk below
     /// `INLINE_MAX` is rewritten inline (the old chain becomes
     /// unreachable and is reclaimed by the next allocator scan).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidPath`] if `name` is empty or longer than
+    /// [`crate::NAME_MAX`] bytes; a longer name would be unreachable or
+    /// wrongly resolved under the C reference.
     pub fn write_to_root(
         &mut self,
         name: &[u8],
@@ -1703,7 +1709,12 @@ impl<S: Storage> Fs<S> {
         if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
             return Err(Error::GeometryMismatch);
         }
-        if name.is_empty() || name.len() > 0x3FF {
+        // Names are capped at NAME_MAX (255), not the tag length field's
+        // 0x3FF ceiling: a longer entry name is unreachable or wrongly
+        // resolved under the C reference (review M2, `lfs-ax2`). Path-
+        // derived names are already within NAME_MAX; this is the guard
+        // for the raw-name write APIs that bypass `Path` validation.
+        if name.is_empty() || name.len() > crate::NAME_MAX {
             return Err(Error::InvalidPath);
         }
         // Pre-check: detect whether the entry exists anywhere in the
@@ -1806,15 +1817,24 @@ impl<S: Storage> Fs<S> {
             }
         };
 
-        // Pass the just-allocated chain as inflight so the wear-level
-        // relocation (if it fires) won't reallocate a chain block.
+        // Pass the just-allocated chain as inflight so a commit-internal
+        // wear relocation, worn-block retry, or split (if it fires) will
+        // not reallocate a chain block. The chain is carried as `(head,
+        // size)` coordinates, not a materialized block list: the list form
+        // capped the honored exclusion at the small `blocks` arrays in the
+        // commit-internal allocation sites (each `2 + MAX_QUEUED_PAIRS`),
+        // so a chain of 33+ blocks overflowed them and failed the write
+        // with `OutOfRange` (review M9). The chain is fully programmed and
+        // synced above, so the allocator's on-demand walk (ADR-0010/0011,
+        // the review C9 mechanism) excludes every chain block regardless of
+        // length, exactly as the streaming-append publish path does.
         self.apply_op_to_pair_inner(
             target,
             &op,
             None,
             None,
             None,
-            Inflight { blocks: &chain[..total_blocks], chain: None },
+            Inflight { blocks: &[], chain: Some((head_block, total_size)) },
             buf_a,
             buf_b,
         )
@@ -4436,18 +4456,61 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
-        self.storage.read(dropped.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(dropped.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
-        let (dropped_tail, stolen_ms, stolen_rs) = {
-            let p = MetadataPair::parse(dropped.a, &*buf_a, dropped.b, &*buf_b)?;
-            (
-                p.reader.tail().map(|t| (t, p.reader.is_hard_tail())),
-                scan_pair_move_state(&p),
-                scan_pair_relocate_state(&p),
-            )
+        // `dropped` is the head of the removed directory, which may span
+        // several pairs linked by HardTails and end in a SoftTail thread
+        // link to the next directory. Un-threading only the head would
+        // re-point the predecessor to the head's HardTail continuation,
+        // grafting the removed directory's leftover pairs onto the
+        // predecessor's chain (review M1, `lfs-tx8`). Walk the whole
+        // HardTail chain: XOR-accumulate every pair's stolen gstate, and
+        // take the LAST pair's tail (the SoftTail to the directory's thread
+        // successor, or None) as the predecessor's new tail, so the entire
+        // directory leaves the global thread in one commit.
+        let mut stolen_ms = [0u8; crate::gstate::MOVE_STATE_BODY_SIZE];
+        let mut stolen_rs = [0u8; crate::gstate::RELOCATE_STATE_BODY_SIZE];
+        let mut current = dropped;
+        let mut walk = BrentTailWalk::new(current);
+        let successor: Option<BlockPair> = loop {
+            self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+            self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            let (tail, is_hard, ms, rs) = {
+                let p = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
+                (
+                    p.reader.tail(),
+                    p.reader.is_hard_tail(),
+                    scan_pair_move_state(&p),
+                    scan_pair_relocate_state(&p),
+                )
+            };
+            for (d, s) in stolen_ms.iter_mut().zip(ms.iter()) {
+                *d ^= *s;
+            }
+            for (d, s) in stolen_rs.iter_mut().zip(rs.iter()) {
+                *d ^= *s;
+            }
+            if is_hard {
+                // A HardTail continuation of this directory: keep walking.
+                match tail {
+                    Some(t) => {
+                        walk.advance(t)?;
+                        current = t;
+                    }
+                    // A HardTail with no target is malformed; end the chain
+                    // here with no thread successor.
+                    None => break None,
+                }
+            } else {
+                // The last pair: its tail is the thread link past the whole
+                // directory (or None at the thread's end).
+                break tail;
+            }
         };
-        let new_tail =
-            dropped_tail.or(Some((BlockPair::new(BlockAddress::NONE, BlockAddress::NONE), false)));
+        // The predecessor's new tail is a thread link (SoftTail), never a
+        // HardTail continuation of the predecessor's own directory.
+        let new_tail = Some((
+            successor.unwrap_or(BlockPair::new(BlockAddress::NONE, BlockAddress::NONE)),
+            false,
+        ));
         let ms = (stolen_ms != [0u8; crate::gstate::MOVE_STATE_BODY_SIZE]).then_some(stolen_ms);
         let rs = (stolen_rs != [0u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]).then_some(stolen_rs);
         self.apply_op_to_pair_inner(
@@ -4780,7 +4843,9 @@ impl<S: Storage> Fs<S> {
         if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
             return Err(Error::GeometryMismatch);
         }
-        if name.is_empty() || name.len() > 0x3FF || content.len() > 0x3FF {
+        // Names are capped at NAME_MAX (255); the inline content keeps
+        // the tag length field's 0x3FF ceiling (review M2, `lfs-ax2`).
+        if name.is_empty() || name.len() > crate::NAME_MAX || content.len() > 0x3FF {
             return Err(Error::InvalidPath);
         }
 
@@ -4983,9 +5048,19 @@ impl<S: Storage> Fs<S> {
         // observes the duplicate state.
         let gstate = accumulate_gstate(&mut fs.storage, fs.root, block_a_buf, block_b_buf)?;
         if let Some((src_pair, src_id)) = gstate.pending_move() {
+            // The decoded source pair is an on-disk pointer from
+            // possibly-corrupt gstate; validate its bounds before recovery
+            // dereferences or writes through it, exactly as every other
+            // on-disk pair pointer is validated (review M3, `lfs-fr8`).
+            if !pair_in_bounds::<S>(src_pair) {
+                return Err(Error::Corrupt);
+            }
             fs.recover_pending_move(src_pair, src_id, block_a_buf, block_b_buf)?;
         }
         if let Some((old_pair, new_pair)) = gstate.pending_relocation() {
+            if !pair_in_bounds::<S>(old_pair) || !pair_in_bounds::<S>(new_pair) {
+                return Err(Error::Corrupt);
+            }
             fs.recover_pending_relocation(old_pair, new_pair, block_a_buf, block_b_buf)?;
         }
         // Deorphan sweep: drop any pair left in the global thread but not

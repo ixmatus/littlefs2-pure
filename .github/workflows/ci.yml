@@ -111,6 +111,10 @@ jobs:
   roundtrip:
     name: round-trip conformance (Rust writes, C reads)
     runs-on: ubuntu-latest
+    # The gate must actually run here: a missing verifier binary is a
+    # hard failure, never a silent skip (review M4/V7).
+    env:
+      LFS_REQUIRE_VERIFIER: 1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
