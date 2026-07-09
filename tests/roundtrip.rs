@@ -19,6 +19,11 @@
 //!   continuation, proving the C reference reads a crate-written chain
 //! - `split_root`: `/f00`..`/f11`, the root pair `{0,1}` split across a
 //!   HardTail continuation, proving the C reference chases the root's tail
+//! - `mutate`:     the read-write direction (review M11). C mounts a
+//!   Rust image, writes files into it, and dumps it back; Rust remounts
+//!   and verifies. Exercises the FCRC / erased-window handshake and C's
+//!   allocator inside a Rust-formatted device, the one direction the
+//!   read-only scenarios above never reach.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -217,4 +222,75 @@ fn roundtrip_removed_entry() {
     let img = dump_image(&storage, "remove");
     invoke_verifier(&verifier, &img, "remove");
     let _ = std::fs::remove_file(&img);
+}
+
+/// Review M11: the read-write direction of the roundtrip gate. Rust
+/// formats an image and writes a baseline file; the C reference mounts
+/// that image and writes two files of its own into it (an inline file
+/// that appends a commit into the erased region Rust left an FCRC over,
+/// and a CTZ file that forces C to allocate data blocks in a Rust-
+/// formatted device); C dumps the mutated image back and Rust remounts
+/// it, confirming its baseline survived and C's writes are present and
+/// correct. This closes the read-only gap: the FCRC / erased-window
+/// handshake was previously unproven in the C-writes-into-Rust direction.
+#[test]
+fn roundtrip_c_writes_into_rust_image() {
+    let Some(verifier) = require_verifier() else { return };
+    let mut storage = MemStorage::new();
+    let mut scratch = common::make_buffer();
+    Fs::format(&mut storage, &mut scratch).unwrap();
+    {
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
+        let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
+        fs.write_to_path(Path::new("/cfg").unwrap(), b"hello, rust", &mut a, &mut b).unwrap();
+        storage = fs.into_storage();
+    }
+    let in_img = dump_image(&storage, "cwrites-in");
+    let out_img = std::env::temp_dir()
+        .join(format!("littlefs2-pure-roundtrip-{}-cwrites-out.bin", std::process::id()));
+
+    let status = Command::new(&verifier)
+        .arg(&in_img)
+        .arg("mutate")
+        .arg(&out_img)
+        .status()
+        .expect("invoke verify_image mutate");
+    assert!(status.success(), "verify_image mutate rejected our image: status = {status:?}");
+
+    // Remount the C-mutated image under Rust and verify everything.
+    let bytes = std::fs::read(&out_img).expect("read mutated image");
+    assert_eq!(
+        bytes.len(),
+        MemStorage::BLOCK_SIZE * MemStorage::BLOCK_COUNT as usize,
+        "mutated image is the wrong size"
+    );
+    let mut remounted = MemStorage::new();
+    remounted.data.copy_from_slice(&bytes);
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
+    let mut fs = Fs::mount(remounted, &mut buf_a, &mut buf_b).expect("remount C-mutated image");
+
+    let read_all = |fs: &mut Fs<MemStorage>, p: &str| -> Vec<u8> {
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
+        let size = fs.size_of(Path::new(p).unwrap(), &mut a, &mut b).unwrap();
+        let mut out = vec![0u8; size as usize];
+        let n = fs.read_at_path(Path::new(p).unwrap(), 0, &mut out, &mut a, &mut b).unwrap();
+        assert_eq!(n, size as usize);
+        out
+    };
+
+    // Rust's baseline survived C's writes.
+    assert_eq!(read_all(&mut fs, "/cfg"), b"hello, rust");
+    // C's inline file.
+    assert_eq!(read_all(&mut fs, "/c_small"), b"hi");
+    // C's CTZ file: 400 bytes of i & 0xff.
+    let expected: Vec<u8> = (0..400).map(|i| (i & 0xff) as u8).collect();
+    assert_eq!(read_all(&mut fs, "/c_big.bin"), expected);
+
+    let _ = std::fs::remove_file(&in_img);
+    let _ = std::fs::remove_file(&out_img);
 }

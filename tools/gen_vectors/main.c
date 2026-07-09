@@ -119,6 +119,15 @@ static void must(int err, const char *what) {
     if (err < 0) { fprintf(stderr, "%s: %d\n", what, err); exit(1); }
 }
 
+// Create `path`, write `n` bytes of `body` (nothing when n == 0), close.
+// Used by the scenarios added for the 2026-06 review coverage classes.
+static void mkfile(lfs_t *lfs, const char *path, const void *body, size_t n) {
+    lfs_file_t f;
+    must(lfs_file_open(lfs, &f, path, LFS_O_WRONLY | LFS_O_CREAT), "open");
+    if (n) must(lfs_file_write(lfs, &f, body, n), "write");
+    must(lfs_file_close(lfs, &f), "close");
+}
+
 // ---- Scenarios ----
 
 // 01_empty_format: format only, no entries.
@@ -254,6 +263,114 @@ static void scenario_deleted_recreated(const char *out_path) {
     dump(out_path);
 }
 
+// 08_user_attrs: three entries each carrying user attributes, with the
+// middle one (/bb) removed so the surviving entries' live ids shift under
+// the delete splice. A reader that reads attributes off the raw committed
+// id rather than splice-correcting to the live id loses /cc's attribute or
+// leaks one across entries (review C1/C2). The Rust side reads every
+// attribute back through get_attr and confirms /bb is absent. Attr ids are
+// the ASCII bytes 't' and 'u'.
+static void scenario_user_attrs(const char *out_path) {
+    reset();
+    lfs_t lfs;
+    must(lfs_format(&lfs, &cfg), "format");
+    must(lfs_mount(&lfs, &cfg), "mount");
+    mkfile(&lfs, "/aa", "keep-me", 7);
+    must(lfs_setattr(&lfs, "/aa", 't', "meta", 4), "setattr aa t");
+    must(lfs_setattr(&lfs, "/aa", 'u', "data99", 6), "setattr aa u");
+    mkfile(&lfs, "/bb", "second", 6);
+    must(lfs_setattr(&lfs, "/bb", 't', "bmeta", 5), "setattr bb t");
+    mkfile(&lfs, "/cc", "third", 5);
+    must(lfs_setattr(&lfs, "/cc", 't', "cmeta", 5), "setattr cc t");
+    must(lfs_remove(&lfs, "/bb"), "remove");
+    must(lfs_unmount(&lfs), "unmount");
+    dump(out_path);
+}
+
+// 09_deep_ctz: a single file large enough to span several CTZ data blocks
+// (900 bytes lands as 4 blocks at this geometry), so reading it back
+// exercises the skip-list back-pointer traversal past the one or two
+// blocks the 03/06 vectors reach. Content is i & 0xff.
+static void scenario_deep_ctz(const char *out_path) {
+    reset();
+    lfs_t lfs;
+    must(lfs_format(&lfs, &cfg), "format");
+    must(lfs_mount(&lfs, &cfg), "mount");
+    uint8_t body[900];
+    for (size_t i = 0; i < sizeof body; i++) body[i] = (uint8_t)(i & 0xff);
+    lfs_file_t f;
+    must(lfs_file_open(&lfs, &f, "/big.bin", LFS_O_WRONLY | LFS_O_CREAT), "open");
+    must(lfs_file_write(&lfs, &f, body, sizeof body), "write");
+    must(lfs_file_close(&lfs, &f), "close");
+    must(lfs_unmount(&lfs), "unmount");
+    dump(out_path);
+}
+
+// 10_delete_tombstone: /aa kept, /bb created then removed with no
+// recreate, leaving a bare delete tombstone beside a live neighbor. This
+// is the C-writes/Rust-reads companion to the roundtrip `remove` scenario
+// (review C3): a reader that mishandles the size-0 delete tag resolves /bb
+// to its neighbor /aa. Distinct from 07, which recreates the deleted name.
+static void scenario_delete_tombstone(const char *out_path) {
+    reset();
+    lfs_t lfs;
+    must(lfs_format(&lfs, &cfg), "format");
+    must(lfs_mount(&lfs, &cfg), "mount");
+    mkfile(&lfs, "/aa", "keep-me", 7);
+    mkfile(&lfs, "/bb", "doomed", 6);
+    must(lfs_remove(&lfs, "/bb"), "remove");
+    must(lfs_unmount(&lfs), "unmount");
+    dump(out_path);
+}
+
+// 11_compacted_rename: three entries, one renamed, then the pair forced
+// through a compaction. C's lfs_dir_compact re-emits the surviving latest
+// tags in log order, so the renamed entry's NAME (rewritten last) lands
+// after higher-id NAMEs: the compacted block carries NAME tags whose ids
+// are not monotonic in log order (here 1, 2, 4, 3). A reader that requires
+// id-dense NAME order rejects this valid C image (review H1). The churned
+// /t entry is only the compaction trigger; it is removed before unmount.
+static void scenario_compacted_rename(const char *out_path) {
+    reset();
+    lfs_t lfs;
+    must(lfs_format(&lfs, &cfg), "format");
+    must(lfs_mount(&lfs, &cfg), "mount");
+    mkfile(&lfs, "/aaa", "AAAA", 4);
+    mkfile(&lfs, "/bbb", "BBBB", 4);
+    mkfile(&lfs, "/ccc", "CCCC", 4);
+    must(lfs_rename(&lfs, "/aaa", "/zzz"), "rename");
+    // Churn a filler entry until the log overflows and a commit triggers
+    // lfs_dir_compact; twelve rounds clear the 256-byte block several times.
+    for (int k = 0; k < 12; k++) {
+        mkfile(&lfs, "/t", "z", 1);
+        must(lfs_remove(&lfs, "/t"), "remove t");
+    }
+    must(lfs_unmount(&lfs), "unmount");
+    dump(out_path);
+}
+
+// 12_multimove_gstate: two cross-directory renames into the same
+// destination /dst with no intervening compaction, so /dst's log holds two
+// MOVESTATE (gstate) tags. C reads a pair's gstate contribution as the
+// single latest matching tag; a reader that XOR-accumulates every MOVESTATE
+// tag in the log decodes a phantom pending move and deletes a live entry at
+// mount (review C4). The Rust side mounts and confirms both moved files
+// resolve under /dst and /src is empty.
+static void scenario_multimove_gstate(const char *out_path) {
+    reset();
+    lfs_t lfs;
+    must(lfs_format(&lfs, &cfg), "format");
+    must(lfs_mount(&lfs, &cfg), "mount");
+    must(lfs_mkdir(&lfs, "/src"), "mkdir src");
+    must(lfs_mkdir(&lfs, "/dst"), "mkdir dst");
+    mkfile(&lfs, "/src/a", "AA", 2);
+    mkfile(&lfs, "/src/b", "BB", 2);
+    must(lfs_rename(&lfs, "/src/a", "/dst/a"), "rename a");
+    must(lfs_rename(&lfs, "/src/b", "/dst/b"), "rename b");
+    must(lfs_unmount(&lfs), "unmount");
+    dump(out_path);
+}
+
 int main(int argc, char **argv) {
     const char *outdir = argc > 1 ? argv[1] : ".";
     char path[512];
@@ -278,6 +395,21 @@ int main(int argc, char **argv) {
 
     snprintf(path, sizeof path, "%s/07_deleted_recreated.bin", outdir);
     scenario_deleted_recreated(path);
+
+    snprintf(path, sizeof path, "%s/08_user_attrs.bin", outdir);
+    scenario_user_attrs(path);
+
+    snprintf(path, sizeof path, "%s/09_deep_ctz.bin", outdir);
+    scenario_deep_ctz(path);
+
+    snprintf(path, sizeof path, "%s/10_delete_tombstone.bin", outdir);
+    scenario_delete_tombstone(path);
+
+    snprintf(path, sizeof path, "%s/11_compacted_rename.bin", outdir);
+    scenario_compacted_rename(path);
+
+    snprintf(path, sizeof path, "%s/12_multimove_gstate.bin", outdir);
+    scenario_multimove_gstate(path);
 
     return 0;
 }

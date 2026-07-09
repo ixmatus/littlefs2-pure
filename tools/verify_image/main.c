@@ -15,6 +15,11 @@
 //   split_root- expect `/f00`..`/f11`, each body == "v" (the ROOT pair
 //               {0,1} split across a HardTail continuation; {0,1} stays the
 //               superblock anchor and the C reference chases its tail)
+//   mutate    - MOUNT a Rust image, WRITE into it (a small inline file and
+//               a CTZ-backed file), then dump the mutated image to a third
+//               argument path for Rust to remount and verify. Proves the
+//               FCRC / erased-window handshake in the C-writes-into-Rust
+//               direction (review M11); usage takes a third path argument.
 //
 // Geometry mirrors `tests/common::MemStorage`:
 //   block_size  = 256
@@ -39,6 +44,12 @@
 
 static uint8_t image[IMAGE_BYTES];
 
+// Read scenarios are pure mount + read and must never mutate the image;
+// the `mutate` scenario sets this so C can write into a Rust-formatted
+// image (review M11). Guarding on it keeps the read scenarios' "no writes
+// happened" assertion while letting the write direction through.
+static int g_writable = 0;
+
 static int ram_read(const struct lfs_config *c, lfs_block_t block,
                     lfs_off_t off, void *buffer, lfs_size_t size) {
     (void)c;
@@ -47,20 +58,41 @@ static int ram_read(const struct lfs_config *c, lfs_block_t block,
     return 0;
 }
 
-// verify_image is read-only; program/erase should never fire during a
-// pure mount + read workload. Return LFS_ERR_IO if they do, which
-// the caller treats as a verification failure.
-static int ram_prog(const struct lfs_config *c, lfs_block_t b,
-                    lfs_off_t off, const void *buf, lfs_size_t sz) {
-    (void)c; (void)b; (void)off; (void)buf; (void)sz;
-    fprintf(stderr, "verify_image: unexpected program call during mount/read\n");
-    return LFS_ERR_IO;
+// In read scenarios, program/erase should never fire during a pure mount +
+// read workload; return LFS_ERR_IO if they do, which the caller treats as
+// a verification failure. In the `mutate` scenario, honor them with NOR
+// semantics (only 1 -> 0 transitions) exactly as gen_vectors does, so C's
+// commit sequencing into the Rust image is exercised honestly.
+static int ram_prog(const struct lfs_config *c, lfs_block_t block,
+                    lfs_off_t off, const void *buffer, lfs_size_t size) {
+    (void)c;
+    if (!g_writable) {
+        fprintf(stderr, "verify_image: unexpected program call during mount/read\n");
+        return LFS_ERR_IO;
+    }
+    if ((size_t)block * BLOCK_SIZE + off + size > IMAGE_BYTES) return LFS_ERR_IO;
+    const uint8_t *src = buffer;
+    uint8_t *dst = &image[block * BLOCK_SIZE + off];
+    for (size_t i = 0; i < size; i++) {
+        if ((dst[i] & src[i]) != src[i]) {
+            fprintf(stderr, "verify_image: 0->1 bit flip at block %u off %u byte %zu\n",
+                    block, off, i);
+            return LFS_ERR_IO;
+        }
+        dst[i] = src[i];
+    }
+    return 0;
 }
 
 static int ram_erase(const struct lfs_config *c, lfs_block_t b) {
-    (void)c; (void)b;
-    fprintf(stderr, "verify_image: unexpected erase call during mount/read\n");
-    return LFS_ERR_IO;
+    (void)c;
+    if (!g_writable) {
+        fprintf(stderr, "verify_image: unexpected erase call during mount/read\n");
+        return LFS_ERR_IO;
+    }
+    if (b >= BLOCK_COUNT) return LFS_ERR_IO;
+    memset(&image[b * BLOCK_SIZE], 0xff, BLOCK_SIZE);
+    return 0;
 }
 
 static int ram_sync(const struct lfs_config *c) {
@@ -140,12 +172,53 @@ static int load_image(const char *path) {
     return 0;
 }
 
+static int dump_image(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); return 1; }
+    size_t n = fwrite(image, 1, IMAGE_BYTES, f);
+    fclose(f);
+    if (n != IMAGE_BYTES) {
+        fprintf(stderr, "verify_image: wrote %zu of %d bytes\n", n, IMAGE_BYTES);
+        return 1;
+    }
+    return 0;
+}
+
+// The `mutate` scenario: C writes two files into a Rust-formatted image.
+// The inline file appends a commit into the root pair's erased region that
+// Rust left an FCRC over; the CTZ file forces C to allocate data blocks in
+// a Rust image and thread them into a new commit. Rust remounts the result
+// and verifies both, closing the read-only gap in the roundtrip gate
+// (review M11). Returns 0 on success.
+static int mutate_image(lfs_t *lfs) {
+    lfs_file_t f;
+    int err = lfs_file_open(lfs, &f, "/c_small", LFS_O_WRONLY | LFS_O_CREAT);
+    if (err < 0) { fprintf(stderr, "verify_image: mutate open c_small: %d\n", err); return 1; }
+    if (lfs_file_write(lfs, &f, "hi", 2) < 0) { fprintf(stderr, "verify_image: mutate write c_small\n"); return 1; }
+    if (lfs_file_close(lfs, &f) < 0) { fprintf(stderr, "verify_image: mutate close c_small\n"); return 1; }
+
+    err = lfs_file_open(lfs, &f, "/c_big.bin", LFS_O_WRONLY | LFS_O_CREAT);
+    if (err < 0) { fprintf(stderr, "verify_image: mutate open c_big: %d\n", err); return 1; }
+    uint8_t body[400];
+    for (size_t i = 0; i < sizeof body; i++) body[i] = (uint8_t)(i & 0xff);
+    if (lfs_file_write(lfs, &f, body, sizeof body) < 0) { fprintf(stderr, "verify_image: mutate write c_big\n"); return 1; }
+    if (lfs_file_close(lfs, &f) < 0) { fprintf(stderr, "verify_image: mutate close c_big\n"); return 1; }
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s <image_path> <scenario>\n", argv[0]);
+    if (argc != 3 && argc != 4) {
+        fprintf(stderr, "usage: %s <image_path> <scenario> [<out_path>]\n", argv[0]);
+        return 2;
+    }
+    const char *scenario = argv[2];
+    int is_mutate = strcmp(scenario, "mutate") == 0;
+    if (is_mutate && argc != 4) {
+        fprintf(stderr, "usage: %s <image_path> mutate <out_path>\n", argv[0]);
         return 2;
     }
     if (load_image(argv[1]) != 0) return 2;
+    if (is_mutate) g_writable = 1;
 
     lfs_t lfs;
     int err = lfs_mount(&lfs, &cfg);
@@ -155,7 +228,9 @@ int main(int argc, char **argv) {
     }
 
     int rc = 0;
-    if (strcmp(argv[2], "inline") == 0) {
+    if (is_mutate) {
+        rc = mutate_image(&lfs);
+    } else if (strcmp(argv[2], "inline") == 0) {
         rc = verify_file(&lfs, "/cfg", (const uint8_t *)"hello, rust", 11);
     } else if (strcmp(argv[2], "ctz") == 0) {
         uint8_t expected[500];
@@ -211,5 +286,12 @@ int main(int argc, char **argv) {
     }
 
     lfs_unmount(&lfs);
+
+    // In mutate mode, persist the image C just wrote so Rust can remount
+    // it. Unmount above flushed all metadata (files were closed inside
+    // mutate_image), so `image` now holds the complete mutated device.
+    if (is_mutate && rc == 0) {
+        rc = dump_image(argv[3]);
+    }
     return rc;
 }

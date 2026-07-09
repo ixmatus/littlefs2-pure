@@ -35,7 +35,7 @@ only `cc` and `make`.
 make vectors
 ```
 
-Writes the four baseline images to `../../tests/vectors/`:
+Writes the committed images to `../../tests/vectors/`:
 
 | File | Scenario |
 |---|---|
@@ -43,10 +43,24 @@ Writes the four baseline images to `../../tests/vectors/`:
 | `02_single_inline.bin` | one inline file `/cfg` ("hello, littlefs") |
 | `03_single_ctz.bin` | one CTZ file `/payload.bin` (500 bytes, `i & 0xff`) |
 | `04_nested_dir.bin` | `/audit/` containing `/audit/log` ("entry-0001;") |
+| `05_hardtail_dir.bin` | `/d` filled `a`..`z`, dense enough to span a HardTail |
+| `06_inline_ctz_boundary.bin` | `/b128` and `/b129`, straddling the inline/CTZ region |
+| `07_deleted_recreated.bin` | `/x` created, removed, recreated with a new body |
+| `08_user_attrs.bin` | `/aa`,`/bb`,`/cc` with attrs, `/bb` removed (splice; review C1/C2) |
+| `09_deep_ctz.bin` | `/big.bin`, 900 bytes, a four-block CTZ chain |
+| `10_delete_tombstone.bin` | `/aa` kept beside a bare `/bb` tombstone (review C3) |
+| `11_compacted_rename.bin` | rename then compaction: non-id-dense NAME order (review H1) |
+| `12_multimove_gstate.bin` | two renames into `/dst`: two `MOVESTATE` tags in one log (review C4) |
+
+Vectors 08-12 are the C-written image classes that hid the top
+findings of the 2026-06 deep review; each pins the read direction of a
+fix (see the per-vector comments in `main.c` and `tests/conformance.rs`).
 
 CI does not invoke this Makefile; the binaries are committed at rest.
 Regenerate locally when the upstream pinning changes or you add a
-scenario.
+scenario. `tests/conformance.rs` pins each vector's CRC32, so a
+regeneration that changes any byte fails the suite until the pin is
+updated in the same commit.
 
 ## Geometry
 
@@ -72,7 +86,8 @@ Matches `tests/common::MemStorage` so the images load directly into
 
 ## Round-trip (Rust -> C)
 
-Not yet wired. The current direction is C-writes, Rust-reads, which
-proves the reader is correct against the spec oracle. The reverse
-direction (Rust writes, C reads) requires a small C verifier
-companion; tracked as a follow-up.
+Wired via the sibling `tools/verify_image/`, which mounts a
+Rust-written image under the C reference. It runs both read-only
+scenarios (C reads what Rust wrote) and a `mutate` scenario (C writes
+into a Rust-formatted image and Rust remounts the result, review M11).
+See `tools/verify_image/README.md` and `tests/roundtrip.rs`.

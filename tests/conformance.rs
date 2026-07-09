@@ -17,6 +17,20 @@
 //!   inline/CTZ size region (both CTZ at this geometry).
 //! - `07_deleted_recreated`: `/x` created, removed, then recreated
 //!   with a different body; a delete tombstone precedes the live entry.
+//! - `08_user_attrs`: `/aa`, `/bb`, `/cc` each with user attributes,
+//!   `/bb` then removed so the survivors' live ids shift; pins
+//!   splice-aware attribute reads (review C1/C2).
+//! - `09_deep_ctz`: `/big.bin`, 900 bytes, a CTZ skip list spanning
+//!   four data blocks; exercises back-pointer traversal past 03/06.
+//! - `10_delete_tombstone`: `/aa` kept beside a bare `/bb` tombstone
+//!   (no recreate); the C-writes/Rust-reads companion to the roundtrip
+//!   `remove` scenario (review C3).
+//! - `11_compacted_rename`: three entries, one renamed, then compacted;
+//!   the compacted block carries NAME ids non-monotonic in log order,
+//!   which a reader requiring id-dense NAME order rejects (review H1).
+//! - `12_multimove_gstate`: two cross-directory renames into `/dst`
+//!   leave two `MOVESTATE` tags in one log; an XOR-accumulating reader
+//!   decodes a phantom pending move at mount (review C4).
 //!
 //! The runner loads each vector into a `MemStorage`, mounts with our
 //! reader, and asserts the expected (name, kind, content) tuples.
@@ -63,6 +77,11 @@ const VECTOR_CRCS: &[(&str, u32)] = &[
     ("05_hardtail_dir.bin", 0xed09_9bc9),
     ("06_inline_ctz_boundary.bin", 0xc999_5194),
     ("07_deleted_recreated.bin", 0x3f96_a60e),
+    ("08_user_attrs.bin", 0xe13d_7a8f),
+    ("09_deep_ctz.bin", 0xe5a6_a7e5),
+    ("10_delete_tombstone.bin", 0xeb99_730e),
+    ("11_compacted_rename.bin", 0x9e98_a6ee),
+    ("12_multimove_gstate.bin", 0xf1b1_6107),
 ];
 
 /// Load a vector file's bytes into a fresh `MemStorage`. Panics on
@@ -116,6 +135,22 @@ fn read_ctz_all(fs: &mut Fs<MemStorage>, p: &str) -> Vec<u8> {
     let n = fs.read_at_path(Path::new(p).unwrap(), 0, &mut out, &mut buf_a, &mut buf_b).unwrap();
     assert_eq!(n, size as usize);
     out
+}
+
+fn get_attr_vec(fs: &mut Fs<MemStorage>, p: &str, attr_id: u8) -> Vec<u8> {
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
+    let mut out = [0u8; 64];
+    let n = fs.get_attr(Path::new(p).unwrap(), attr_id, &mut out, &mut a, &mut b).unwrap();
+    out[..n].to_vec()
+}
+
+fn root_names(fs: &mut Fs<MemStorage>) -> Vec<Vec<u8>> {
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    fs.list_root(|e| names.push(e.name.to_vec()), &mut a, &mut b).unwrap();
+    names
 }
 
 #[test]
@@ -256,6 +291,123 @@ fn vector_07_deleted_recreated_resolves_to_fresh_body() {
     let mut names: Vec<Vec<u8>> = Vec::new();
     fs.list_root(|e| names.push(e.name.to_vec()), &mut a, &mut b).unwrap();
     assert_eq!(names, vec![b"x".to_vec()], "only the recreated /x is live");
+}
+
+#[test]
+fn vector_08_user_attrs_reads_splice_aware() {
+    // /aa, /bb, /cc were each written with user attributes, then /bb
+    // (the middle id) removed. The delete splices the survivors down one
+    // live id, so /cc's attribute lives at a raw committed id one above
+    // its current live id. A reader that compares the raw id without
+    // splice-correcting loses /cc's attribute or reads /bb's across the
+    // gap (review C1/C2). Attr ids are the ASCII bytes 't' and 'u'.
+    let mut fs = mount(load("08_user_attrs.bin"));
+
+    assert_eq!(get_attr_vec(&mut fs, "/aa", b't'), b"meta");
+    assert_eq!(get_attr_vec(&mut fs, "/aa", b'u'), b"data99");
+    assert_eq!(get_attr_vec(&mut fs, "/cc", b't'), b"cmeta");
+    // An attribute id never set reads as absent (zero bytes).
+    assert_eq!(get_attr_vec(&mut fs, "/aa", b'z'), b"");
+
+    // /bb is gone; only /aa and /cc survive, in live-id order.
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
+    assert!(!fs.exists(Path::new("/bb").unwrap(), &mut a, &mut b).unwrap());
+    assert_eq!(root_names(&mut fs), vec![b"aa".to_vec(), b"cc".to_vec()]);
+}
+
+#[test]
+fn vector_09_deep_ctz_traverses_full_chain() {
+    // 900 bytes lands as a four-block CTZ skip list at this geometry, so
+    // reading it back walks the multi-level back pointers the smaller CTZ
+    // vectors (03, 06) never reach.
+    let mut fs = mount(load("09_deep_ctz.bin"));
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
+
+    let r = fs.resolve(Path::new("/big.bin").unwrap(), &mut a, &mut b).unwrap();
+    assert_eq!(r.struct_type, TagType::CtzStruct);
+    let ctz = CtzStruct::from_bytes(r.struct_body).unwrap();
+    assert_eq!(ctz.size, 900);
+    let blocks = littlefs2_pure::ctz::block_count(ctz.size, MemStorage::BLOCK_SIZE as u32);
+    assert!(blocks >= 3, "deep CTZ vector must span 3+ blocks, got {blocks}");
+
+    let bytes = read_ctz_all(&mut fs, "/big.bin");
+    let expected: Vec<u8> = (0..900).map(|i| (i & 0xff) as u8).collect();
+    assert_eq!(bytes, expected);
+}
+
+#[test]
+fn vector_10_delete_tombstone_absent_neighbor_intact() {
+    // /aa is kept; /bb was created then removed with no recreate, leaving
+    // a bare delete tombstone beside a live neighbor. The C-writes /
+    // Rust-reads companion to the roundtrip `remove` scenario (review C3):
+    // a reader mishandling the size-0 delete resolves /bb to /aa. Distinct
+    // from 07, which recreates the deleted name.
+    let mut fs = mount(load("10_delete_tombstone.bin"));
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
+
+    let mut scratch = [0u8; 32];
+    assert_eq!(read_inline(&mut fs, "/aa", &mut scratch), b"keep-me");
+    assert!(!fs.exists(Path::new("/bb").unwrap(), &mut a, &mut b).unwrap());
+    assert_eq!(root_names(&mut fs), vec![b"aa".to_vec()], "only /aa is live");
+}
+
+#[test]
+fn vector_11_compacted_rename_accepts_non_id_dense_order() {
+    // /aaa, /bbb, /ccc were created, /aaa renamed to /zzz, then the pair
+    // forced through a C compaction. lfs_dir_compact re-emits survivors in
+    // log order, so the renamed entry's NAME lands after higher-id NAMEs:
+    // the compacted block carries NAME ids non-monotonic in log order
+    // (1, 2, 4, 3). Before the H1 fix the reader required id-dense NAME
+    // order and rejected this valid C image with Error::Corrupt; the mount
+    // succeeding is the regression guard. The churned /t entry was the
+    // compaction trigger and is gone.
+    let mut fs = mount(load("11_compacted_rename.bin"));
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
+
+    assert_eq!(root_names(&mut fs), vec![b"bbb".to_vec(), b"ccc".to_vec(), b"zzz".to_vec()]);
+    for (name, body) in [("/zzz", b"AAAA"), ("/bbb", b"BBBB"), ("/ccc", b"CCCC")] {
+        let r = fs.resolve(Path::new(name).unwrap(), &mut a, &mut b).unwrap();
+        assert_eq!(r.struct_body, body, "{name} body");
+    }
+    assert!(!fs.exists(Path::new("/aaa").unwrap(), &mut a, &mut b).unwrap());
+    assert!(!fs.exists(Path::new("/t").unwrap(), &mut a, &mut b).unwrap());
+}
+
+#[test]
+fn vector_12_multimove_gstate_reads_latest_tag_wins() {
+    // Two cross-directory renames into /dst with no intervening compaction
+    // leave two MOVESTATE tags in /dst's log. C reads a pair's gstate
+    // contribution as the single latest matching tag; an XOR-accumulating
+    // reader decodes a phantom pending move and deletes a live entry at
+    // mount (review C4). Mounting cleanly with both files intact is the
+    // guard, and a second mount over the recovered image proves the
+    // recovery is idempotent (no futile balancing commit corrupts state).
+    let check = |fs: &mut Fs<MemStorage>| {
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
+        assert_eq!(root_names(fs), vec![b"dst".to_vec(), b"src".to_vec()]);
+        let mut scratch = [0u8; 8];
+        assert_eq!(read_inline(fs, "/dst/a", &mut scratch), b"AA");
+        assert_eq!(read_inline(fs, "/dst/b", &mut scratch), b"BB");
+        let mut count = 0usize;
+        fs.list_dir(Path::new("/src").unwrap(), |_| count += 1, &mut a, &mut b).unwrap();
+        assert_eq!(count, 0, "/src is empty after the moves");
+        assert!(!fs.exists(Path::new("/src/a").unwrap(), &mut a, &mut b).unwrap());
+    };
+
+    let mut fs = mount(load("12_multimove_gstate.bin"));
+    check(&mut fs);
+    // Remount the recovered image: mount-time gstate recovery must be a
+    // no-op here, not a deletion of a live entry.
+    let storage = fs.into_storage();
+    let mut buf_a = common::make_buffer();
+    let mut buf_b = common::make_buffer();
+    let mut fs2 = Fs::mount(storage, &mut buf_a, &mut buf_b).expect("remount recovered image");
+    check(&mut fs2);
 }
 
 #[test]
