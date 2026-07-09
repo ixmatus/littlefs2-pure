@@ -1614,6 +1614,12 @@ impl<S: Storage> Fs<S> {
     /// body is replaced); an existing CTZ entry shrunk below
     /// `INLINE_MAX` is rewritten inline (the old chain becomes
     /// unreachable and is reclaimed by the next allocator scan).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidPath`] if `name` is empty or longer than
+    /// [`crate::NAME_MAX`] bytes; a longer name would be unreachable or
+    /// wrongly resolved under the C reference.
     pub fn write_to_root(
         &mut self,
         name: &[u8],
@@ -1703,7 +1709,12 @@ impl<S: Storage> Fs<S> {
         if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
             return Err(Error::GeometryMismatch);
         }
-        if name.is_empty() || name.len() > 0x3FF {
+        // Names are capped at NAME_MAX (255), not the tag length field's
+        // 0x3FF ceiling: a longer entry name is unreachable or wrongly
+        // resolved under the C reference (review M2, `lfs-ax2`). Path-
+        // derived names are already within NAME_MAX; this is the guard
+        // for the raw-name write APIs that bypass `Path` validation.
+        if name.is_empty() || name.len() > crate::NAME_MAX {
             return Err(Error::InvalidPath);
         }
         // Pre-check: detect whether the entry exists anywhere in the
@@ -4780,7 +4791,9 @@ impl<S: Storage> Fs<S> {
         if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
             return Err(Error::GeometryMismatch);
         }
-        if name.is_empty() || name.len() > 0x3FF || content.len() > 0x3FF {
+        // Names are capped at NAME_MAX (255); the inline content keeps
+        // the tag length field's 0x3FF ceiling (review M2, `lfs-ax2`).
+        if name.is_empty() || name.len() > crate::NAME_MAX || content.len() > 0x3FF {
             return Err(Error::InvalidPath);
         }
 
