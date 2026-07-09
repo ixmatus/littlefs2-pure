@@ -1817,15 +1817,24 @@ impl<S: Storage> Fs<S> {
             }
         };
 
-        // Pass the just-allocated chain as inflight so the wear-level
-        // relocation (if it fires) won't reallocate a chain block.
+        // Pass the just-allocated chain as inflight so a commit-internal
+        // wear relocation, worn-block retry, or split (if it fires) will
+        // not reallocate a chain block. The chain is carried as `(head,
+        // size)` coordinates, not a materialized block list: the list form
+        // capped the honored exclusion at the small `blocks` arrays in the
+        // commit-internal allocation sites (each `2 + MAX_QUEUED_PAIRS`),
+        // so a chain of 33+ blocks overflowed them and failed the write
+        // with `OutOfRange` (review M9). The chain is fully programmed and
+        // synced above, so the allocator's on-demand walk (ADR-0010/0011,
+        // the review C9 mechanism) excludes every chain block regardless of
+        // length, exactly as the streaming-append publish path does.
         self.apply_op_to_pair_inner(
             target,
             &op,
             None,
             None,
             None,
-            Inflight { blocks: &chain[..total_blocks], chain: None },
+            Inflight { blocks: &[], chain: Some((head_block, total_size)) },
             buf_a,
             buf_b,
         )
