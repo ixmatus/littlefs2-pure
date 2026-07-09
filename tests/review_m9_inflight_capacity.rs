@@ -6,13 +6,13 @@
 //! splits, `apply_op_to_pair_inner` copied the write's whole in-flight
 //! chain into a fixed exclusion array so the internal allocation could
 //! not reuse a chain block. Those arrays are bounded (the largest, the
-//! split-continuation array, is `2 + MAX_QUEUED_PAIRS + MAX_BAD_BLOCK_RETRIES
-//! + 1 = 43`), so a chain longer than that overflowed the bound check and
-//! returned `OutOfRange`. The fix carries the chain as `(head, size)`
-//! coordinates walked on demand (the review C9 mechanism) instead of a
-//! materialized block list, so no exclusion array ever receives the chain
-//! and the publish succeeds for any chain length, uniform with the
-//! streaming-append path.
+//! split-continuation array, holds `2 + MAX_QUEUED_PAIRS +
+//! MAX_BAD_BLOCK_RETRIES + 1 = 43` entries), so a chain longer than that
+//! overflowed the bound check and returned `OutOfRange`. The fix carries
+//! the chain as `(head, size)` coordinates walked on demand (the review C9
+//! mechanism) instead of a materialized block list, so no exclusion array
+//! ever receives the chain and the publish succeeds for any chain length,
+//! uniform with the streaming-append path.
 //!
 //! Verification note: the overflow's user impact is narrower than the
 //! finding suggested. `split_directory_pair`'s `OutOfRange` is caught by
