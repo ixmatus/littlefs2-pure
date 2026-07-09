@@ -56,9 +56,9 @@ Open issues against the v1.x line (regressions, ergonomic gaps that surface in r
 ## Conformance
 
 - [x] `tools/gen_vectors/`: vendored C reference + Makefile + `main.c` producing baseline images.
-- [x] `tests/vectors/`: four committed golden images (empty format, single inline, single CTZ, nested dir).
+- [x] `tests/vectors/`: twelve committed golden images. The baseline seven (empty format, single inline, single CTZ, nested dir, HardTail dir, inline/CTZ boundary, delete-recreate) plus the 2026-06 review classes `08`-`12` (user attrs across a splice, a four-block CTZ chain, a bare delete tombstone, a C-compacted non-id-dense directory, a two-move gstate log). Each vector's CRC32 is pinned in `tests/conformance.rs`.
 - [x] `tests/conformance.rs`: per-vector test, mount + assert expected `(name, kind, content)` tuples.
-- [x] `tests/roundtrip.rs` + `tools/verify_image/`: a C verifier that mounts images Rust wrote and validates expected content. Combined with `tests/conformance.rs`, the bit-accuracy claim is bidirectional.
+- [x] `tests/roundtrip.rs` + `tools/verify_image/`: a C verifier that mounts images Rust wrote and validates expected content, in both directions. The read-only scenarios have C read what Rust wrote; the `mutate` scenario has C write into a Rust-formatted image (an inline and a CTZ file) which Rust then remounts and verifies, exercising the FCRC / erased-window handshake in the C-writes direction. Combined with `tests/conformance.rs`, the bit-accuracy claim is bidirectional.
 
 ## Infrastructure
 
