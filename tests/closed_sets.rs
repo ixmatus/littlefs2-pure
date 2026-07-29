@@ -457,10 +457,13 @@ fn bucket_of(t: TagType) -> &'static str {
 /// Per bucket, never a total: a floor on the sum would let one variant widen
 /// while another narrows without anything failing. `UserAttr` claims all 256
 /// chunks of `0x3xx` because the chunk byte is the caller's attribute id;
-/// `CommitCrc` claims four because the low two bits of `0x5xx` are the erase
-/// state hint. `RelocateState` is this crate's own extension at the unused
-/// `0x7fe` slot (ADR-0005) and has no oracle counterpart, which is why the
-/// oracle table above does not name it.
+/// `CommitCrc` claims 128 because the C reader's acceptance rule
+/// (`lfs_tag_type2`, which masks the type field with `0x780`) terminates a
+/// commit on every `0x5xx` chunk with bit 7 clear, `0x00..=0x7f` (review L2,
+/// `lfs-bdv`; the C writer emits only chunks 0 and 1, and the gap is
+/// deliberate forward compatibility room). `RelocateState` is this crate's
+/// own extension at the unused `0x7fe` slot (ADR-0005) and has no oracle
+/// counterpart, which is why the oracle table above does not name it.
 const EXPECTED_CENSUS: [(&str, usize); 19] = [
     ("RegularFile", 1),
     ("Directory", 1),
@@ -473,13 +476,13 @@ const EXPECTED_CENSUS: [(&str, usize); 19] = [
     ("UserAttr", 256),
     ("Create", 1),
     ("Delete", 1),
-    ("CommitCrc", 4),
+    ("CommitCrc", 128),
     ("ForwardCrc", 1),
     ("SoftTail", 1),
     ("HardTail", 1),
     ("MoveState", 1),
     ("RelocateState", 1),
-    ("Unknown", 1773),
+    ("Unknown", 1649),
     ("UNCLASSIFIED", 0),
 ];
 

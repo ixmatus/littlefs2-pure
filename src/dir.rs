@@ -457,8 +457,9 @@ const _: () = assert!(
 ///
 /// A splice stream this walker cannot replay is reported as `None`, the
 /// same answer a well formed pair with no such name gives. The signature
-/// is frozen for the 1.x line, so the distinction lives in
-/// [`lookup_checked`], which every path inside this crate uses. Callers
+/// is frozen for the 1.x line, so the distinction lives in the crate
+/// internal `lookup_checked`, which every path inside this crate uses.
+/// Callers
 /// outside the crate that must tell a missing entry from a damaged pair
 /// should route through [`crate::Fs::resolve`], which surfaces
 /// [`crate::error::Error::Corrupt`].
