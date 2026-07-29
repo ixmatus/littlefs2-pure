@@ -14,12 +14,11 @@
 //! writing a second CTZ file drives `walk_ctz_chain` over the first
 //! file's chain. Before the fix the skip-pointer read panics here.
 //!
-//! Scope: this pins the allocator walk only (the finding's location). The
-//! CTZ *read* path (`ctz::collect_chain_blocks`) issues the same
-//! sub-`READ_SIZE` skip-pointer reads and is tracked as a separate
-//! discovered follow-up, so this test deliberately does not read file
-//! content back (it checks existence via aligned full-block metadata
-//! reads).
+//! Scope: this pins the allocator walk only (the finding's location),
+//! so it checks existence via aligned full-block metadata reads rather
+//! than reading file content back. The CTZ read path carried the same
+//! defect on its own reads; that is `lfs-8e6`, fixed and pinned
+//! separately by `tests/review_ctz_read_alignment.rs`.
 
 use littlefs2_pure::storage::Storage;
 use littlefs2_pure::{Fs, Path};

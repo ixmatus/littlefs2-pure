@@ -453,18 +453,52 @@ const _: () = assert!(
 /// static assertion above fails the build if `LookupSlot` gains a
 /// field; `docs/decisions/0006-stack-budget.md` records the accounting
 /// and why a caller-supplied buffer was not adopted in 1.x.
+/// # Corruption is not absence
+///
+/// A splice stream this walker cannot replay is reported as `None`, the
+/// same answer a well formed pair with no such name gives. The signature
+/// is frozen for the 1.x line, so the distinction lives in the crate
+/// internal `lookup_checked`, which every path inside this crate uses.
+/// Callers
+/// outside the crate that must tell a missing entry from a damaged pair
+/// should route through [`crate::Fs::resolve`], which surfaces
+/// [`crate::error::Error::Corrupt`].
 #[must_use]
 pub fn lookup<'a>(pair: &MetadataPair<'a>, name: &[u8]) -> Option<Resolved<'a>> {
+    lookup_checked(pair, name).ok().flatten()
+}
+
+/// Look up a directory entry by name within a single metadata pair,
+/// surfacing splice corruption instead of hiding it (review L4).
+///
+/// Identical to [`lookup`] on every well formed pair: `Ok(Some(..))`
+/// where `lookup` returns `Some(..)`, `Ok(None)` where it returns `None`
+/// for a genuinely absent name. The difference is the third outcome. A
+/// splice tag the shared [`splice_step`] core rejects (a `Delete` of an
+/// id the pair never created, a `Create` beyond the running count, a
+/// roster past [`MAX_LIVE_ENTRIES`]) becomes
+/// [`crate::error::Error::Corrupt`] or [`crate::error::Error::OutOfRange`]
+/// here, matching what the sibling walkers [`live_entries`] and
+/// `fs::gather_live_slots` already do with the same stream.
+///
+/// Collapsing that case into "not found" is worse than a lost
+/// diagnostic: a caller told a name is absent goes on to create it, and
+/// the create lands in a pair whose entry roster is already unreadable,
+/// compounding the damage. The write paths and the resolve paths in
+/// [`crate::fs`] therefore call this variant.
+pub(crate) fn lookup_checked<'a>(
+    pair: &MetadataPair<'a>,
+    name: &[u8],
+) -> Result<Option<Resolved<'a>>, crate::error::Error> {
     let mut slots: [LookupSlot<'a>; MAX_LIVE_ENTRIES] = [LookupSlot::EMPTY; MAX_LIVE_ENTRIES];
     let mut count: usize = 0;
 
     for entry in pair.reader.iter_tags() {
         let tag = entry.tag;
         let id = tag.id() as usize;
-        match splice_step(&mut slots, &mut count, LookupSlot::EMPTY, tag) {
-            Err(_) => return None,
-            Ok(SpliceStep::Consumed) => {}
-            Ok(SpliceStep::Name(id)) => {
+        match splice_step(&mut slots, &mut count, LookupSlot::EMPTY, tag)? {
+            SpliceStep::Consumed => {}
+            SpliceStep::Name(id) => {
                 slots[id].name = Some(entry.body);
                 slots[id].kind = match tag.tag_type() {
                     TagType::RegularFile => Some(EntryKind::RegularFile),
@@ -473,7 +507,7 @@ pub fn lookup<'a>(pair: &MetadataPair<'a>, name: &[u8]) -> Option<Resolved<'a>> 
                     _ => unreachable!(),
                 };
             }
-            Ok(SpliceStep::Other) => match tag.tag_type() {
+            SpliceStep::Other => match tag.tag_type() {
                 // STRUCT tags may precede the NAME that establishes
                 // their id's count in a C-compacted log (review H1);
                 // park them and let a later NAME claim the slot.
@@ -496,12 +530,85 @@ pub fn lookup<'a>(pair: &MetadataPair<'a>, name: &[u8]) -> Option<Resolved<'a>> 
             continue;
         };
         if slot_name == name {
-            return Some(Resolved {
+            return Ok(Some(Resolved {
                 entry: DirEntry { id: i as u16, name: slot_name, kind },
                 struct_type,
                 struct_body,
-            });
+            }));
         }
     }
-    None
+    Ok(None)
+}
+
+#[cfg(test)]
+mod corrupt_splice_tests {
+    //! Review L4 (bead `lfs-ceq`): the checked lookup must report a
+    //! splice stream the shared core rejects, and the frozen public
+    //! wrapper must keep answering `None` for it.
+
+    use super::{live_entries, lookup, lookup_checked};
+    use crate::block::BlockAddress;
+    use crate::error::Error;
+    use crate::meta::{Commit, MetadataPair};
+    use crate::tag::{Tag, TagType};
+
+    /// A block holding one live entry `a` followed by a `Delete` of an id
+    /// the pair never created. `splice_step` rejects that `Delete`, which
+    /// is the condition every walker sees.
+    fn corrupt_block() -> [u8; 256] {
+        let mut buf = [0xFFu8; 256];
+        let mut commit = Commit::new(&mut buf, 1).unwrap();
+        commit.tag(Tag::new(true, TagType::Create, 0, 0), &[]).unwrap();
+        commit.tag(Tag::new(true, TagType::RegularFile, 0, 1), b"a").unwrap();
+        commit.tag(Tag::new(true, TagType::InlineStruct, 0, 1), b"x").unwrap();
+        commit.tag(Tag::new(true, TagType::Delete, 9, 0), &[]).unwrap();
+        commit.finish(0).unwrap();
+        buf
+    }
+
+    /// The same shape without the phantom `Delete`, as the control.
+    fn healthy_block() -> [u8; 256] {
+        let mut buf = [0xFFu8; 256];
+        let mut commit = Commit::new(&mut buf, 1).unwrap();
+        commit.tag(Tag::new(true, TagType::Create, 0, 0), &[]).unwrap();
+        commit.tag(Tag::new(true, TagType::RegularFile, 0, 1), b"a").unwrap();
+        commit.tag(Tag::new(true, TagType::InlineStruct, 0, 1), b"x").unwrap();
+        commit.finish(0).unwrap();
+        buf
+    }
+
+    #[test]
+    fn checked_lookup_reports_what_the_sibling_walkers_report() {
+        let block = corrupt_block();
+        let empty = [0xFFu8; 256];
+        let pair = MetadataPair::parse(BlockAddress::new(0), &block, BlockAddress::new(1), &empty)
+            .unwrap();
+
+        // The sibling walker's verdict on the same stream.
+        let sibling = live_entries(&pair, |_| Ok::<(), Error>(()));
+        assert_eq!(sibling, Err(Error::Corrupt));
+
+        // The checked lookup now agrees with it.
+        assert_eq!(lookup_checked(&pair, b"a"), Err(Error::Corrupt));
+
+        // The frozen public wrapper still flattens it to `None`, which is
+        // exactly why the checked variant exists.
+        assert!(lookup(&pair, b"a").is_none());
+    }
+
+    #[test]
+    fn checked_lookup_matches_the_wrapper_on_a_healthy_pair() {
+        let block = healthy_block();
+        let empty = [0xFFu8; 256];
+        let pair = MetadataPair::parse(BlockAddress::new(0), &block, BlockAddress::new(1), &empty)
+            .unwrap();
+
+        let checked = lookup_checked(&pair, b"a").unwrap().expect("the entry resolves");
+        let wrapped = lookup(&pair, b"a").expect("the entry resolves");
+        assert_eq!(checked, wrapped);
+        assert_eq!(checked.struct_body, b"x");
+
+        assert_eq!(lookup_checked(&pair, b"absent"), Ok(None));
+        assert!(lookup(&pair, b"absent").is_none());
+    }
 }

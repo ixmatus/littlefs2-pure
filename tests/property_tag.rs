@@ -55,7 +55,11 @@ fn arb_tag_type() -> impl Strategy<Value = TagType> {
         any::<u8>().prop_map(TagType::UserAttr),
         Just(TagType::Create),
         Just(TagType::Delete),
-        (0u8..=3).prop_map(TagType::CommitCrc),
+        // The commit CRC chunk domain is the C reader's acceptance range,
+        // `0x00..=0x7f`, not the two values the C writer emits (review
+        // L2). Chunks with bit 7 set are not commit CRCs and so do not
+        // round trip through this variant.
+        (0u8..=0x7f).prop_map(TagType::CommitCrc),
         Just(TagType::ForwardCrc),
         Just(TagType::SoftTail),
         Just(TagType::HardTail),
@@ -91,6 +95,10 @@ const TAG_ORACLE: &[(bool, TagType, u16, u16, u32)] = &[
     (true, TagType::Delete, 7, 0x3ff, 0x4ff0_1fff),
     // CommitCrc(1), valid, no-id, len 4 (type11 = 0x501).
     (true, TagType::CommitCrc(1), 0x3ff, 4, 0x501f_fc04),
+    // CommitCrc(4), valid, no-id, len 4 (type11 = 0x504). Inside the C
+    // reader's accepted chunk range but outside what the C writer emits
+    // (review L2).
+    (true, TagType::CommitCrc(4), 0x3ff, 4, 0x504f_fc04),
     // ForwardCrc, valid, no-id, len 4 (type11 = 0x5ff).
     (true, TagType::ForwardCrc, 0x3ff, 4, 0x5fff_fc04),
     // SoftTail, valid, no-id, len 8 (type11 = 0x600).

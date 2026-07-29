@@ -921,6 +921,20 @@ fn build_compact_commit(
 /// Bounded at [`crate::alloc::MAX_QUEUED_PAIRS`] visited pairs to
 /// match the allocator's BFS budget; deeper directory trees return
 /// `Error::OutOfRange`.
+///
+/// # Pair identity is the physical block set
+///
+/// The visited set keys on [`BlockPair::is_same_pair`], not on the
+/// derived ordered equality. XOR is self-inverse, so folding one pair's
+/// `MoveState` body twice cancels it to zero. An image naming one
+/// physical pair as `{a, b}` in one place and `{b, a}` in another would
+/// otherwise be walked twice and would silently erase that pair's
+/// pending move from the accumulated gstate, so mount recovery would
+/// never fire on a move that a correct reader completes (review L7,
+/// `lfs-a8j`). Canonicalizing the key does not change what is read: the
+/// queue still stores each pair in the order it was found, and
+/// [`MetadataPair::parse`] picks the active half by revision counter
+/// rather than by position.
 fn accumulate_gstate<S: Storage>(
     storage: &mut S,
     root: BlockPair,
@@ -965,7 +979,7 @@ fn accumulate_gstate<S: Storage>(
             if !pair_in_bounds::<S>(tail_pair) {
                 return Err(Error::Corrupt);
             }
-            if !queue[..tail].contains(&tail_pair) {
+            if !crate::block::contains_pair(&queue[..tail], tail_pair) {
                 if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                     return Err(Error::OutOfRange);
                 }
@@ -988,7 +1002,7 @@ fn accumulate_gstate<S: Storage>(
                 if !pair_in_bounds::<S>(child) {
                     return Err(Error::Corrupt);
                 }
-                if !queue[..tail].contains(&child) {
+                if !crate::block::contains_pair(&queue[..tail], child) {
                     if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                         return Err(Error::OutOfRange);
                     }
@@ -1015,6 +1029,14 @@ fn accumulate_gstate<S: Storage>(
 /// directory's entries continue there), so they are followed; the live
 /// `DirStruct` view (not raw `iter_tags`) ensures a directory whose entry
 /// has already been deleted is not counted as live.
+///
+/// Collected pairs are compared with [`BlockPair::is_same_pair`] rather
+/// than the derived ordered equality, both when deduping during the walk
+/// and, at every caller, when testing a thread successor for membership
+/// in the result. Order carries no meaning on disk, so a successor named
+/// `{b, a}` against a tree entry collected as `{a, b}` is the same live
+/// directory; treating it as absent would let the deorphan sweep drop a
+/// live pair out of the global thread (review L7, `lfs-a8j`).
 fn collect_live_tree_pairs<S: Storage>(
     storage: &mut S,
     root: BlockPair,
@@ -1036,7 +1058,13 @@ fn collect_live_tree_pairs<S: Storage>(
         // the tree); a SoftTail is the global list (not the tree).
         if pair.reader.is_hard_tail() {
             if let Some(cont) = pair.reader.tail() {
-                if pair_in_bounds::<S>(cont) && !out[..tail].contains(&cont) {
+                // Out-of-range is `Corrupt`, not a skip; the sentinel
+                // already read as thread end upstream. See
+                // [`pair_in_bounds`] for the posture (`lfs-qeh`).
+                if !pair_in_bounds::<S>(cont) {
+                    return Err(Error::Corrupt);
+                }
+                if !crate::block::contains_pair(&out[..tail], cont) {
                     if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                         return Err(Error::OutOfRange);
                     }
@@ -1058,7 +1086,7 @@ fn collect_live_tree_pairs<S: Storage>(
                 if !pair_in_bounds::<S>(child) {
                     return Err(Error::Corrupt);
                 }
-                if !out[..tail].contains(&child) {
+                if !crate::block::contains_pair(&out[..tail], child) {
                     if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                         return Err(Error::OutOfRange);
                     }
@@ -1219,6 +1247,44 @@ fn verify_programmed<S: Storage>(
         && crate::crc::update(crate::crc::INIT, region) == expected
 }
 
+/// Re-read a just-programmed sub-block region and compare it byte for
+/// byte against `expected`, the file-data counterpart of
+/// [`verify_programmed`] (review `lfs-ttr`).
+///
+/// The metadata sites verify a region that is itself a scratch buffer,
+/// so they can read back over it and CRC-compare. The file-data tail
+/// fill programs from the caller's immutable slice instead, so this
+/// variant reads into `scratch` (a spare `BLOCK_SIZE` buffer) and
+/// compares directly, which is exact rather than CRC-equal and leaves
+/// `expected` untouched.
+///
+/// Alignment: `off` and `len` are content coordinates and need not sit
+/// on the read grid, so the read is widened to the enclosing
+/// `READ_SIZE` window. `BLOCK_SIZE` is a multiple of `PROG_SIZE`, itself
+/// a multiple of `READ_SIZE` (both powers of two), so the widened window
+/// stays inside the block; the bounds check is the backstop for a
+/// storage impl that violates that contract.
+fn verify_programmed_bytes<S: Storage>(
+    storage: &mut S,
+    block: BlockAddress,
+    off: usize,
+    expected: &[u8],
+    scratch: &mut [u8],
+) -> bool {
+    let Some(end) = off.checked_add(expected.len()) else {
+        return false;
+    };
+    let lo = off - (off % S::READ_SIZE);
+    let hi = end.next_multiple_of(S::READ_SIZE);
+    if hi > S::BLOCK_SIZE || hi > scratch.len() {
+        return false;
+    }
+    if storage.read(block.as_u32(), lo as u32, &mut scratch[lo..hi]).is_err() {
+        return false;
+    }
+    scratch[off..end] == *expected
+}
+
 /// True when `op` adds a new entry, so the combined entry sequence has
 /// one more element (at index `count`) than the live entry count.
 /// Create-family ops append an entry; every other op transforms or
@@ -1233,6 +1299,25 @@ fn op_adds_entry(op: &WriteOp<'_>) -> bool {
 /// totalling 40. Matches the C reference's `lfs_dir_splittingcompact`
 /// (lfs.c, "space is complicated").
 const SPLIT_RESERVE: usize = 40;
+
+/// Continuation pairs one compacting split may cut off, bounding the
+/// C reference's unbounded `lfs_dir_splittingcompact` outer loop for a
+/// kernel with no allocator and a pinned stack budget (ADR-0006).
+///
+/// The loop re-cuts the lower portion until it fits about half a block,
+/// so `end` shrinks toward the halving sequence's floor: with the cut
+/// index landing at `end / 2` whenever the upper portion fits, the entry
+/// range halves per cut and `log2(MAX_LIVE_ENTRIES) = 8` cuts cover the
+/// widest pair this crate can hold. Cuts beyond the bound degrade to the
+/// pre-existing single-block commit, which succeeds when the remainder
+/// fits one block and otherwise returns [`Error::OutOfRange`], exactly
+/// the behavior before multi-cut splitting existed. The reachable-pair
+/// budget and the root fullness guard cap the count further.
+///
+/// Each permitted cut reserves two entries in the split's excluded-block
+/// list, so raising this constant costs `8 * MAX_SPLIT_CUTS` bytes of
+/// stack in [`Fs::split_directory_pair`].
+const MAX_SPLIT_CUTS: usize = 8;
 
 /// Wire size of the live entries in the combined-sequence range
 /// `[lo, hi)` exactly as [`build_compact_commit`] would emit them
@@ -1343,10 +1428,64 @@ fn should_relocate(
 /// kernel must validate before handing the address to
 /// [`Storage::read`] (whose contract requires it to error on
 /// out-of-range, but which the kernel does not depend on for its own
-/// correctness). Out-of-range pair addresses are never legitimately
-/// reachable, so callers skip or reject them.
+/// correctness).
+///
+/// # The posture, stated once (`lfs-qeh`)
+///
+/// Every *walker* that decodes a pair address from disk and enqueues it
+/// owes the same two answers, and this is the one place they are written
+/// down. Sites that enforce it point here rather than restating it.
+///
+/// 1. **The all ones sentinel is thread end, never an address.** It is
+///    resolved upstream, at the tail decode
+///    ([`crate::meta::MetadataReader::tail`]), which reports it as
+///    `None`. It therefore never reaches this predicate from a tail, and
+///    a walker needs no sentinel special case of its own. The one
+///    exception is [`crate::alloc`]'s single buffer walker, which reads
+///    raw tags rather than the decoded tail and so applies the rule
+///    itself. From a `DirStruct` body the sentinel is not thread end and
+///    carries no meaning (the C writer never emits one), so it falls
+///    through to rule 2 and is rejected like any other bad address.
+/// 2. **A genuine out-of-range pair is `Error::Corrupt`, not a skip.**
+///    The oracle is `lfs_dir_fetchmatch` (`lfs.c:1103`), whose first act
+///    is to return `LFS_ERR_CORRUPT` when either half is `>=
+///    lfs->block_count`; the C reader reaches that check for exactly the
+///    addresses these walkers reach, because it too filters null tails
+///    before fetching.
+///
+/// Rule 2 was previously split: most sites rejected while
+/// [`collect_live_tree_pairs`]'s `HardTail` and the parent-lookup BFS
+/// silently skipped. A skip is strictly worse than a reject here. No
+/// legitimate image contains a live out-of-range pair, so nothing is
+/// lost by rejecting, whereas skipping *hides* the corruption and lets a
+/// walk return a confidently incomplete answer: a reachability set
+/// missing a pair, which the deorphan sweep then reads as a pair to
+/// unthread, or a parent lookup returning `None` for a directory that
+/// does have a parent.
+///
+/// # What this does not yet cover
+///
+/// The rule governs the walkers, which decode an address and decide
+/// whether to enqueue it. It does not yet govern the *chase* sites,
+/// which follow a `HardTail` to continue one directory's own chain
+/// (`resolve`, `list_dir`, `find_thread_predecessor`,
+/// `unthread_and_steal` and their kin: sixteen pair reads across this
+/// module). Those hand the address straight to [`Storage::read`] and
+/// surface an out-of-range one as [`Error::Io`], which misreads image
+/// corruption as a hardware fault, exactly the confusion review L9
+/// (`lfs-b2m`) removed from the walkers. The C reference has no such
+/// split because its bounds check lives inside `lfs_dir_fetchmatch` and
+/// therefore covers every fetch, chases included. Closing the gap means
+/// routing all sixteen reads through one bounds-checked pair read; that
+/// is a separate concern from this one and is deliberately not folded in
+/// here. Note the *sentinel* is already correct at those sites: it
+/// resolves to `None` at the decode, so a chase terminates rather than
+/// dereferencing all ones.
+///
+/// Shared with [`crate::alloc`], whose forest walkers owe the same
+/// rejection at every enqueue site (review L9, `lfs-b2m`).
 #[inline]
-fn pair_in_bounds<S: Storage>(pair: BlockPair) -> bool {
+pub(crate) fn pair_in_bounds<S: Storage>(pair: BlockPair) -> bool {
     pair.a.as_u32() < S::BLOCK_COUNT && pair.b.as_u32() < S::BLOCK_COUNT
 }
 
@@ -1459,7 +1598,13 @@ fn find_parent_in_tree<S: Storage>(
         // Latest tail only; every raw tail tag would re-enqueue
         // superseded thread links.
         if let Some(t) = pair.reader.tail() {
-            if pair_in_bounds::<S>(t) && !queue[..tail].contains(&t) {
+            // Out-of-range is `Corrupt`, not a skip; the sentinel already
+            // read as thread end upstream. See [`pair_in_bounds`] for the
+            // posture (`lfs-qeh`).
+            if !pair_in_bounds::<S>(t) {
+                return Err(Error::Corrupt);
+            }
+            if !crate::block::contains_pair(&queue[..tail], t) {
                 if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                     return Err(Error::OutOfRange);
                 }
@@ -1482,10 +1627,14 @@ fn find_parent_in_tree<S: Storage>(
                 // `i` is the entry's live id by construction.
                 return Ok(Some((pair_addr, i as u16)));
             }
-            // An out-of-range DirStruct body cannot be the target (a
-            // real allocated pair) and must never be dereferenced;
-            // skip it rather than enqueue.
-            if pair_in_bounds::<S>(child) && !queue[..tail].contains(&child) {
+            // An out-of-range DirStruct body must never be dereferenced,
+            // and is `Corrupt` rather than a skip: swallowing it would
+            // let this lookup answer "no parent" for a directory that has
+            // one. See [`pair_in_bounds`] for the posture (`lfs-qeh`).
+            if !pair_in_bounds::<S>(child) {
+                return Err(Error::Corrupt);
+            }
+            if !crate::block::contains_pair(&queue[..tail], child) {
                 if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                     return Err(Error::OutOfRange);
                 }
@@ -1662,6 +1811,14 @@ impl<S: Storage> Fs<S> {
     /// program fails (a worn/bad block), returns `Err(phys)` with that
     /// block's physical address so the caller can exclude it and rebuild
     /// past it. `chain.len()` is the block count.
+    ///
+    /// A block whose read back disagrees with what was sent counts as
+    /// worn too (review `lfs-ttr`): the C reference validates every
+    /// program it issues, file data included, and routes a mismatch into
+    /// the same relocation a reported failure takes. `buf_a` is rebuilt
+    /// from scratch for each block, so the clobbering
+    /// [`verify_programmed`] does on a mismatch costs the caller
+    /// nothing.
     fn try_build_ctz_chain(
         &mut self,
         chain: &[BlockAddress],
@@ -1691,6 +1848,9 @@ impl<S: Storage> Fs<S> {
             let phys = block.as_u32();
             self.storage.erase(phys).map_err(|_| phys)?;
             self.storage.program(phys, 0, &buf_a[..S::BLOCK_SIZE]).map_err(|_| phys)?;
+            if !verify_programmed(&mut self.storage, *block, 0, &mut buf_a[..S::BLOCK_SIZE]) {
+                return Err(phys);
+            }
         }
         Ok(())
     }
@@ -2096,7 +2256,7 @@ impl<S: Storage> Fs<S> {
         }
         let layout = {
             let p = MetadataPair::parse(owner.a, &*buf_a, owner.b, &*buf_b)?;
-            match crate::dir::lookup(&p, name) {
+            match crate::dir::lookup_checked(&p, name)? {
                 None => Layout::Missing,
                 Some(r) => {
                     if r.entry.kind != crate::dir::EntryKind::RegularFile {
@@ -2190,7 +2350,7 @@ impl<S: Storage> Fs<S> {
         buf_b: &mut [u8],
     ) -> Result<(u32, u32), Error> {
         use crate::ctz::{
-            block_count, block_index_at_offset, content_bytes_in_block, seek_block,
+            block_count, block_index_at_offset, content_bytes_in_block, seek_block_buffered,
             skip_pointers_in_block,
         };
 
@@ -2269,11 +2429,23 @@ impl<S: Storage> Fs<S> {
                             *x = 0xFF;
                         }
                         buf_a[off..off + fill].copy_from_slice(&data[..fill]);
+                        // A candidate that reports success but lands
+                        // corrupted cells is excluded exactly like one
+                        // that reports the failure (review `lfs-ttr`).
+                        // The next attempt re-reads the committed tail
+                        // into `buf_a`, so the read back's clobbering is
+                        // harmless here.
                         if self.storage.erase(fresh.as_u32()).is_ok()
                             && self
                                 .storage
                                 .program(fresh.as_u32(), 0, &buf_a[..S::BLOCK_SIZE])
                                 .is_ok()
+                            && verify_programmed(
+                                &mut self.storage,
+                                fresh,
+                                0,
+                                &mut buf_a[..S::BLOCK_SIZE],
+                            )
                         {
                             tail_addr = fresh;
                             break;
@@ -2349,9 +2521,18 @@ impl<S: Storage> Fs<S> {
                             // copy-on-written, index n_old - 1 must
                             // resolve to the NEW tail; its copied
                             // header reaches the unchanged earlier
-                            // blocks.
-                            seek_block(&mut self.storage, tail_addr, n_old - 1, target_idx as u32)?
-                                .as_u32()
+                            // blocks. `buf_a` holds the block image
+                            // under construction, so the descent stages
+                            // its aligned reads through `buf_b`, which
+                            // the allocation above has finished with.
+                            seek_block_buffered(
+                                &mut self.storage,
+                                tail_addr,
+                                n_old - 1,
+                                target_idx as u32,
+                                buf_b,
+                            )?
+                            .as_u32()
                         };
                         let off = 4 * k;
                         buf_a[off..off + 4].copy_from_slice(&target_phys.to_le_bytes());
@@ -2363,8 +2544,18 @@ impl<S: Storage> Fs<S> {
                     content_off += take;
 
                     let phys = new_blocks[(new_i - n_old) as usize].as_u32();
+                    // A read back mismatch is a worn block too, and
+                    // takes the same exclusion (review `lfs-ttr`).
+                    // `buf_a` is rebuilt for every block of every
+                    // attempt, so its clobbering costs nothing.
                     if self.storage.erase(phys).is_err()
                         || self.storage.program(phys, 0, &buf_a[..S::BLOCK_SIZE]).is_err()
+                        || !verify_programmed(
+                            &mut self.storage,
+                            BlockAddress::new(phys),
+                            0,
+                            &mut buf_a[..S::BLOCK_SIZE],
+                        )
                     {
                         // Worn block: exclude it and rebuild the new set.
                         if ex_len >= MAX_BAD_BLOCK_RETRIES {
@@ -2388,6 +2579,25 @@ impl<S: Storage> Fs<S> {
         // dirty check turns into a copy-on-write.
         if let Some((tail_phys, off, fill)) = deferred_fill {
             self.storage.program(tail_phys, off, &data[..fill]).map_err(|_| Error::Io)?;
+            // Read back what was just sent (review `lfs-ttr`). Unlike
+            // every other file-data site this one cannot relocate: the
+            // overflow blocks written in step 2 already carry skip
+            // pointers naming this block's address, so moving it now
+            // would strand them. `Io` is therefore the same verdict a
+            // program failure gets here, and it is a safe one: the
+            // metadata still records `old_size`, so nothing acknowledged
+            // is lost, and the cells this attempt did land leave the
+            // region dirty, which routes the caller's retry through the
+            // copy-on-write branch of step 1.
+            if !verify_programmed_bytes(
+                &mut self.storage,
+                BlockAddress::new(tail_phys),
+                off as usize,
+                &data[..fill],
+                buf_a,
+            ) {
+                return Err(Error::Io);
+            }
         }
 
         self.storage.sync().map_err(|_| Error::Io)?;
@@ -2425,8 +2635,8 @@ impl<S: Storage> Fs<S> {
         buf_b: &mut [u8],
     ) -> Result<BlockAddress, Error> {
         use crate::ctz::{
-            block_count, block_index_at_offset, collect_chain_blocks, content_bytes_in_block,
-            skip_pointers_in_block, MAX_CTZ_BLOCKS,
+            block_count, block_index_at_offset, collect_chain_blocks_buffered,
+            content_bytes_in_block, skip_pointers_in_block, MAX_CTZ_BLOCKS,
         };
         debug_assert!(new_size > 0 && new_size <= old_size);
         let bs = S::BLOCK_SIZE as u32;
@@ -2435,7 +2645,15 @@ impl<S: Storage> Fs<S> {
             return Err(Error::OutOfRange);
         }
         let mut chain = [BlockAddress::NONE; MAX_CTZ_BLOCKS];
-        collect_chain_blocks(&mut self.storage, head_block, n_old, &mut chain[..n_old as usize])?;
+        // `buf_a` is free until the relocated block image is built
+        // below, so it serves as the walk's aligned read window.
+        collect_chain_blocks_buffered(
+            &mut self.storage,
+            head_block,
+            n_old,
+            &mut chain[..n_old as usize],
+            buf_a,
+        )?;
 
         let (new_tail_idx, abs_off) = block_index_at_offset(new_size - 1, bs);
         let header = 4 * skip_pointers_in_block(new_tail_idx);
@@ -2479,6 +2697,14 @@ impl<S: Storage> Fs<S> {
         self.storage
             .program(fresh_addr.as_u32(), 0, &buf_a[..S::BLOCK_SIZE])
             .map_err(|_| Error::Io)?;
+        // Read back the relocated tail (review `lfs-ttr`). A mismatch
+        // reports `Io`, the verdict a program failure already gets on
+        // this path; only the fresh block was written, so the committed
+        // chain and the committed metadata are untouched either way and
+        // the caller's shrink simply did not happen.
+        if !verify_programmed(&mut self.storage, fresh_addr, 0, &mut buf_a[..S::BLOCK_SIZE]) {
+            return Err(Error::Io);
+        }
         self.storage.sync().map_err(|_| Error::Io)?;
         Ok(fresh_addr)
     }
@@ -2612,58 +2838,94 @@ impl<S: Storage> Fs<S> {
             }
         }
 
-        // Allocate two blocks for the new directory's metadata pair.
-        let mut new_blocks = [BlockAddress::NONE; 2];
-        crate::alloc::alloc_blocks_cached(
-            &mut self.storage,
-            self.root,
-            &mut self.used_cache,
-            &[],
-            None,
-            &mut new_blocks,
-            buf_a,
-            buf_b,
-        )?;
-        let new_dir = BlockPair::new(new_blocks[0], new_blocks[1]);
-
-        // Initialize: erase both blocks, then write an empty commit
+        // Allocate two blocks for the new directory's metadata pair and
+        // initialize them: erase both, then write an empty commit
         // (revision 1 + CCRC, no entries) on block A. Block B remains
         // pristine erased as the alternate.
-        self.storage.erase(new_dir.a.as_u32()).map_err(|_| Error::Io)?;
-        self.storage.erase(new_dir.b.as_u32()).map_err(|_| Error::Io)?;
-        for byte in buf_a.iter_mut() {
-            *byte = 0xFF;
-        }
-        let new_end = {
-            let mut commit = crate::meta::Commit::new(&mut buf_a[..S::BLOCK_SIZE], 1)?;
-            // The new directory takes the parent's old place in the global
-            // list: its tail points where the parent's tail did (null if
-            // the parent was the list end). Crash-safe: until the parent's
-            // commit below lands, the new dir is referenced by nothing and
-            // is reclaimed as an orphan, so this link is never reachable.
-            if let Some((tail_pair, is_hard)) = parent_tail {
-                let mut body = [0u8; 8];
-                body[0..4].copy_from_slice(&tail_pair.a.as_u32().to_le_bytes());
-                body[4..8].copy_from_slice(&tail_pair.b.as_u32().to_le_bytes());
-                let tag_type = if is_hard {
-                    crate::tag::TagType::HardTail
-                } else {
-                    crate::tag::TagType::SoftTail
+        //
+        // A candidate whose erase or program fails, or whose init commit
+        // does not read back (review H2), is a worn block. Exclude it and
+        // allocate again, bounded by `MAX_BAD_BLOCK_RETRIES`, the same
+        // discipline `relocate_compact_to_fresh` and the split
+        // continuation follow (ADR-0014, `lfs-n23`). Retrying is purely
+        // additive here: the pair is referenced by nothing until the
+        // parent's `CreateDir` commit lands far below, so an abandoned
+        // candidate is a blank orphan the next allocator scan reclaims.
+        // Exclusion is per block, not per pair: the healthy half of a
+        // rejected pair is free to come back paired with someone else.
+        let mut excluded = [BlockAddress::NONE; MAX_BAD_BLOCK_RETRIES];
+        let mut ex_len = 0usize;
+        let mut new_blocks = [BlockAddress::NONE; 2];
+        let new_dir = loop {
+            crate::alloc::alloc_blocks_cached(
+                &mut self.storage,
+                self.root,
+                &mut self.used_cache,
+                &excluded[..ex_len],
+                None,
+                &mut new_blocks,
+                buf_a,
+                buf_b,
+            )?;
+            let candidate = BlockPair::new(new_blocks[0], new_blocks[1]);
+            let worn = if self.storage.erase(candidate.a.as_u32()).is_err() {
+                Some(candidate.a)
+            } else if self.storage.erase(candidate.b.as_u32()).is_err() {
+                Some(candidate.b)
+            } else {
+                for byte in buf_a.iter_mut() {
+                    *byte = 0xFF;
+                }
+                let new_end = {
+                    let mut commit = crate::meta::Commit::new(&mut buf_a[..S::BLOCK_SIZE], 1)?;
+                    // The new directory takes the parent's old place in the
+                    // global list: its tail points where the parent's tail
+                    // did (null if the parent was the list end).
+                    // Crash-safe: until the parent's commit below lands,
+                    // the new dir is referenced by nothing and is
+                    // reclaimed as an orphan, so this link is never
+                    // reachable.
+                    if let Some((tail_pair, is_hard)) = parent_tail {
+                        let mut body = [0u8; 8];
+                        body[0..4].copy_from_slice(&tail_pair.a.as_u32().to_le_bytes());
+                        body[4..8].copy_from_slice(&tail_pair.b.as_u32().to_le_bytes());
+                        let tag_type = if is_hard {
+                            crate::tag::TagType::HardTail
+                        } else {
+                            crate::tag::TagType::SoftTail
+                        };
+                        commit.tag(
+                            crate::tag::Tag::new(true, tag_type, crate::tag::ID_NONE, 8),
+                            &body,
+                        )?;
+                    }
+                    commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
+                    commit.bytes_written()
                 };
-                commit.tag(crate::tag::Tag::new(true, tag_type, crate::tag::ID_NONE, 8), &body)?;
+                // `verify_programmed` clobbers `buf_a` on a mismatch, and
+                // both exits from here rebuild it: a retry re-emits the
+                // commit above, and the success path re-reads the target
+                // pair below.
+                if self.storage.program(candidate.a.as_u32(), 0, &buf_a[..new_end]).is_err()
+                    || !verify_programmed(&mut self.storage, candidate.a, 0, &mut buf_a[..new_end])
+                {
+                    Some(candidate.a)
+                } else {
+                    None
+                }
+            };
+            match worn {
+                None => break candidate,
+                Some(bad) => {
+                    if ex_len >= MAX_BAD_BLOCK_RETRIES {
+                        return Err(Error::Io);
+                    }
+                    excluded[ex_len] = bad;
+                    ex_len += 1;
+                    self.used_cache = None;
+                }
             }
-            commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
-            commit.bytes_written()
         };
-        self.storage.program(new_dir.a.as_u32(), 0, &buf_a[..new_end]).map_err(|_| Error::Io)?;
-        // Review H2: the new directory's init commit gets the same
-        // read-back every other commit gets. A verify failure reports
-        // `Io` exactly like a program failure on this path; the
-        // allocated pair stays an unreferenced orphan. `buf_a` is
-        // re-read below before its next use.
-        if !verify_programmed(&mut self.storage, new_dir.a, 0, &mut buf_a[..new_end]) {
-            return Err(Error::Io);
-        }
         self.storage.sync().map_err(|_| Error::Io)?;
 
         // Re-read the target pair to compute the new id from the live
@@ -2926,8 +3188,8 @@ impl<S: Storage> Fs<S> {
     /// destination `Create` commit atomically (review H6; the C
     /// reference's `LFS_FROM_MOVE` replays all unique tags of the
     /// moved id). One documented divergence: the attributes stage
-    /// through a fixed 1 KiB stack pool, so an entry whose live
-    /// attribute payload exceeds [`RENAME_ATTR_STAGE`] fails the
+    /// through a fixed 1 KiB stack pool (`RENAME_ATTR_STAGE`), so an
+    /// entry whose live attribute payload exceeds that stage fails the
     /// rename with [`Error::OutOfRange`] (attributes intact, nothing
     /// moved) where the C reference, which streams the source pair
     /// through its block caches, would succeed.
@@ -3008,7 +3270,7 @@ impl<S: Storage> Fs<S> {
         let staged_attr_len;
         {
             let p = MetadataPair::parse(src_owner.a, &*buf_a, src_owner.b, &*buf_b)?;
-            let r = crate::dir::lookup(&p, old_leaf_bytes).ok_or(Error::NotFound)?;
+            let r = crate::dir::lookup_checked(&p, old_leaf_bytes)?.ok_or(Error::NotFound)?;
             let n = r.struct_body.len();
             if n > src_body.len() {
                 return Err(Error::OutOfRange);
@@ -3240,12 +3502,20 @@ impl<S: Storage> Fs<S> {
         // re-emit it; an in-place append keeps the existing tail tag and
         // only emits when the tail actually changes.
         let effective_tail = new_tail.or(current_tail);
-        // A `new_tail` whose pair is the NONE sentinel means "clear the
-        // tail" (un-threading the global-list end so the predecessor
+        // A `new_tail` whose pair is the all-ones sentinel means "clear
+        // the tail" (un-threading the global-list end so the predecessor
         // becomes the new end). The tail tag is sticky, so an in-place
         // append cannot drop it; force a compaction, which rebuilds the
         // block without re-emitting any tail tag.
-        let clear_tail = matches!(new_tail, Some((p, _)) if p.a.is_none());
+        //
+        // That yields the tag-absent spelling of thread end, which is what
+        // `lfs_dir_compact` (`lfs.c:2003`) writes for the same state. The C
+        // reference's `lfs_dir_drop` (`lfs.c:1831`) instead writes the
+        // sentinel literally. Both are conforming and both read as thread
+        // end under either reader (`lfs-yl6`); this crate pins the
+        // tag-absent one on the write side and accepts both on the read
+        // side.
+        let clear_tail = matches!(new_tail, Some((p, _)) if p.is_null());
 
         let extra_ms_dsize =
             extra_move_state.map_or(0, |_| 4 + crate::gstate::MOVE_STATE_BODY_SIZE);
@@ -3451,9 +3721,25 @@ impl<S: Storage> Fs<S> {
         // active block: eagerly relocate the pair onto a fresh block,
         // rebuilding the (readable) active block's live set there and dropping
         // the worn block, exactly like the alternate-worn pivot but evicting
-        // the active half. A single pair's live set always fits one block (it
-        // splits at half-block during growth), so no split is needed. The
-        // root pair is the fixed superblock anchor and cannot relocate.
+        // the active half. The root pair is the fixed superblock anchor and
+        // cannot relocate.
+        //
+        // No split here, and the reason is arithmetic rather than the
+        // half-block invariant a growing op can break (review L1): this
+        // branch runs only when `can_append` held, so
+        // `committed_end + dsize <= BLOCK_SIZE`. The active block's log
+        // physically holds every tag the rebuild re-emits (this writer emits
+        // a Create, a NAME, a STRUCT, and the attribute tags into its own
+        // compacted blocks) plus the revision header, the tail tag the
+        // rebuild re-emits, and at least one CCRC and FCRC, so
+        // `committed_end` is at least the rebuilt size of the same set; and
+        // the op adds `dsize` bytes to the log against `dsize - 8` to a
+        // rebuild, which shares the one trailing CCRC. The rebuilt image is
+        // therefore at most `BLOCK_SIZE - 8` and cannot overflow. What this
+        // branch does skip is the *half-block* redistribution the ordinary
+        // path performs, so a pair relocated this way may carry more than
+        // half a block until its next ordinary compaction splits it.
+        // Swept by `tests/review_l1_forced_victim.rs`.
         if let Some(victim) = forced_victim {
             if pair_addr == self.root {
                 return Err(Error::Io);
@@ -3499,16 +3785,20 @@ impl<S: Storage> Fs<S> {
             compute_split_index::<S>(source_buf, slots, count, op, 0, total)?
         };
         let mut do_split = split > 0;
+        // How many continuation pairs this split may cut off. Each guard
+        // below lowers the ceiling; `do_split` false means zero.
+        let mut max_cuts = MAX_SPLIT_CUTS;
         if do_split {
-            // Bound the reachable-pair count before splitting. The split
-            // adds exactly one reachable pair (the continuation); the
+            // Bound the reachable-pair count before splitting. Each cut
+            // adds exactly one reachable pair (its continuation); the
             // mount-time walks (allocator scan, gstate accumulation,
             // deorphan) enumerate the forest into fixed `MAX_QUEUED_PAIRS`
             // arrays (ADR-0006), so a forest of more than `MAX_QUEUED_PAIRS`
             // reachable pairs is unmountable. At the budget, do not split:
             // fall through to a single-block compaction (degraded), which
             // still fits when the live set is at most one block and only
-            // a genuine overflow turns into `OutOfRange` below.
+            // a genuine overflow turns into `OutOfRange` below. Below the
+            // budget, the headroom is the cut ceiling.
             //
             // `collect_live_tree_pairs` clobbers both scratch buffers, so
             // re-read the active block afterward to restore the bytes
@@ -3521,6 +3811,8 @@ impl<S: Storage> Fs<S> {
             self.storage.read(active_addr.as_u32(), 0, source_buf).map_err(|_| Error::Io)?;
             if reachable >= crate::alloc::MAX_QUEUED_PAIRS {
                 do_split = false;
+            } else {
+                max_cuts = max_cuts.min(crate::alloc::MAX_QUEUED_PAIRS - reachable);
             }
         }
         if do_split && pair_addr == self.root {
@@ -3531,15 +3823,21 @@ impl<S: Storage> Fs<S> {
             // permanently consume the last free blocks and starve future
             // writes. Do not split the root once free space drops to an
             // eighth of the device — degrade to a single-block compaction
-            // (a root overflow then keeps its prior `OutOfRange`).
+            // (a root overflow then keeps its prior `OutOfRange`). A
+            // multi-cut split consumes two blocks per cut, so the same
+            // question is asked once per cut: cut `k` (zero-based) is
+            // permitted only while `free - 2 * k` still clears the floor.
             // `scan_used_blocks` clobbers both buffers; restore the source.
             let mut used = crate::alloc::Bitmap::EMPTY;
             crate::alloc::scan_used_blocks(&mut self.storage, self.root, &mut used, buf_a, buf_b)?;
             let source_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
             self.storage.read(active_addr.as_u32(), 0, source_buf).map_err(|_| Error::Io)?;
             let free = (0..S::BLOCK_COUNT).filter(|&blk| !used.is_set(blk)).count();
-            if free <= (S::BLOCK_COUNT as usize) / 8 {
+            let floor = (S::BLOCK_COUNT as usize) / 8;
+            if free <= floor {
                 do_split = false;
+            } else {
+                max_cuts = max_cuts.min((free - floor).div_ceil(2));
             }
         }
         if do_split {
@@ -3568,6 +3866,7 @@ impl<S: Storage> Fs<S> {
                 op,
                 split,
                 total,
+                max_cuts,
                 tail,
                 ms_arg,
                 rs_arg,
@@ -3867,9 +4166,12 @@ impl<S: Storage> Fs<S> {
     ) -> Result<BlockPair, Error> {
         // Excluded set: the pair's own two blocks, every inflight block from a
         // parent relocation cascade, and every worn fresh candidate tried so
-        // far. Sized for the worst case with bound checks → `OutOfRange`.
-        let mut excluded =
-            [BlockAddress::NONE; 2 + 2 + crate::alloc::MAX_QUEUED_PAIRS + MAX_BAD_BLOCK_RETRIES];
+        // far. The widest caller is the split's worn-alternate path, whose
+        // in-flight list also names both blocks of every continuation the
+        // split already cut. Sized for that worst case with bound checks →
+        // `OutOfRange`.
+        let mut excluded = [BlockAddress::NONE;
+            2 + 2 + crate::alloc::MAX_QUEUED_PAIRS + 2 * MAX_SPLIT_CUTS + 2 * MAX_BAD_BLOCK_RETRIES];
         excluded[0] = pair_addr.a;
         excluded[1] = pair_addr.b;
         let mut base_len = 2;
@@ -3997,54 +4299,64 @@ impl<S: Storage> Fs<S> {
         }
     }
 
-    /// Split an overflowing directory pair across a freshly allocated
-    /// `HardTail` continuation, matching the C reference's `lfs_dir_split`.
-    /// The combined entry sequence is cut at `split` (computed by
+    /// Split an overflowing directory pair across freshly allocated
+    /// `HardTail` continuations, matching the C reference's `lfs_dir_split`
+    /// driven by the `lfs_dir_splittingcompact` outer loop. The combined
+    /// entry sequence is cut at `split` (computed by
     /// [`compute_split_index`]): the upper portion `[split, total)` moves
-    /// to the continuation, the lower portion `[0, split)` stays in the
-    /// original pair, now ending in a `HardTail` to the continuation.
+    /// to a continuation, and the remaining lower portion is re-measured
+    /// and cut again until it fits, up to `max_cuts` continuations. What is
+    /// left stays in the original pair, now ending in a `HardTail` to the
+    /// most recently cut continuation.
     ///
-    /// **Ordering and crash-safety.** The continuation is allocated and
-    /// fully programmed *before* the original's lower-half commit lands.
-    /// Until that commit, the continuation is referenced by nothing (the
-    /// original's active block still holds its pre-split tags with no
-    /// HardTail), so a crash leaves it an unreferenced orphan reclaimed by
-    /// the next allocator scan — exactly the `mkdir` create window. After
-    /// the lower-half commit lands on the original's alternate (higher
-    /// revision, CCRC-valid), the directory reads as the post-split state:
-    /// the original's lower entries followed by the continuation's upper
-    /// entries (which include the new entry for a Create), concatenated by
-    /// `list_pair_chain` across the HardTail.
+    /// **Why more than one cut.** A single cut bounds only the *upper*
+    /// portion (`compute_split_index` shrinks it to about half a block); the
+    /// lower portion is whatever remains, and an op that grows an existing
+    /// entry in place (a `SetAttr`, an inline `Update`, a `RenameInPlace`
+    /// to a longer name) can leave that remainder larger than one block.
+    /// The first cut then lands a continuation the lower half cannot join,
+    /// and the lower commit fails with `Error::OutOfRange` where the C
+    /// reference simply cuts again (review L1, ADR-0013). Each cut narrows
+    /// `end` to the previous cut index, so the loop terminates.
     ///
-    /// **gstate** stays on the original (lower) pair; the continuation is
-    /// brand new and carries a zero contribution. The continuation
-    /// inherits the original's prior tail so the global thread (and any
-    /// further continuation) stays linked.
+    /// **Ordering and crash-safety.** Every continuation is allocated and
+    /// fully programmed *before* the original's lower commit lands, newest
+    /// cut last, each inheriting the previously programmed one as its tail.
+    /// Until that final commit none of them is referenced (the original's
+    /// active block still holds its pre-split tags with no HardTail), so a
+    /// crash leaves them unreferenced orphans reclaimed by the next
+    /// allocator scan — exactly the `mkdir` create window, one pair per cut
+    /// instead of one. The single linearization point is unchanged: the
+    /// lower commit on the original's alternate (higher revision,
+    /// CCRC-valid). After it the directory reads as the post-split state,
+    /// `list_pair_chain` concatenating the original's entries, then each
+    /// continuation's in cut order (the newest cut holds the entries
+    /// closest to the original, so chain order is entry order).
     ///
-    /// **Worn blocks.** A split writes a fresh continuation block and the
+    /// **gstate** stays on the original (lower) pair; every continuation is
+    /// brand new and carries a zero contribution. The first (topmost) cut
+    /// inherits the original's prior tail so the global thread stays
+    /// linked; later cuts inherit the continuation cut before them.
+    ///
+    /// **Worn blocks.** A split writes fresh continuation blocks and the
     /// original's alternate, either of which may be worn. A worn continuation
     /// block is relocated past in place: the continuation is unreferenced
-    /// until the lower-half commit, so a failed write is a clean blank orphan
-    /// — exclude it and reallocate the pair (bounded by
-    /// [`MAX_BAD_BLOCK_RETRIES`]). A worn *alternate* on the lower-half write
-    /// relocates the original onto a fresh block via
-    /// [`Self::relocate_compact_to_fresh`], with the lower half still
-    /// carrying the `HardTail` to the continuation; that returns the new pair
-    /// address (`Ok(Some(new_pair))`) so the caller repoints the parent. The
-    /// root pair cannot relocate, so a worn root alternate stays
+    /// until the lower commit, so a failed write is a clean blank orphan
+    /// — exclude it and reallocate the pair. The retry budget
+    /// ([`MAX_BAD_BLOCK_RETRIES`]) spans the whole split, not each cut, so a
+    /// wholly-failing device cannot loop longer for having more cuts. A worn
+    /// *alternate* on the lower commit relocates the original onto a fresh
+    /// block via [`Self::relocate_compact_to_fresh`], with the lower portion
+    /// still carrying the `HardTail` to the newest continuation; that returns
+    /// the new pair address (`Ok(Some(new_pair))`) so the caller repoints the
+    /// parent. The root pair cannot relocate, so a worn root alternate stays
     /// [`Error::Io`]. A normal split returns `Ok(None)`.
     ///
-    /// One split always suffices in this writer: each metadata pair fits
-    /// one block and each `WriteOp` adds at most one entry, so the combined
-    /// sequence is at most one block plus one entry, which a single cut
-    /// splits into two sub-block pairs (the upper bounded to half a block
-    /// by `compute_split_index`, the lower being the pre-existing entries).
-    /// A multi-pair directory grows by repeatedly splitting the last pair
-    /// as it fills. The within-compaction cascade of the C reference's
-    /// `lfs_dir_splittingcompact` (reachable only when one commit batches
-    /// several creates) is therefore unreachable here; see ADR-0013. A
-    /// lower portion that somehow still exceeded the block would surface as
-    /// the pre-existing `Error::OutOfRange` from `build_compact_commit`.
+    /// `max_cuts` is the caller's ceiling from the reachable-pair budget and
+    /// the root fullness guard, itself capped by [`MAX_SPLIT_CUTS`]; it is at
+    /// least 1. Exhausting it leaves a lower portion that may still exceed
+    /// one block, which surfaces as the pre-existing `Error::OutOfRange` from
+    /// `build_compact_commit`.
     #[allow(clippy::too_many_arguments)]
     fn split_directory_pair(
         &mut self,
@@ -4058,6 +4370,7 @@ impl<S: Storage> Fs<S> {
         op: &WriteOp<'_>,
         split: usize,
         total: usize,
+        max_cuts: usize,
         inherited_tail: Option<(BlockPair, bool)>,
         ms_arg: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
         rs_arg: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
@@ -4065,14 +4378,16 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<Option<BlockPair>, Error> {
-        // Excluded set for the continuation allocation: the pair's own blocks,
-        // any inflight blocks, and every worn continuation candidate tried.
-        // The build buffer is the allocator's single-buffer scan scratch, so
-        // the source buffer (holding the bytes `slots` point into) is never
-        // clobbered. One extra slot holds the first-allocated block tentatively
-        // while the second is allocated.
-        let mut excluded =
-            [BlockAddress::NONE; 2 + crate::alloc::MAX_QUEUED_PAIRS + MAX_BAD_BLOCK_RETRIES + 1];
+        // Excluded set for the continuation allocations: the pair's own
+        // blocks, any inflight blocks, both blocks of every continuation
+        // already cut (they are programmed but unreferenced, so the
+        // allocator's scan cannot see them), and every worn continuation
+        // candidate tried. The build buffer is the allocator's single-buffer
+        // scan scratch, so the source buffer (holding the bytes `slots` point
+        // into) is never clobbered. One extra slot holds the first-allocated
+        // block of the current cut tentatively while the second is allocated.
+        let mut excluded = [BlockAddress::NONE;
+            2 + crate::alloc::MAX_QUEUED_PAIRS + 2 * MAX_SPLIT_CUTS + MAX_BAD_BLOCK_RETRIES + 1];
         excluded[0] = active_addr;
         excluded[1] = alternate_addr;
         let mut base = 2;
@@ -4084,20 +4399,126 @@ impl<S: Storage> Fs<S> {
             base += 1;
         }
 
+        // Cut loop. `end` is the exclusive upper bound of the portion still
+        // to place; `cut` is where the next continuation starts; `pending`
+        // is the tail that continuation inherits (the original's prior tail
+        // for the first, topmost cut; the previous continuation after that).
+        // The worn-block retry budget is shared across cuts.
+        let mut end = total;
+        let mut cut = split;
+        let mut pending = inherited_tail;
+        let mut cuts = 0usize;
+        let mut tries = 0usize;
+        let cont = loop {
+            let cont = self.program_split_continuation(
+                active_is_a,
+                slots,
+                count,
+                op,
+                cut,
+                end,
+                pending,
+                inflight.chain,
+                &mut excluded,
+                &mut base,
+                &mut tries,
+                buf_a,
+                buf_b,
+            )?;
+            // The continuation is programmed but unreferenced, so keep its
+            // blocks off every later allocation in this split (the next cut,
+            // and the worn-alternate relocation below). `base` already
+            // covers any worn candidate this cut burned through.
+            if base + 2 > excluded.len() {
+                return Err(Error::OutOfRange);
+            }
+            excluded[base] = cont.a;
+            excluded[base + 1] = cont.b;
+            base += 2;
+            pending = Some((cont, true));
+            end = cut;
+            cuts += 1;
+            if cuts >= max_cuts {
+                break cont;
+            }
+            // Re-measure what is left. `compute_split_index` returns 0 when
+            // the remainder already fits, which ends the loop; otherwise it
+            // is the next cut index and `end` strictly decreases.
+            let next = {
+                let source_buf: &[u8] = if active_is_a { &*buf_a } else { &*buf_b };
+                compute_split_index::<S>(source_buf, slots, count, op, 0, end)?
+            };
+            if next == 0 {
+                break cont;
+            }
+            cut = next;
+        };
+        let split = end;
+        self.finish_split_lower_half(
+            pair_addr,
+            alternate_addr,
+            active_is_a,
+            new_revision,
+            slots,
+            count,
+            op,
+            split,
+            cont,
+            ms_arg,
+            rs_arg,
+            inflight,
+            &excluded[..base],
+            buf_a,
+            buf_b,
+        )
+    }
+
+    /// Allocate and fully program one `HardTail` continuation pair holding
+    /// the combined-sequence range `[lo, hi)` at revision 1, inheriting
+    /// `inherited_tail`, carrying no gstate. Block B is left erased as the
+    /// continuation's alternate so a stale image there cannot masquerade as
+    /// a newer revision.
+    ///
+    /// The pair is unreferenced on return: nothing points at it until the
+    /// caller's lower-half commit lands, so a crash here leaks two blocks
+    /// the next allocator scan reclaims. A worn candidate block is excluded
+    /// and the pair reallocated, charged against the caller's shared
+    /// `tries` budget so a wholly-failing device terminates.
+    ///
+    /// `excluded[..*base]` is the caller's persistent exclusion prefix. On
+    /// success `*base` has advanced past any worn candidate this call burned
+    /// through, so a later cut does not re-offer the same bad block; the
+    /// caller then records the returned pair's own two blocks.
+    #[allow(clippy::too_many_arguments)]
+    fn program_split_continuation(
+        &mut self,
+        active_is_a: bool,
+        slots: &[SlotOffsets; MAX_LIVE_ENTRIES],
+        count: usize,
+        op: &WriteOp<'_>,
+        lo: usize,
+        hi: usize,
+        inherited_tail: Option<(BlockPair, bool)>,
+        chain: Option<(u32, u32)>,
+        excluded: &mut [BlockAddress],
+        base: &mut usize,
+        tries: &mut usize,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<BlockPair, Error> {
         // Allocate + program the continuation, relocating past worn
         // continuation blocks. The continuation is unreferenced until the
         // lower-half commit, so an attempt that hits a worn block leaves a
         // blank/unreferenced orphan: exclude the worn block and retry.
-        let mut ex = base;
-        let mut tries = 0usize;
-        let cont = loop {
+        let mut ex = *base;
+        loop {
             let ca = if active_is_a {
                 crate::alloc::alloc_one_block_cached_single_buf(
                     &mut self.storage,
                     self.root,
                     &mut self.used_cache,
                     &excluded[..ex],
-                    inflight.chain,
+                    chain,
                     buf_b,
                 )?
             } else {
@@ -4106,7 +4527,7 @@ impl<S: Storage> Fs<S> {
                     self.root,
                     &mut self.used_cache,
                     &excluded[..ex],
-                    inflight.chain,
+                    chain,
                     buf_a,
                 )?
             };
@@ -4123,7 +4544,7 @@ impl<S: Storage> Fs<S> {
                     self.root,
                     &mut self.used_cache,
                     &excluded[..=ex],
-                    inflight.chain,
+                    chain,
                     buf_b,
                 )?
             } else {
@@ -4132,17 +4553,17 @@ impl<S: Storage> Fs<S> {
                     self.root,
                     &mut self.used_cache,
                     &excluded[..=ex],
-                    inflight.chain,
+                    chain,
                     buf_a,
                 )?
             };
             let cont = BlockPair::new(ca, cb);
 
-            // Build + program the continuation: the upper portion at revision
-            // 1, inheriting the original's prior tail, carrying no gstate.
-            // Rebuilt each attempt (the alloc clobbered the build buffer);
-            // the bytes are identical since the continuation's tail does not
-            // reference its own address.
+            // Build + program the continuation: the range at revision 1,
+            // inheriting the caller's tail, carrying no gstate. Rebuilt each
+            // attempt (the alloc clobbered the build buffer); the bytes are
+            // identical since the continuation's tail does not reference its
+            // own address.
             let cont_len = if active_is_a {
                 build_compact_commit(
                     buf_b,
@@ -4151,8 +4572,8 @@ impl<S: Storage> Fs<S> {
                     slots,
                     count,
                     op,
-                    split,
-                    total,
+                    lo,
+                    hi,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
                     None,
@@ -4167,8 +4588,8 @@ impl<S: Storage> Fs<S> {
                     slots,
                     count,
                     op,
-                    split,
-                    total,
+                    lo,
+                    hi,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
                     None,
@@ -4189,22 +4610,57 @@ impl<S: Storage> Fs<S> {
             // image there cannot masquerade as a newer revision.
             let b_ok = a_ok && self.storage.erase(cb.as_u32()).is_ok();
             if a_ok && b_ok {
-                break cont;
+                // Promote the worn candidates this call recorded into the
+                // caller's persistent prefix; the scratch slot at `ex` holds
+                // `ca`, which the caller overwrites with the pair proper.
+                *base = ex;
+                return Ok(cont);
             }
             // A continuation block is worn: exclude it and retry. The other
             // (good, possibly already-written) block is abandoned as a
             // blank/unreferenced orphan and reclaimed by the next scan.
             self.used_cache = None;
-            tries += 1;
-            if tries >= MAX_BAD_BLOCK_RETRIES {
+            *tries += 1;
+            if *tries >= MAX_BAD_BLOCK_RETRIES || ex + 1 >= excluded.len() {
                 return Err(Error::Io);
             }
             let worn = if a_ok { cb } else { ca };
             excluded[ex] = worn;
             ex += 1;
-        };
+        }
+    }
 
-        // Make the continuation durable before the linearizing commit, so
+    /// Program the split's lower portion `[0, split)` onto the original
+    /// pair's alternate, ending in a `HardTail` to `cont` (the newest
+    /// continuation) and carrying the original's gstate. This program is the
+    /// split's linearization point: every continuation is already durable
+    /// and unreferenced, and this commit is what makes the chain reachable.
+    ///
+    /// Returns `Ok(None)` for the normal in-place case, or
+    /// `Ok(Some(new_pair))` when the alternate turned out to be worn and the
+    /// original relocated onto a fresh block, which the caller propagates to
+    /// the parent. `excluded_conts` holds the split's already-allocated
+    /// blocks so the relocation cannot land on one.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_split_lower_half(
+        &mut self,
+        pair_addr: BlockPair,
+        alternate_addr: BlockAddress,
+        active_is_a: bool,
+        new_revision: u32,
+        slots: &[SlotOffsets; MAX_LIVE_ENTRIES],
+        count: usize,
+        op: &WriteOp<'_>,
+        split: usize,
+        cont: BlockPair,
+        ms_arg: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
+        rs_arg: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
+        inflight: Inflight<'_>,
+        excluded_conts: &[BlockAddress],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<Option<BlockPair>, Error> {
+        // Make every continuation durable before the linearizing commit, so
         // a reordering device cannot expose a HardTail to a not-yet-written
         // continuation (mirrors mkdir's sync between the new dir and the
         // parent commit).
@@ -4214,7 +4670,7 @@ impl<S: Storage> Fs<S> {
         // ending in a HardTail (split bit set) to the continuation, carrying
         // the original's gstate. Programming this block (higher revision,
         // CCRC-valid) is the split's linearization point — the moment the
-        // continuation becomes reachable.
+        // continuation chain becomes reachable.
         let low_len = if active_is_a {
             build_compact_commit(
                 buf_b,
@@ -4277,19 +4733,10 @@ impl<S: Storage> Fs<S> {
         if pair_addr == self.root {
             return Err(Error::Io);
         }
-        // The continuation blocks are allocated but not yet reachable; keep
-        // the relocation's fresh allocation off them.
-        let mut reloc_inflight = [BlockAddress::NONE; 2 + crate::alloc::MAX_QUEUED_PAIRS];
-        reloc_inflight[0] = cont.a;
-        reloc_inflight[1] = cont.b;
-        let mut rl = 2;
-        for &b in inflight.blocks {
-            if rl >= reloc_inflight.len() {
-                return Err(Error::OutOfRange);
-            }
-            reloc_inflight[rl] = b;
-            rl += 1;
-        }
+        // Every continuation this split cut is allocated but not yet
+        // reachable; keep the relocation's fresh allocation off all of them.
+        // `excluded_conts` already carries the caller's own in-flight blocks
+        // (the split copied them in first), so it subsumes `inflight.blocks`.
         let new_pair = self.relocate_compact_to_fresh(
             pair_addr,
             alternate_addr,
@@ -4303,7 +4750,7 @@ impl<S: Storage> Fs<S> {
             ms_arg,
             rs_arg,
             Some((cont, true)),
-            Inflight { blocks: &reloc_inflight[..rl], chain: inflight.chain },
+            Inflight { blocks: excluded_conts, chain: inflight.chain },
             None,
             buf_a,
             buf_b,
@@ -4554,7 +5001,8 @@ impl<S: Storage> Fs<S> {
         };
         let dir_pair = {
             let p = MetadataPair::parse(owner.a, &*buf_a, owner.b, &*buf_b)?;
-            let resolved = crate::dir::lookup(&p, leaf.as_bytes()).ok_or(Error::NotFound)?;
+            let resolved =
+                crate::dir::lookup_checked(&p, leaf.as_bytes())?.ok_or(Error::NotFound)?;
             if resolved.struct_type != crate::tag::TagType::DirStruct
                 || resolved.struct_body.len() != 8
             {
@@ -4897,7 +5345,25 @@ impl<S: Storage> Fs<S> {
     /// After this call returns, `storage` can be passed to [`Fs::mount`]
     /// to obtain a usable handle. Block `1` is left in pristine erased
     /// state to serve as the metadata pair's alternate.
+    ///
+    /// # Geometry
+    ///
+    /// `S` must satisfy the [`crate::geometry`] preconditions, chiefly
+    /// the 128 byte block size floor the CTZ skip pointer header
+    /// forces and the C reference asserts. The check is a compile time
+    /// one: this function names
+    /// [`crate::geometry::Geometry::CHECK`], so formatting a device the
+    /// kernel cannot compute with is a build error, not a corrupt
+    /// image. [`Error::GeometryMismatch`] is the runtime backstop for
+    /// the same predicate, and is also what a `scratch` shorter than
+    /// one block reports.
     pub fn format(storage: &mut S, scratch: &mut [u8]) -> Result<(), Error> {
+        // Geometry gate, before any arithmetic that trusts the
+        // constants. Naming the const is what makes a device the kernel
+        // cannot compute with a compile error; the `validate` call is
+        // the folded-away backstop. See `crate::geometry`.
+        let () = crate::geometry::Geometry::<S>::CHECK;
+        crate::geometry::validate::<S>()?;
         if scratch.len() < S::BLOCK_SIZE {
             return Err(Error::GeometryMismatch);
         }
@@ -4977,11 +5443,19 @@ impl<S: Storage> Fs<S> {
     /// | Variant | Meaning | Suggested action |
     /// |---|---|---|
     /// | [`Error::Io`] | The `storage.read` call failed. | Retry on a transient device fault, or escalate. |
-    /// | [`Error::GeometryMismatch`] | Buffers are the wrong size, **or** the on-disk superblock's `block_size` / `block_count` differs from the [`Storage`] trait's advertised values. | Caller bug (wrong buffer length) or wrong-chip-for-image. Do not auto-format. |
+    /// | [`Error::GeometryMismatch`] | Buffers are the wrong size, **or** the on-disk superblock's `block_size` / `block_count` differs from the [`Storage`] trait's advertised values, **or** the device's geometry violates a [`crate::geometry`] precondition. | Caller bug (wrong buffer length) or wrong-chip-for-image. Do not auto-format. |
     /// | [`Error::Unformatted`] | Both blocks of the root pair are pristine `0xFF`. The device has never been programmed (fresh chip, post-full-erase). | Call [`Fs::format`] and retry, *if* the caller owns the formatting decision. |
     /// | [`Error::Corrupt`] | At least one block has been programmed, but neither block has a successfully verified CCRC commit. Bit rot, torn erase, or third-party-tool damage. | Escalate to a recovery path; do not auto-format. |
     /// | [`Error::NotLittleFs`] | Both blocks parse cleanly (valid CCRC commits) but the [`crate::MAGIC`] NAME tag is absent. The blocks hold someone else's metadata format. | Escalate; this is the "wrong filesystem on this chip" case. |
     /// | [`Error::UnsupportedVersion`] | Magic + superblock present, but the version word is newer than this crate. The contained value is the encoded version. | Escalate; cannot read forward-version data safely. |
+    ///
+    /// The geometry row is the one a caller rarely sees, because the
+    /// same preconditions are gated at compile time: `Fs::mount` names
+    /// [`crate::geometry::Geometry::CHECK`], so a `Storage` whose
+    /// constants the kernel cannot compute with (a block size below the
+    /// 128 byte CTZ floor, a block size off the program grid, a zero
+    /// read or program size) fails to build rather than failing to
+    /// mount. The runtime row remains as the backstop.
     ///
     /// `Error::Unformatted` versus `Error::Corrupt` is the key
     /// distinction for production boot logic: an `Unformatted` device
@@ -4994,6 +5468,14 @@ impl<S: Storage> Fs<S> {
         block_a_buf: &mut [u8],
         block_b_buf: &mut [u8],
     ) -> Result<Self, Error> {
+        // Geometry gate, before any arithmetic that trusts the
+        // constants. Naming the const is what makes a device the kernel
+        // cannot compute with a compile error; the `validate` call is
+        // the folded-away backstop. Every other method on `Fs` is
+        // reachable only through a handle this function returns, so the
+        // whole surface inherits the check. See `crate::geometry`.
+        let () = crate::geometry::Geometry::<S>::CHECK;
+        crate::geometry::validate::<S>()?;
         if block_a_buf.len() != S::BLOCK_SIZE || block_b_buf.len() != S::BLOCK_SIZE {
             return Err(Error::GeometryMismatch);
         }
@@ -5108,11 +5590,14 @@ impl<S: Storage> Fs<S> {
             let Some(next) = next else {
                 break;
             };
-            if tree[..tree_count].contains(&next) {
+            if crate::block::contains_pair(&tree[..tree_count], next) {
                 // A live threaded directory; advance, but stop on a cycle
                 // (leave the corrupt thread as-is for the resolution path
-                // to reject).
-                if visited[..visited_count].contains(&next) {
+                // to reject). Both membership tests compare physical block
+                // sets: a thread successor named in the opposite order to
+                // the tree's copy is the same live directory, and reading
+                // it as absent would drop it from the thread (review L7).
+                if crate::block::contains_pair(&visited[..visited_count], next) {
                     break;
                 }
                 if visited_count < crate::alloc::MAX_QUEUED_PAIRS {
@@ -5200,7 +5685,7 @@ impl<S: Storage> Fs<S> {
             crate::alloc::MAX_QUEUED_PAIRS];
         let tree_count =
             collect_live_tree_pairs(&mut self.storage, self.root, &mut tree, buf_a, buf_b)?;
-        let target = if tree[..tree_count].contains(&src_pair) {
+        let target = if crate::block::contains_pair(&tree[..tree_count], src_pair) {
             src_pair
         } else {
             relocated_twin_in(&mut self.storage, &tree[..tree_count], src_pair, buf_a, buf_b)?
@@ -5386,7 +5871,7 @@ impl<S: Storage> Fs<S> {
             // back to re-read. Scope it tightly.
             let tail_to_follow = {
                 let pair = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
-                if crate::dir::lookup(&pair, leaf_name.as_bytes()).is_some() {
+                if crate::dir::lookup_checked(&pair, leaf_name.as_bytes())?.is_some() {
                     None
                 } else if pair.reader.is_hard_tail() {
                     pair.reader.tail()
@@ -5401,7 +5886,7 @@ impl<S: Storage> Fs<S> {
             }
             // Found here; re-parse to produce the returned 'b-lifetime view.
             let pair = MetadataPair::parse(current.a, buf_a, current.b, buf_b)?;
-            let resolved = crate::dir::lookup(&pair, leaf_name.as_bytes()).expect(
+            let resolved = crate::dir::lookup_checked(&pair, leaf_name.as_bytes())?.expect(
                 "lookup succeeded once already in this iteration; the data has not changed",
             );
             return Ok(ResolvedPath {
@@ -5449,7 +5934,7 @@ impl<S: Storage> Fs<S> {
             let count: usize;
             {
                 let pair = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
-                hit = crate::dir::lookup(&pair, name).map(|r| (r.entry.id, r.entry.kind));
+                hit = crate::dir::lookup_checked(&pair, name)?.map(|r| (r.entry.id, r.entry.kind));
                 // Only a HardTail continues this directory; a SoftTail is
                 // the next directory in the global thread, not part of
                 // this chain.
@@ -5503,7 +5988,7 @@ impl<S: Storage> Fs<S> {
             self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
             self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
             let pair = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
-            if let Some(resolved) = crate::dir::lookup(&pair, name) {
+            if let Some(resolved) = crate::dir::lookup_checked(&pair, name)? {
                 if resolved.entry.kind != crate::dir::EntryKind::Directory {
                     return Err(Error::NotFound);
                 }
@@ -5739,5 +6224,228 @@ mod split_point_tests {
                 .unwrap(),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod corrupt_splice_resolve_tests {
+    //! Review L4 (bead `lfs-ceq`): [`Fs::resolve`] must report a metadata
+    //! pair whose splice stream cannot be replayed as [`Error::Corrupt`],
+    //! never as [`Error::NotFound`]. A caller told a name is absent goes
+    //! on to create it, and that create lands in a pair whose entry
+    //! roster is already unreadable.
+    //!
+    //! # Why the handle is built directly rather than mounted
+    //!
+    //! [`Fs::mount`] runs `accumulate_gstate` over every reachable pair,
+    //! and that sweep already walks each pair through
+    //! `gather_live_slots`, which propagates the same rejection. So today
+    //! an image corrupted this way fails at mount and never reaches
+    //! `resolve`. That shadow is a property of the current mount
+    //! sequence, not of `resolve`, and nothing in `resolve`'s contract
+    //! promises the tree was pre screened. These tests therefore build
+    //! the handle over the corrupt device directly, isolating the unit
+    //! under test from an unrelated gate.
+
+    use super::{Fs, ROOT_BLOCK_PAIR};
+    use crate::block::BlockAddress;
+    use crate::error::Error;
+    use crate::meta::{Commit, MetadataPair};
+    use crate::path::Path;
+    use crate::storage::Storage;
+    use crate::superblock::Superblock;
+    use crate::tag::{Tag, TagType};
+
+    const BS: usize = 256;
+    const BC: u32 = 8;
+
+    /// Fixed capacity NOR backing: eight 256 byte blocks, program only
+    /// clears bits, erase restores them. Enough device for a formatted
+    /// root pair holding one inline file.
+    struct Dev {
+        data: [u8; BS * BC as usize],
+    }
+
+    impl Dev {
+        fn new() -> Self {
+            Self { data: [0xFFu8; BS * BC as usize] }
+        }
+    }
+
+    impl Storage for Dev {
+        type Error = ();
+        const READ_SIZE: usize = 16;
+        const PROG_SIZE: usize = 16;
+        const BLOCK_SIZE: usize = BS;
+        const BLOCK_COUNT: u32 = BC;
+        const CACHE_SIZE: usize = 64;
+        const LOOKAHEAD_SIZE: usize = 8;
+
+        fn read(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), ()> {
+            let start = block as usize * BS + off as usize;
+            if start + buf.len() > self.data.len() {
+                return Err(());
+            }
+            buf.copy_from_slice(&self.data[start..start + buf.len()]);
+            Ok(())
+        }
+
+        fn program(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), ()> {
+            let start = block as usize * BS + off as usize;
+            if start + data.len() > self.data.len() {
+                return Err(());
+            }
+            for (existing, &new) in self.data[start..start + data.len()].iter_mut().zip(data) {
+                assert_eq!(*existing & new, new, "NOR program flipped a 0 bit to 1");
+                *existing &= new;
+            }
+            Ok(())
+        }
+
+        fn erase(&mut self, block: u32) -> Result<(), ()> {
+            let start = block as usize * BS;
+            if start + BS > self.data.len() {
+                return Err(());
+            }
+            for b in &mut self.data[start..start + BS] {
+                *b = 0xFF;
+            }
+            Ok(())
+        }
+    }
+
+    /// An id no two entry root pair ever created, so the `Delete` naming
+    /// it is unambiguously a corrupt splice rather than a stale but
+    /// replayable log.
+    const PHANTOM_ID: u16 = 200;
+
+    /// Format a device, write `/keep`, and return the device plus its
+    /// superblock. The superblock is captured from the healthy mount so
+    /// the corrupt handle can be built without mounting again.
+    fn formatted_device() -> (Dev, Superblock) {
+        let mut dev = Dev::new();
+        let mut scratch = [0u8; BS];
+        Fs::format(&mut dev, &mut scratch).unwrap();
+        let mut buf_a = [0u8; BS];
+        let mut buf_b = [0u8; BS];
+        let mut fs = Fs::mount(dev, &mut buf_a, &mut buf_b).unwrap();
+        let mut a = [0u8; BS];
+        let mut b = [0u8; BS];
+        fs.write_to_path(Path::new("/keep").unwrap(), b"v", &mut a, &mut b).unwrap();
+        let sb = *fs.superblock();
+        (fs.into_storage(), sb)
+    }
+
+    /// Append one more commit to the root pair's active block carrying a
+    /// `Delete` of [`PHANTOM_ID`]. The bytes past the committed end are
+    /// still erased, so this is the same shape an appending writer
+    /// produces, with one tag the splice replay cannot accept.
+    fn corrupt_root_splice(dev: &mut Dev) {
+        let mut block_a = [0u8; BS];
+        let mut block_b = [0u8; BS];
+        block_a.copy_from_slice(&dev.data[0..BS]);
+        block_b.copy_from_slice(&dev.data[BS..2 * BS]);
+        let (active, end, ptag) = {
+            let pair =
+                MetadataPair::parse(BlockAddress::new(0), &block_a, BlockAddress::new(1), &block_b)
+                    .unwrap();
+            (pair.active_block.as_u32(), pair.reader.committed_end(), pair.reader.next_ptag())
+        };
+        let mut block = if active == 0 { block_a } else { block_b };
+        {
+            let mut commit = Commit::new_appending(&mut block, end, ptag).unwrap();
+            commit.tag(Tag::new(true, TagType::Delete, PHANTOM_ID, 0), &[]).unwrap();
+            commit.finish(0).unwrap();
+        }
+        let base = active as usize * BS;
+        dev.data[base..base + BS].copy_from_slice(&block);
+    }
+
+    /// Build a handle over `dev` without the mount time sweep.
+    fn handle(dev: Dev, sb: Superblock) -> Fs<Dev> {
+        Fs {
+            storage: dev,
+            superblock: sb,
+            root: ROOT_BLOCK_PAIR,
+            used_cache: None,
+            pending_move: None,
+        }
+    }
+
+    /// The appended commit really does verify, so the `Delete` reaches
+    /// the entry walk. Without this the rest of the module tests nothing.
+    #[test]
+    fn the_appended_commit_verifies() {
+        let (mut dev, _sb) = formatted_device();
+        corrupt_root_splice(&mut dev);
+        let mut block_a = [0u8; BS];
+        let mut block_b = [0u8; BS];
+        block_a.copy_from_slice(&dev.data[0..BS]);
+        block_b.copy_from_slice(&dev.data[BS..2 * BS]);
+        let pair =
+            MetadataPair::parse(BlockAddress::new(0), &block_a, BlockAddress::new(1), &block_b)
+                .unwrap();
+        let hits = pair
+            .reader
+            .iter_tags()
+            .filter(|e| e.tag.tag_type() == TagType::Delete && e.tag.id() == PHANTOM_ID)
+            .count();
+        assert_eq!(hits, 1, "the appended Delete must sit inside a verified commit");
+    }
+
+    /// The finding. Before the fix this returned `NotFound`.
+    #[test]
+    fn resolve_reports_corrupt_not_notfound() {
+        let (mut dev, sb) = formatted_device();
+        corrupt_root_splice(&mut dev);
+        let mut fs = handle(dev, sb);
+        let mut a = [0u8; BS];
+        let mut b = [0u8; BS];
+        let err = fs.resolve(Path::new("/keep").unwrap(), &mut a, &mut b).unwrap_err();
+        assert_eq!(err, Error::Corrupt, "a corrupt splice stream must not read as a missing entry");
+    }
+
+    /// `exists` derives from `resolve`, so the corruption must not be
+    /// laundered into a calm `Ok(false)` that invites a create.
+    #[test]
+    fn exists_propagates_corrupt() {
+        let (mut dev, sb) = formatted_device();
+        corrupt_root_splice(&mut dev);
+        let mut fs = handle(dev, sb);
+        let mut a = [0u8; BS];
+        let mut b = [0u8; BS];
+        let err = fs.exists(Path::new("/anything").unwrap(), &mut a, &mut b).unwrap_err();
+        assert_eq!(err, Error::Corrupt);
+    }
+
+    /// `read_at_path` resolves first, so it inherits the same verdict.
+    #[test]
+    fn read_at_path_propagates_corrupt() {
+        let (mut dev, sb) = formatted_device();
+        corrupt_root_splice(&mut dev);
+        let mut fs = handle(dev, sb);
+        let mut a = [0u8; BS];
+        let mut b = [0u8; BS];
+        let mut out = [0u8; 8];
+        let err =
+            fs.read_at_path(Path::new("/keep").unwrap(), 0, &mut out, &mut a, &mut b).unwrap_err();
+        assert_eq!(err, Error::Corrupt);
+    }
+
+    /// The healthy device is unaffected by the routing change: a present
+    /// name resolves and an absent one is still `NotFound`.
+    #[test]
+    fn healthy_device_is_unaffected() {
+        let (dev, sb) = formatted_device();
+        let mut fs = handle(dev, sb);
+        let mut a = [0u8; BS];
+        let mut b = [0u8; BS];
+        let hit = fs.resolve(Path::new("/keep").unwrap(), &mut a, &mut b).unwrap();
+        assert_eq!(hit.entry.name, b"keep");
+        assert_eq!(hit.struct_body, b"v");
+        let err = fs.resolve(Path::new("/gone").unwrap(), &mut a, &mut b).unwrap_err();
+        assert_eq!(err, Error::NotFound, "an absent name on a healthy pair is still NotFound");
+        assert!(fs.exists(Path::new("/keep").unwrap(), &mut a, &mut b).unwrap());
+        assert!(!fs.exists(Path::new("/gone").unwrap(), &mut a, &mut b).unwrap());
     }
 }

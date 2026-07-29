@@ -16,6 +16,7 @@ One line per entry; content lives in the entries, never here. Schema and convent
 
 - [crc32-iso-hdlc](crc32-iso-hdlc.md) — the littlefs CRC variant anchored to the CRC RevEng catalogue check value
 - [brent-1980-cycle-detection](brent-1980-cycle-detection.md) — Brent's cycle detection behind the ADR-0009 tail walk
+- [closed-set-registries](closed-set-registries.md) — the tag types, entry kinds, and format constants this crate mirrors, their authority, and what the error set deliberately does not mirror
 
 ## History and frame
 
@@ -36,7 +37,7 @@ Post mortems are written at fix time, in the same slice as the fix; crash consis
 
 ## Named gaps
 
-- The closed set registries (tag types in `src/tag.rs`, error kinds in `src/error.rs`, format constants in `src/lib.rs`) are hand maintained against the pinned SPEC.md; generators that emit them from a single table are preferred and deferred (tracker id lfs-432 at the time of writing).
-- Registry hashes and pointers are checked structurally by `tests/registry.rs` only; CI verification that recorded sha256 values still match and archived URLs still resolve is deferred (lfs-lrs).
+- The closed set registries (tag types in `src/tag.rs`, error kinds in `src/error.rs`, format constants in `src/lib.rs`) remain hand maintained, but they are no longer unguarded: `tests/closed_sets.rs` pins each set per bucket and cross checks it against the pinned oracle in both directions, and the `closed-set-registries` entry records the authority and the limits. Emitting the declarations themselves from a single table is still preferred and still deferred; the guard closes the drift risk that made it urgent.
+- Registry hashes and pointers are checked beyond structure now: `tools/check_references.sh` verifies every recorded sha256 against the vendored artifact on each push, and `tools/probe_reference_links.sh` probes canonical and archived URLs weekly. The residual gap is what a hash cannot see: a pointer only source whose retrieved copy lives nowhere in this tree (the JFFS2 and YAFFS papers) is recorded but unverifiable here, and a URL that resolves is not a URL whose content still says what was cited.
 - No flash vendor app notes are cited yet; when the allocator or wear discussion first leans on one, it enters this registry in the same slice.
 - Philosophy entries (conviviality, permacomputing, maintenance culture) are absent by design; they are copied from the downstream master registry, not authored here.

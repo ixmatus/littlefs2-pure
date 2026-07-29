@@ -85,8 +85,16 @@ use crate::{BlockAddress, Fs};
 /// - [`OpenOptions::truncate`] — drop existing content on open.
 ///   Requires `write`. Has no effect on missing files.
 /// - [`OpenOptions::create`] — create the file if missing. The parent
-///   directory must already exist. Has no effect when the file is
-///   already present.
+///   directory must already exist. Requires `write`. Has no effect
+///   when the file is already present.
+///
+/// Both `create` and `truncate` mutate the device, so
+/// [`Fs::open`](crate::Fs::open) rejects either one unless the access
+/// mode also grants write. This matches `std::fs::OpenOptions`, which
+/// fails with `InvalidInput` when `create`, `create_new`, or
+/// `truncate` is set and the access mode names neither `write` nor
+/// `append`. Without that rule a nominally read only open would
+/// program flash.
 // Five bool fields mirror `std::fs::OpenOptions` semantics one-for-one
 // (read / write / append / truncate / create). The shape is the
 // standard library's, so the same lint allowance applies here.
@@ -133,7 +141,11 @@ impl OpenOptions {
     }
 
     /// Set the truncate flag. Drops existing content to zero bytes on
-    /// open. Requires [`Self::write`].
+    /// open.
+    ///
+    /// Requires [`Self::write`] (which [`Self::append`] also sets).
+    /// A truncating open without write access is rejected by
+    /// [`Fs::open`](crate::Fs::open) with [`Error::InvalidPath`].
     #[must_use]
     pub const fn truncate(mut self, on: bool) -> Self {
         self.truncate = on;
@@ -141,6 +153,12 @@ impl OpenOptions {
     }
 
     /// Set the create flag. Creates the file if it does not exist.
+    ///
+    /// Requires [`Self::write`] (which [`Self::append`] also sets).
+    /// A creating open without write access is rejected by
+    /// [`Fs::open`](crate::Fs::open) with [`Error::InvalidPath`],
+    /// because materializing the entry programs the parent metadata
+    /// pair and a read only open must never touch the device.
     #[must_use]
     pub const fn create(mut self, on: bool) -> Self {
         self.create = on;
@@ -213,6 +231,8 @@ impl<S: Storage> Fs<S> {
     /// - **Append**: write at end of file. Combine with `truncate`
     ///   to start from empty.
     /// - **Create**: allocate a fresh empty file when missing.
+    ///   Requires write access, since materializing the entry
+    ///   programs the parent metadata pair.
     ///
     /// Opening an existing **inline** file (one whose content lives
     /// directly in an `InlineStruct` body inside the metadata pair)
@@ -226,8 +246,11 @@ impl<S: Storage> Fs<S> {
     ///
     /// - [`Error::GeometryMismatch`] if either buffer is the wrong size.
     /// - [`Error::InvalidPath`] for the root path, empty names, or
-    ///   conflicting mode flags (e.g. `truncate` without `write`,
-    ///   neither `read` nor `write`).
+    ///   conflicting mode flags: neither `read` nor `write`,
+    ///   `truncate` without `write`, or `create` without `write`.
+    ///   The last two are the device mutating flags, and rejecting
+    ///   them without write access is what keeps a read only open
+    ///   from programming flash.
     /// - [`Error::NotFound`] if the parent directory or, for
     ///   non-creating modes, the file itself does not exist.
     /// - [`Error::AlreadyExists`] if `path` resolves to a directory.
@@ -246,7 +269,18 @@ impl<S: Storage> Fs<S> {
         if !options.read && !options.write {
             return Err(Error::InvalidPath);
         }
-        if options.truncate && !options.write {
+        // `create` and `truncate` both mutate the device, so both need
+        // write access. This is `std::fs::OpenOptions`'s creation-mode
+        // rule: it rejects `create`, `create_new`, and `truncate` when
+        // the access mode grants neither `write` nor `append`. Testing
+        // `write` alone covers append here because `OpenOptions::append`
+        // sets `write`; an options value carrying `append` without
+        // `write` is one this crate refuses writes on everywhere else
+        // (see `File::write`), so it does not license a creation either.
+        // Before this check existed, `read(true).create(true)` was a
+        // read-only open that programmed the parent metadata pair
+        // (review L6).
+        if (options.create || options.truncate) && !options.write {
             return Err(Error::InvalidPath);
         }
 
@@ -273,7 +307,7 @@ impl<S: Storage> Fs<S> {
         }
         let existing: Existing = {
             let p = MetadataPair::parse(owner.a, &*buf_a, owner.b, &*buf_b)?;
-            match dir::lookup(&p, name) {
+            match dir::lookup_checked(&p, name)? {
                 None => Existing::Missing,
                 Some(r) => {
                     if r.entry.kind != dir::EntryKind::RegularFile {

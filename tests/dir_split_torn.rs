@@ -18,8 +18,29 @@
 //! no entry duplicated, and no pair reachable by following tails from
 //! the root missing from the tree (no leaked continuation). A second
 //! remount is stable (recovery is idempotent).
+//!
+//! `torn_multi_cut_directory_split_is_atomic_across_every_power_loss`
+//! sweeps the same window for a split that has to cut twice (review L1):
+//! a `set_attr` grows an entry the first cut would leave behind, so the
+//! writer programs two continuations before the single linearizing
+//! commit. The crash window is wider by one continuation, and the
+//! invariant is the same: nothing is reachable until the lower commit
+//! lands, so every tear reads as the pre-state or the post-state.
+//!
+//! The single-cut sweep runs under two tear models. The first tears at
+//! the kernel's program calls over a permissive RAM device. The second
+//! (review coverage item V4, bead `lfs-hki`) tears at the device's own
+//! program boundaries, with the injector inside `NorAlignedStorage`
+//! over a strict NOR device, and can leave the interrupted page half
+//! programmed. The second model is the finer one, because the
+//! alignment adapter splits each commit span the kernel programs in one
+//! call into `PROG_SIZE` windows; on this geometry that is roughly four
+//! device programs per kernel program call. Both counts are measured at
+//! run time by the respective `*_call_counts` helper, so neither sweep
+//! carries a frozen tally.
 
 use littlefs2_pure::meta::MetadataReader;
+use littlefs2_pure::storage::Storage;
 use littlefs2_pure::{BlockPair, Fs, Path};
 
 mod common;
@@ -37,7 +58,7 @@ fn buf() -> [u8; BS] {
 /// for that continuation.
 const ENTRIES: u32 = 16;
 
-fn scenario(fs: &mut Fs<TornWriteStorage>) {
+fn scenario<S: Storage>(fs: &mut Fs<S>) {
     let mut a = buf();
     let mut b = buf();
     let _ = fs.mkdir(Path::new("/d").unwrap(), &mut a, &mut b);
@@ -145,7 +166,7 @@ fn assert_no_thread_orphan(data: &[u8]) {
 /// names, asserting each reads back its one-byte content and that no name
 /// repeats. Returns `None` if the directory does not resolve (a valid
 /// pre-operation state where `/d` was not yet created).
-fn enumerate_dir(fs: &mut Fs<MemStorage>) -> Option<Vec<Vec<u8>>> {
+fn enumerate_dir<S: Storage>(fs: &mut Fs<S>) -> Option<Vec<Vec<u8>>> {
     let mut a = buf();
     let mut b = buf();
     if !fs.exists(Path::new("/d").unwrap(), &mut a, &mut b).ok()? {
@@ -173,6 +194,7 @@ fn enumerate_dir(fs: &mut Fs<MemStorage>) -> Option<Vec<Vec<u8>>> {
 
 #[test]
 fn torn_directory_split_is_atomic_across_every_power_loss() {
+    let scenario = scenario::<TornWriteStorage>;
     let (fmt_calls, scenario_calls) = common::torn_call_counts(scenario);
     assert!(scenario_calls > 0);
     // The scenario must actually split: a single 256-byte pair cannot hold
@@ -250,4 +272,243 @@ fn torn_directory_split_is_atomic_across_every_power_loss() {
         let names_b = enumerate_dir(&mut fs);
         assert_eq!(names_a, names_b, "directory state must be stable across remounts");
     }
+}
+
+// --- multi-cut split (review L1) -------------------------------------
+
+/// Attribute sizes that drive the pair into a state one cut cannot
+/// place. `MC_A0` and `MC_A1` grow entries 0 and 1 by log append, then
+/// `MC_TRIGGER` forces a compaction whose combined range is 304 bytes:
+/// the first cut leaves a 278-byte lower portion, which no 256-byte
+/// block holds, so a second cut has to follow. The byte accounting is
+/// spelled out in `tests/review_l1_split_recheck.rs`.
+const MC_A0: usize = 60;
+const MC_A1: usize = 60;
+const MC_TRIGGER: usize = 120;
+
+/// Names of the four entries the multi-cut scenario creates, in
+/// creation order.
+const MC_NAMES: [&str; 4] = ["0", "1", "2", "3"];
+
+fn multi_cut_scenario(fs: &mut Fs<TornWriteStorage>) {
+    let mut a = buf();
+    let mut b = buf();
+    let _ = fs.mkdir(Path::new("/d").unwrap(), &mut a, &mut b);
+    for name in MC_NAMES {
+        let p = format!("/d/{name}");
+        let _ = fs.write_to_path(Path::new(&p).unwrap(), b"", &mut a, &mut b);
+    }
+    let _ = fs.set_attr(Path::new("/d/0").unwrap(), 1, &[0xA0; MC_A0], &mut a, &mut b);
+    let _ = fs.set_attr(Path::new("/d/1").unwrap(), 1, &[0xA1; MC_A1], &mut a, &mut b);
+    let _ = fs.set_attr(Path::new("/d/0").unwrap(), 2, &[0xB0; MC_TRIGGER], &mut a, &mut b);
+}
+
+/// Read attribute `id` on `/d/<name>` and assert it is either absent
+/// (`Ok(0)`, the pre-state of that `set_attr`) or exactly `len` bytes of
+/// `fill` (its post-state). A partial value would mean a `set_attr`
+/// half-landed, which no split may allow. A tear before the entry was
+/// created leaves nothing to check.
+fn assert_attr_all_or_nothing(
+    fs: &mut Fs<MemStorage>,
+    name: &str,
+    id: u8,
+    len: usize,
+    fill: u8,
+    ctx: &str,
+) {
+    let mut a = buf();
+    let mut b = buf();
+    let mut out = [0u8; BS];
+    let path = format!("/d/{name}");
+    if !fs.exists(Path::new(&path).unwrap(), &mut a, &mut b).unwrap() {
+        return;
+    }
+    let n = fs.get_attr(Path::new(&path).unwrap(), id, &mut out, &mut a, &mut b).unwrap();
+    if n == 0 {
+        return;
+    }
+    assert_eq!(n, len, "{ctx}: attr {id} on {name} landed partially ({n} bytes)");
+    assert!(
+        out[..len].iter().all(|&x| x == fill),
+        "{ctx}: attr {id} on {name} landed with wrong content"
+    );
+}
+
+/// Enumerate `/d` for the multi-cut scenario: the surviving names must
+/// be an exact prefix of the creation order, with no duplicates.
+/// Returns `None` when `/d` does not resolve.
+fn enumerate_multi_cut_dir(fs: &mut Fs<MemStorage>, ctx: &str) -> Option<Vec<Vec<u8>>> {
+    let mut a = buf();
+    let mut b = buf();
+    if !fs.exists(Path::new("/d").unwrap(), &mut a, &mut b).ok()? {
+        return None;
+    }
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    fs.list_dir(Path::new("/d").unwrap(), |e| names.push(e.name.to_vec()), &mut a, &mut b).ok()?;
+    let mut sorted = names.clone();
+    sorted.sort();
+    let before = sorted.len();
+    sorted.dedup();
+    assert_eq!(before, sorted.len(), "{ctx}: a multi-cut split must not duplicate an entry");
+    for (i, name) in names.iter().enumerate() {
+        assert_eq!(
+            name.as_slice(),
+            MC_NAMES[i].as_bytes(),
+            "{ctx}: surviving entries must be an exact prefix of the write sequence, got {names:?}"
+        );
+    }
+    Some(names)
+}
+
+/// Length of `/d`'s HardTail chain in a raw image, counting the first
+/// pair. Three means the split cut twice.
+fn multi_cut_chain_len(data: &[u8]) -> u32 {
+    let root =
+        BlockPair::new(littlefs2_pure::BlockAddress::new(0), littlefs2_pure::BlockAddress::new(1));
+    let (children, _, _) = read_pair(data, root);
+    let mut cur = *children.first().expect("root must reference /d");
+    let mut chain = 1;
+    for _ in 0..8 {
+        let (_, tail, is_hard) = read_pair(data, cur);
+        match (is_hard, tail) {
+            (true, Some(next)) => {
+                chain += 1;
+                cur = next;
+            }
+            _ => break,
+        }
+    }
+    chain
+}
+
+#[test]
+fn torn_multi_cut_directory_split_is_atomic_across_every_power_loss() {
+    let (fmt_calls, scenario_calls) = common::torn_call_counts(multi_cut_scenario);
+    assert!(scenario_calls > 0);
+
+    // The scenario must actually cut twice on an untorn run, otherwise
+    // the sweep below would be covering the ordinary single-cut window
+    // again. Three pairs in the chain means two continuations.
+    {
+        let mut storage = MemStorage::new();
+        let mut scratch = buf();
+        Fs::format(&mut storage, &mut scratch).unwrap();
+        let mut ba = buf();
+        let mut bb = buf();
+        let mut fs = Fs::mount(storage, &mut ba, &mut bb).unwrap();
+        let mut a = buf();
+        let mut b = buf();
+        fs.mkdir(Path::new("/d").unwrap(), &mut a, &mut b).unwrap();
+        for name in MC_NAMES {
+            let p = format!("/d/{name}");
+            fs.write_to_path(Path::new(&p).unwrap(), b"", &mut a, &mut b).unwrap();
+        }
+        fs.set_attr(Path::new("/d/0").unwrap(), 1, &[0xA0; MC_A0], &mut a, &mut b).unwrap();
+        fs.set_attr(Path::new("/d/1").unwrap(), 1, &[0xA1; MC_A1], &mut a, &mut b).unwrap();
+        fs.set_attr(Path::new("/d/0").unwrap(), 2, &[0xB0; MC_TRIGGER], &mut a, &mut b)
+            .expect("the growing set_attr must re-split rather than fail");
+        let data = fs.into_storage();
+        assert_no_thread_orphan(&data.data);
+        assert_eq!(
+            multi_cut_chain_len(&data.data),
+            3,
+            "the scenario must produce a two-cut split (three pairs)"
+        );
+    }
+
+    for trigger in 1..=fmt_calls + scenario_calls + 2 {
+        let image = match common::run_torn_scenario(trigger, multi_cut_scenario) {
+            common::TornRun::TornFormat => {
+                assert!(
+                    trigger <= fmt_calls,
+                    "trigger {trigger}: format reported torn past its own \
+                     {fmt_calls} program calls"
+                );
+                continue;
+            }
+            common::TornRun::Image(image) => image,
+        };
+
+        let ctx = format!("multi-cut sweep trigger {trigger}");
+        let names_a = {
+            let mut fs =
+                common::mount_image_strict(image.clone(), &format!("{ctx}, first remount"));
+            let names = enumerate_multi_cut_dir(&mut fs, &ctx);
+            if names.is_some() {
+                assert_attr_all_or_nothing(&mut fs, "0", 1, MC_A0, 0xA0, &ctx);
+                assert_attr_all_or_nothing(&mut fs, "0", 2, MC_TRIGGER, 0xB0, &ctx);
+                assert_attr_all_or_nothing(&mut fs, "1", 1, MC_A1, 0xA1, &ctx);
+            }
+            let data = fs.into_storage();
+            assert_no_thread_orphan(&data.data);
+            names
+        };
+
+        let mut fs = common::mount_image_strict(image, &format!("{ctx}, second remount"));
+        let names_b = enumerate_multi_cut_dir(&mut fs, &ctx);
+        assert_eq!(names_a, names_b, "{ctx}: directory state must be stable across remounts");
+    }
+}
+
+/// The split sweep at DEVICE program granularity, with partial window
+/// landings (review coverage item V4, bead `lfs-hki`).
+///
+/// Same invariants as the kernel boundary sweep above: the image must
+/// mount, `/d` must hold an exact prefix of the write sequence with no
+/// duplicate and no unreadable entry, the tail thread must reach no
+/// pair outside the tree, and a second consecutive mount must answer
+/// the same. What changes is where the power cut lands: inside a real
+/// page program of the continuation write or of the parent repoint, and
+/// possibly with that page left half programmed.
+///
+/// Landing lengths come from `common::NOR_PARTIAL_LANDINGS`; that
+/// constant documents the sampling bound.
+#[test]
+fn torn_directory_split_is_atomic_across_every_nor_program_landing() {
+    let scenario = scenario::<common::NorTornStorage>;
+    let (fmt_calls, scenario_calls) = common::nor_torn_call_counts(scenario);
+    assert!(scenario_calls > 0);
+
+    let mut witness = common::PartialLandingWitness::new();
+    for partial in common::NOR_PARTIAL_LANDINGS {
+        for trigger in 1..=fmt_calls + scenario_calls + 2 {
+            let ctx = format!("nor split sweep trigger {trigger}, partial landing {partial}");
+            let image = match common::run_nor_torn_scenario(trigger, partial, scenario) {
+                common::TornRun::TornFormat => {
+                    assert!(
+                        trigger <= fmt_calls,
+                        "{ctx}: format reported torn past its own {fmt_calls} device programs"
+                    );
+                    continue;
+                }
+                common::TornRun::Image(image) => image,
+            };
+            witness.observe(partial, trigger, &image);
+
+            let names_a = {
+                let mut fs = common::mount_nor_image_strict(image.clone(), &ctx);
+                let names = enumerate_dir(&mut fs);
+                if let Some(names) = &names {
+                    for (i, name) in names.iter().enumerate() {
+                        assert_eq!(
+                            name,
+                            format!("f{i:02}").as_bytes(),
+                            "{ctx}: surviving entries must be an exact prefix of the \
+                             write sequence, got {names:?}"
+                        );
+                    }
+                }
+                assert_no_thread_orphan(&common::nor_image_of(fs));
+                names
+            };
+
+            let mut fs = common::mount_nor_image_strict(image, &format!("{ctx}, second remount"));
+            assert_eq!(
+                names_a,
+                enumerate_dir(&mut fs),
+                "{ctx}: directory state must be stable across remounts"
+            );
+        }
+    }
+    witness.assert_partials_landed("nor split sweep");
 }

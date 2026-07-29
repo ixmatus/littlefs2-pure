@@ -12,9 +12,19 @@
 //   split_dir - expect `/d/f00`..`/d/f13`, each body == "x" (a directory
 //               this crate split across a HardTail continuation; the C
 //               reference must chase the chain to find every entry)
+//   multi_cut - expect `/d/0`..`/d/3`, empty, with attributes 1 and 2 on
+//               `/d/0` and attribute 1 on `/d/1` (a directory this crate
+//               split with TWO cuts in one compaction; the C reference
+//               must chase both HardTail links and read every attribute)
 //   split_root- expect `/f00`..`/f11`, each body == "v" (the ROOT pair
 //               {0,1} split across a HardTail continuation; {0,1} stays the
 //               superblock anchor and the C reference chases its tail)
+//   null_tail - expect `/b/keep` == "KEEP" and `/a` absent, in an image
+//               this crate produced by removing the LAST directory in the
+//               global thread. Proves the oracle accepts our tag-absent
+//               spelling of thread end, where its own `lfs_dir_drop`
+//               writes an explicit all-ones tail body (review L9,
+//               `lfs-yl6`)
 //   mutate    - MOUNT a Rust image, WRITE into it (a small inline file and
 //               a CTZ-backed file), then dump the mutated image to a third
 //               argument path for Rust to remount and verify. Proves the
@@ -160,6 +170,36 @@ static int verify_file(lfs_t *lfs, const char *path,
     return 0;
 }
 
+// Read user attribute `id` on `path` and require exactly `len` bytes of
+// `fill`. Used by the multi_cut scenario, whose entries carry the
+// attributes that made the pair too large for a single cut.
+static int verify_attr(lfs_t *lfs, const char *path, uint8_t id,
+                       uint8_t fill, size_t len) {
+    uint8_t buf[256];
+    if (len > sizeof buf) {
+        fprintf(stderr, "verify_image: attr buffer too small\n");
+        return 1;
+    }
+    lfs_ssize_t n = lfs_getattr(lfs, path, id, buf, (lfs_size_t)len);
+    if (n < 0) {
+        fprintf(stderr, "verify_image: getattr %s id %u failed: %d\n", path, id, (int)n);
+        return 1;
+    }
+    if ((size_t)n != len) {
+        fprintf(stderr, "verify_image: attr %s id %u length: got %d expected %zu\n",
+                path, id, (int)n, len);
+        return 1;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (buf[i] != fill) {
+            fprintf(stderr, "verify_image: attr %s id %u byte %zu: got %02x expected %02x\n",
+                    path, id, i, buf[i], fill);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int load_image(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return 1; }
@@ -206,6 +246,14 @@ static int mutate_image(lfs_t *lfs) {
     return 0;
 }
 
+// lfs_fs_traverse callback: the traverse itself is the assertion (it
+// walks the whole global metadata thread and every CTZ chain, erroring
+// on any link it cannot fetch), so the callback only has to succeed.
+static int count_block(void *p, lfs_block_t block) {
+    (void)p; (void)block;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 3 && argc != 4) {
         fprintf(stderr, "usage: %s <image_path> <scenario> [<out_path>]\n", argv[0]);
@@ -248,6 +296,21 @@ int main(int argc, char **argv) {
             snprintf(path, sizeof path, "/d/f%02d", i);
             rc = verify_file(&lfs, path, (const uint8_t *)"x", 1);
         }
+    } else if (strcmp(argv[2], "multi_cut") == 0) {
+        // A directory this crate split with TWO cuts in one compaction
+        // (review L1): `/d/0` carries 180 bytes of attributes, so the
+        // first cut left a lower portion no block could hold and a second
+        // cut had to follow. The C reference must chase both HardTail
+        // links, find all four entries, and read every attribute back.
+        rc = 0;
+        for (int i = 0; i < 4 && rc == 0; i++) {
+            char path[16];
+            snprintf(path, sizeof path, "/d/%d", i);
+            rc = verify_file(&lfs, path, (const uint8_t *)"", 0);
+        }
+        if (rc == 0) rc = verify_attr(&lfs, "/d/0", 1, 0xA0, 60);
+        if (rc == 0) rc = verify_attr(&lfs, "/d/0", 2, 0xB0, 120);
+        if (rc == 0) rc = verify_attr(&lfs, "/d/1", 1, 0xA1, 60);
     } else if (strcmp(argv[2], "remove") == 0) {
         // Delete-tag wire compatibility (review C3): the image holds
         // /aa = "keep-me" and a REMOVED /bb. Before the fix the
@@ -279,6 +342,41 @@ int main(int argc, char **argv) {
             char path[16];
             snprintf(path, sizeof path, "/f%02d", i);
             rc = verify_file(&lfs, path, (const uint8_t *)"v", 1);
+        }
+    } else if (strcmp(argv[2], "null_tail") == 0) {
+        // Write-side half of the null tail interop question (lfs-yl6).
+        // The crate produced this image by `mkdir /a; mkdir /b;
+        // /b/keep; rmdir /a`, removing the last directory in the global
+        // thread. The C reference reaches the same state via
+        // `lfs_dir_drop` (lfs.c:1831), which writes an all-ones tail body;
+        // this crate instead compacts the predecessor and omits the tail
+        // tag. Both spell "thread ends here" and the C reader treats them
+        // identically, because every walk over dir->tail is gated on
+        // lfs_pair_isnull. This scenario is the proof of that claim in the
+        // direction the conformance vector cannot cover: the oracle must
+        // mount our spelling, see /b with its file, and NOT see /a.
+        rc = verify_file(&lfs, "/b/keep", (const uint8_t *)"KEEP", 4);
+        if (rc == 0) {
+            struct lfs_info info;
+            int st = lfs_stat(&lfs, "/a", &info);
+            if (st != LFS_ERR_NOENT) {
+                fprintf(stderr,
+                        "verify_image: /a should be removed but lfs_stat "
+                        "returned %d\n", st);
+                rc = 1;
+            }
+        }
+        // The un-threading must also leave the global list walkable: a
+        // traverse visits every threaded pair, so a predecessor left
+        // pointing at the dropped directory would surface here.
+        if (rc == 0) {
+            int st = lfs_fs_traverse(&lfs, count_block, NULL);
+            if (st != 0) {
+                fprintf(stderr,
+                        "verify_image: lfs_fs_traverse over the un-threaded "
+                        "global list failed: %d\n", st);
+                rc = 1;
+            }
         }
     } else {
         fprintf(stderr, "verify_image: unknown scenario %s\n", argv[2]);

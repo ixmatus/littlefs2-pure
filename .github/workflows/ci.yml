@@ -99,6 +99,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --target ${{ matrix.target }} --no-default-features
 
+  references:
+    # The deterministic half of the reference registry rot check: every
+    # sha256 recorded in docs/references/ must still match the artifact
+    # committed in this tree. It touches no network and needs no toolchain,
+    # so it is cheap enough to gate every push, and a mismatch is exactly
+    # the kind of silent drift that is worthless to discover late.
+    #
+    # The other half, probing whether the canonical and archived URLs still
+    # resolve, is deliberately NOT here. That probe depends on the health of
+    # a dozen third party hosts, so wiring it into the per push gate would
+    # let an unrelated outage fail an unrelated build. It runs weekly in
+    # reference-rot.yml instead.
+    name: reference registry hashes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: tools/check_references.sh
+
   conformance:
     name: C-reference conformance (consume committed vectors)
     runs-on: ubuntu-latest

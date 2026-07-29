@@ -1,0 +1,90 @@
+name: Reference rot
+
+# Probe the canonical and archived URLs recorded in docs/references/ and
+# report which ones have rotted.
+#
+# This runs on a schedule rather than on push, and the separation is the
+# whole point. Hash verification is deterministic and lives in the per push
+# gate (the `references` job in ci.yml). URL probing depends on the health of
+# a dozen third party hosts on any given morning, so putting it in the push
+# gate would let a publisher's bad afternoon fail a build that changed
+# nothing but a comment. A gate that fails for reasons the author cannot fix
+# is a gate people learn to click past.
+#
+# Weekly is the right cadence for link rot: documents disappear on the scale
+# of months, and the archived copy recorded at citation time is what makes a
+# dead canonical URL recoverable rather than fatal. Finding out within a week
+# is soon enough to save a fresh snapshot.
+
+on:
+  schedule:
+    # Mondays at 06:17 UTC. The odd minute avoids the top of the hour, when
+    # every scheduled workflow on the platform starts at once and runners
+    # queue.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Probe at most this many URLs (0 means all)"
+        required: false
+        default: "0"
+      kind:
+        description: "Which URLs to probe"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - canonical
+          - archived
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe canonical and archived URLs
+    runs-on: ubuntu-latest
+    # A publisher that stops answering should not leave the job hanging
+    # until the platform default timeout of six hours.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: probe recorded URLs
+        id: probe
+        run: |
+          set -o pipefail
+          tools/probe_reference_links.sh \
+            --limit "${{ github.event.inputs.limit || '0' }}" \
+            --kind "${{ github.event.inputs.kind || 'all' }}" \
+            --delay 2 \
+            --timeout 30 2>&1 | tee probe.log
+
+      - name: publish the probe summary
+        # Runs whether or not the probe failed: when something has rotted,
+        # the listing is the reason to look, so burying it in a failed step's
+        # log is precisely the wrong place for it.
+        if: always()
+        run: |
+          {
+            echo "## Reference link rot probe"
+            echo
+            echo "Registry: \`docs/references/\`. A 404, a 410, or a host that no longer"
+            echo "resolves fails this job. Everything else is reported and tolerated:"
+            echo "a 403 usually means a publisher dislikes automated clients rather than"
+            echo "that the document vanished."
+            echo
+            echo '```'
+            cat probe.log || echo "(the probe produced no output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload the probe log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reference-probe-log
+          path: probe.log
+          if-no-files-found: warn
+          retention-days: 90

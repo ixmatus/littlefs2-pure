@@ -31,6 +31,11 @@
 //! - `12_multimove_gstate`: two cross-directory renames into `/dst`
 //!   leave two `MOVESTATE` tags in one log; an XOR-accumulating reader
 //!   decodes a phantom pending move at mount (review C4).
+//! - `13_null_tail`: `mkdir /a`, `mkdir /b`, `/b/keep`, then `rmdir /a`
+//!   removes the last directory in the global thread, so the C
+//!   reference's `lfs_dir_drop` hands `/b` an explicit all-ones SoftTail
+//!   body; a reader that treats the sentinel as an address rejects the
+//!   image as `Corrupt` (review L9, `lfs-yl6`).
 //!
 //! The runner loads each vector into a `MemStorage`, mounts with our
 //! reader, and asserts the expected (name, kind, content) tuples.
@@ -82,6 +87,7 @@ const VECTOR_CRCS: &[(&str, u32)] = &[
     ("10_delete_tombstone.bin", 0xeb99_730e),
     ("11_compacted_rename.bin", 0x9e98_a6ee),
     ("12_multimove_gstate.bin", 0xf1b1_6107),
+    ("13_null_tail.bin", 0x8a06_ba04),
 ];
 
 /// Load a vector file's bytes into a fresh `MemStorage`. Panics on
@@ -408,6 +414,71 @@ fn vector_12_multimove_gstate_reads_latest_tag_wins() {
     let mut buf_b = common::make_buffer();
     let mut fs2 = Fs::mount(storage, &mut buf_a, &mut buf_b).expect("remount recovered image");
     check(&mut fs2);
+}
+
+#[test]
+fn vector_13_null_tail_mounts_and_reads() {
+    // `lfs_dir_drop` (lfs.c:1831) commits the dropped directory's tail
+    // body with no `lfs_pair_isnull` guard, so removing the LAST directory
+    // in the global thread hands its predecessor a literal all-ones
+    // SoftTail body. This image is that history: mkdir /a, mkdir /b (which
+    // threads root -> /b -> /a, mkdir inserting at the head), a file in
+    // /b, then rmdir /a. The surviving /b pair carries the sentinel.
+    //
+    // The C reader accepts it because every thread walk is gated on
+    // `lfs_pair_isnull(dir->tail)` before the pair is fetched. Reporting
+    // the sentinel to our walkers as a real address instead made mount
+    // return Corrupt on a conforming image (`lfs-yl6`).
+    let mut fs = mount(load("13_null_tail.bin"));
+    let mut a = common::make_buffer();
+    let mut b = common::make_buffer();
+
+    assert_eq!(root_names(&mut fs), vec![b"b".to_vec()], "/a was removed, /b survives");
+    assert!(!fs.exists(Path::new("/a").unwrap(), &mut a, &mut b).unwrap());
+
+    // The survivor is a directory, and its contents read back through the
+    // pair that carries the sentinel tail.
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    fs.list_dir(Path::new("/b").unwrap(), |e| names.push(e.name.to_vec()), &mut a, &mut b).unwrap();
+    assert_eq!(names, vec![b"keep".to_vec()]);
+    let mut scratch = [0u8; 8];
+    assert_eq!(read_inline(&mut fs, "/b/keep", &mut scratch), b"KEEP");
+}
+
+#[test]
+fn vector_13_null_tail_carries_the_explicit_sentinel() {
+    // Structural pin for the vector above: assert the image really does
+    // contain a committed tail tag whose body is all ones, so a future
+    // regeneration that happens to take the compacting path (which omits
+    // the tag, lfs.c:2003) cannot silently turn the mount test into a
+    // check of the ordinary tag-absent encoding.
+    //
+    // Read at the raw tag level rather than through `MetadataReader::tail`,
+    // which deliberately reports the sentinel as `None`.
+    let bytes = std::fs::read("tests/vectors/13_null_tail.bin").expect("read vector");
+    let bs = MemStorage::BLOCK_SIZE;
+    let mut found = false;
+    for blk in 0..MemStorage::BLOCK_COUNT as usize {
+        let block = &bytes[blk * bs..(blk + 1) * bs];
+        let Ok(reader) = littlefs2_pure::meta::MetadataReader::new(block) else { continue };
+        if !reader.has_commits() {
+            continue;
+        }
+        for tag in reader.iter_tags() {
+            if !matches!(tag.tag.tag_type(), TagType::SoftTail | TagType::HardTail) {
+                continue;
+            }
+            if tag.body.len() == 8 && tag.body == [0xFF; 8] {
+                found = true;
+            }
+        }
+    }
+    assert!(
+        found,
+        "13_null_tail.bin no longer carries an explicit all-ones tail body; \
+         regenerate the scenario so it exercises `lfs_dir_drop`'s unguarded \
+         tail commit, or the mount test below proves nothing new"
+    );
 }
 
 #[test]

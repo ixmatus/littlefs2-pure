@@ -154,10 +154,23 @@ pub enum TagType {
     Delete,
 
     // ---- CRC (0x5xx) ----
-    /// Commit CRC, `LFS2_TYPE_CCRC = 0x500..=0x503` (low two bits are the
-    /// erase state hint). The contained `u8` holds the chunk.
+    /// Commit CRC, `LFS2_TYPE_CCRC = 0x500..=0x57f`. The contained `u8`
+    /// holds the chunk, whose low bit is the erase state perturb hint.
+    ///
+    /// The accepted chunk range is the C reader's, not the C writer's.
+    /// `lfs_dir_fetchmatch` terminates a commit on
+    /// `lfs_tag_type2(tag) == LFS_TYPE_CCRC` (`lfs.c:1182`), and
+    /// `lfs_tag_type2` masks the type field with `0x780` (`lfs.c:347`),
+    /// so every chunk whose bit 7 is clear ends a commit. The C writer
+    /// emits only chunk `0x00` and `0x01` (`lfs.c:1715`); the wider
+    /// reader range is deliberate forward compatibility room, and a
+    /// reader that narrows it breaks the commit chain of an image a
+    /// future writer may legitimately produce. See the note on
+    /// [`Tag::is_ccrc`].
     CommitCrc(u8),
-    /// Forward CRC for the next commit, `LFS2_TYPE_FCRC = 0x5ff`.
+    /// Forward CRC for the next commit, `LFS2_TYPE_FCRC = 0x5ff`. Chunk
+    /// `0xff` has bit 7 set, so an FCRC is never also a commit CRC
+    /// (`lfs.c:1264` tests the full 11 bit type field).
     ForwardCrc,
 
     // ---- Tail (0x6xx) ----
@@ -213,7 +226,11 @@ impl TagType {
             (0x3, c) => Self::UserAttr(c),
             (0x4, 0x01) => Self::Create,
             (0x4, 0xff) => Self::Delete,
-            (0x5, c) if c <= 0x03 => Self::CommitCrc(c),
+            // Commit CRC acceptance follows the C reader's mask, not the
+            // narrower set of chunks the C writer currently emits: any
+            // chunk with bit 7 clear terminates a commit. See the
+            // [`TagType::CommitCrc`] doc for the derivation.
+            (0x5, c) if c & 0x80 == 0 => Self::CommitCrc(c),
             (0x5, 0xff) => Self::ForwardCrc,
             (0x6, 0x00) => Self::SoftTail,
             (0x6, 0x01) => Self::HardTail,
@@ -227,7 +244,9 @@ impl TagType {
     ///
     /// `from_bits(t.into_bits()) == t` for every `t` that does not require
     /// the `UserAttr(_)` or `CommitCrc(_)` variants to be in a range outside
-    /// their natural domain.
+    /// their natural domain. `CommitCrc`'s natural domain is chunk
+    /// `0x00..=0x7f`; a chunk with bit 7 set encodes a type field that
+    /// decodes back as [`TagType::ForwardCrc`] or [`TagType::Unknown`].
     #[must_use]
     pub const fn into_bits(self) -> u16 {
         let (abstract_type, chunk): (u8, u8) = match self {
@@ -401,15 +420,37 @@ impl Tag {
         4 + self.body_len()
     }
 
-    /// `true` if this is a commit CRC tag (type `0x500..=0x503`).
+    /// `true` if this is a commit CRC tag, the tag that terminates a
+    /// commit: type field `0x500..=0x57f`.
+    ///
+    /// # Why the range is that wide (review L2)
+    ///
+    /// The C reader's test is `lfs_tag_type2(tag) == LFS_TYPE_CCRC`
+    /// (`lfs.c:1182`, and again on the previous tag at `lfs.c:1173` for
+    /// the erased state decision), where `lfs_tag_type2` keeps only the
+    /// top four bits of the eleven bit type field via
+    /// `(tag & 0x78000000) >> 20` (`lfs.c:347`). Every chunk from `0x00`
+    /// through `0x7f` satisfies it. Only bit 0 of the chunk carries meaning
+    /// to the reader: it is the perturb bit XORed into bit 31 of the
+    /// running tag base (`lfs.c:1201`). The remaining chunk bits are
+    /// reserved space a future writer may use.
+    ///
+    /// The C writer emits only `0x500` and `0x501` today
+    /// (`lfs.c:1715`). Recognizing exactly what the current writer emits
+    /// would leave this reader unable to follow the commit chain of an
+    /// otherwise valid image, so the classification matches the C
+    /// reader's acceptance rule instead. Chunk `0xff` is
+    /// [`TagType::ForwardCrc`] and chunks `0x80..=0xfe` are ordinary
+    /// data tags to both readers.
     #[inline]
     #[must_use]
     pub const fn is_ccrc(self) -> bool {
         matches!(self.tag_type(), TagType::CommitCrc(_))
     }
 
-    /// If this is a [`TagType::CommitCrc`], returns its chunk byte (low 2
-    /// bits carry the erase state hint).
+    /// If this is a [`TagType::CommitCrc`], returns its chunk byte
+    /// (`0x00..=0x7f`, whose low bit carries the erase state perturb
+    /// hint).
     #[inline]
     #[must_use]
     pub const fn ccrc_chunk(self) -> Option<u8> {

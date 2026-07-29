@@ -14,7 +14,11 @@
 //! backward from the head and marking each block).
 //!
 //! Cycles are detected via the bitmap itself: a pair whose blocks
-//! are already marked is not enqueued again. The CTZ chain walk uses
+//! are already marked is not enqueued again. Pending-queue dedup
+//! compares physical block sets ([`crate::BlockPair::is_same_pair`]),
+//! not the ordered `(a, b)` tuple: order carries no meaning on disk, so
+//! an image naming one pair under both orders would otherwise burn two
+//! queue slots on one pair (review L7, `lfs-a8j`). The CTZ chain walk uses
 //! [`crate::ctz::skip_pointers_in_block`] and the
 //! `count = 2 - (index & 1)` rule from `lfs_ctz_traverse` so it stays
 //! O(N) in the chain length, with two skip-pointer reads per even
@@ -199,6 +203,19 @@ fn gather_live_structs(
 ///
 /// `buf_a` and `buf_b` are scratch buffers of `S::BLOCK_SIZE` each;
 /// they are reused for every pair read.
+///
+/// # Rejection of out-of-range pairs
+///
+/// Every pair address the walk decodes from disk (a `DirStruct` body,
+/// the pair's tail) is validated against `S::BLOCK_COUNT` before it is
+/// enqueued, and an address outside the device returns
+/// [`Error::Corrupt`]. This is the rejection the [`Storage`] trait's own
+/// documentation promises on the kernel's behalf, and it matches the C
+/// reference, whose `lfs_dir_fetchmatch` opens by returning
+/// `LFS_ERR_CORRUPT` for a pair with either block past `block_count`
+/// (review L9, `lfs-b2m`). Without it a corrupt or adversarial image
+/// surfaced as [`Error::Io`], which reads as a device fault rather than
+/// as the image corruption it is.
 pub fn scan_used_blocks<S: Storage>(
     storage: &mut S,
     root: BlockPair,
@@ -249,9 +266,21 @@ pub fn scan_used_blocks<S: Storage>(
                 1 => walk_ctz_chain(storage, ls.w0, ls.w1, used, buf_a)?,
                 2 => {
                     let child = BlockPair::new(BlockAddress::new(ls.w0), BlockAddress::new(ls.w1));
-                    // Skip pairs already marked (visited) or in-flight.
+                    // A live DirStruct naming a pair outside the device is
+                    // image corruption, not a device fault; reject before
+                    // the enqueue rather than reading through it (review
+                    // L9, `lfs-b2m`).
+                    if !crate::fs::pair_in_bounds::<S>(child) {
+                        return Err(Error::Corrupt);
+                    }
+                    // Skip pairs already marked (visited) or in-flight. The
+                    // in-flight test compares physical block sets, not the
+                    // ordered tuple: pair order carries no meaning on disk,
+                    // so `{a, b}` and `{b, a}` are one pair and enqueueing
+                    // both burns two of the bounded queue's slots on one
+                    // walk (review L7, `lfs-a8j`).
                     if (!used.is_set(child.a.as_u32()) || !used.is_set(child.b.as_u32()))
-                        && !child_pairs[..child_count].contains(&child)
+                        && !crate::block::contains_pair(&child_pairs[..child_count], child)
                     {
                         if child_count >= MAX_QUEUED_PAIRS {
                             return Err(Error::OutOfRange);
@@ -267,8 +296,18 @@ pub fn scan_used_blocks<S: Storage>(
         // or a SoftTail to the next directory in the global thread). The
         // tail is not an entry; `reader.tail()` is latest-wins.
         if let Some(t) = next_tail {
+            // A tail is a decoded on-disk pointer like any other and owes
+            // the same rejection (review L9, `lfs-b2m`). The all-ones
+            // sentinel never arrives here: `MetadataReader::tail` resolves
+            // it to `None` (thread end) at the decode, matching the C
+            // reader's `lfs_pair_isnull` gate, so `Some(t)` is always a
+            // genuine address claim. See `fs::pair_in_bounds` for the
+            // posture (`lfs-yl6`, `lfs-qeh`).
+            if !crate::fs::pair_in_bounds::<S>(t) {
+                return Err(Error::Corrupt);
+            }
             if (!used.is_set(t.a.as_u32()) || !used.is_set(t.b.as_u32()))
-                && !child_pairs[..child_count].contains(&t)
+                && !crate::block::contains_pair(&child_pairs[..child_count], t)
             {
                 if child_count >= MAX_QUEUED_PAIRS {
                     return Err(Error::OutOfRange);
@@ -285,7 +324,10 @@ pub fn scan_used_blocks<S: Storage>(
             // child and a tail successor is collected by two parents before
             // it is popped and marked used, so a blind enqueue would place
             // it in the bounded queue twice and spuriously overflow it.
-            if queue[head..tail].contains(child) {
+            // The membership test is over physical block sets, since a pair
+            // named `{a, b}` by one parent and `{b, a}` by another is one
+            // pair (review L7, `lfs-a8j`).
+            if crate::block::contains_pair(&queue[head..tail], *child) {
                 continue;
             }
             if tail >= MAX_QUEUED_PAIRS {
@@ -435,6 +477,14 @@ pub fn alloc_blocks_excluding<S: Storage>(
 /// commits parse there, and unions every referenced pair / CTZ chain.
 /// Blocks reachable from EITHER half of a pair are marked, so the
 /// result is a safe over-approximation of "in use".
+///
+/// Carries the same out-of-range rejection as [`scan_used_blocks`]: a
+/// decoded pair address outside `S::BLOCK_COUNT` returns
+/// [`Error::Corrupt`]. The rejection matters more here, because this
+/// walker follows RAW tags rather than the splice-corrected live view,
+/// so it reaches a `DirStruct` that a later `Delete` removed. An image
+/// carrying such a stale out-of-range body mounts cleanly and only
+/// reaches this walker on the next relocation (review L9, `lfs-b2m`).
 pub fn scan_used_with_single_buf<S: Storage>(
     storage: &mut S,
     root: BlockPair,
@@ -490,10 +540,33 @@ pub fn scan_used_with_single_buf<S: Storage>(
                             entry.body[6],
                             entry.body[7],
                         ]);
+                        let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
+                        // This walker reads RAW tags, so it decodes tail
+                        // bodies itself instead of going through
+                        // `MetadataReader::tail`, and owes the sentinel
+                        // reading directly: an all-ones body on a TAIL tag
+                        // is thread end, so there is nothing to enqueue.
+                        // The same body on a `DirStruct` is not thread end
+                        // and carries no meaning at all, so it falls
+                        // through to the bounds check and is rejected
+                        // (`lfs-yl6`; see `fs::pair_in_bounds`).
+                        let is_tail =
+                            matches!(entry.tag.tag_type(), TagType::HardTail | TagType::SoftTail);
+                        if is_tail && child.is_null() {
+                            continue;
+                        }
+                        // Reject an out-of-range pair before the "already
+                        // marked" guard can swallow it: `Bitmap::is_set`
+                        // answers `true` past its 4096-entry cap, so a far
+                        // out-of-range address used to be silently accepted
+                        // here while a nearer one was dereferenced into an
+                        // `Io` (review L9, `lfs-b2m`).
+                        if !crate::fs::pair_in_bounds::<S>(child) {
+                            return Err(Error::Corrupt);
+                        }
                         if !used.is_set(a) || !used.is_set(b) {
-                            let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
                             // Dedup against the in-flight enqueue list.
-                            if !child_pairs[..child_count].contains(&child) {
+                            if !crate::block::contains_pair(&child_pairs[..child_count], child) {
                                 if child_count >= MAX_QUEUED_PAIRS {
                                     return Err(Error::OutOfRange);
                                 }
@@ -536,7 +609,10 @@ pub fn scan_used_with_single_buf<S: Storage>(
             // child and a tail successor is collected by two parents before
             // it is popped and marked used, so a blind enqueue would place
             // it in the bounded queue twice and spuriously overflow it.
-            if queue[head..tail].contains(child) {
+            // The membership test is over physical block sets, since a pair
+            // named `{a, b}` by one parent and `{b, a}` by another is one
+            // pair (review L7, `lfs-a8j`).
+            if crate::block::contains_pair(&queue[head..tail], *child) {
                 continue;
             }
             if tail >= MAX_QUEUED_PAIRS {

@@ -121,7 +121,10 @@ step 4.
 Three findings refined the plan during `lfs-cvh.1`..`.4`.
 
 **A single split suffices per op; the within-compaction cascade is
-unreachable here.** The C reference cascades because `lfs_dir_commit`
+unreachable here.** *(Superseded: see "Revision after review L1" below.
+The claim holds only for ops that add an entry or leave the existing
+ones their size; an op that grows an entry in place breaks it.)* The C
+reference cascades because `lfs_dir_commit`
 batches many attrs into one commit, so a single compaction can add many
 entries and overflow by more than one pair. This crate commits one
 `WriteOp` at a time, adding at most one entry, and every metadata pair
@@ -203,10 +206,68 @@ genuine over-one-block overflow still returns `OutOfRange`. The
 reachable-pair budget guard (above) folds into the same fallback.
 Pinned by `tests/dir_split_degraded.rs`.
 
+## Revision after review L1 (2026-07-27): a single cut does not suffice
+
+The "a single split suffices per op" revision above is **wrong**, and the
+argument shows where. It reasons that the lower portion of a cut is "the
+pre-existing entries, themselves at most one block," which holds only
+while every write op either adds an entry or leaves the existing ones the
+size they were. Three ops grow an entry in place: `SetAttr`, an inline
+`Update`, and a `RenameInPlace` to a longer name. When the grown entry
+falls in the lower portion, `compute_split_index` still bounds only the
+upper portion (it shrinks that to about half a block and stops), so the
+lower portion can exceed one block, `build_compact_commit` rejects it,
+and the whole op fails with `Error::OutOfRange`.
+
+The C reference does not fail: `lfs_dir_splittingcompact` wraps the cut
+in `while (true)`, sets `end = split` after each `lfs_dir_split`, and
+measures again, cutting until what remains fits. The oracle was run
+directly on the reproducer's sequence (four entries, two attributes grown
+by log append, then a third that forces the compaction) at the same
+geometry: every C call returns 0, all three attributes read back after a
+remount, and all four entries enumerate.
+
+`split_directory_pair` now runs the same loop. Each cut programs one
+continuation holding the range above the cut, inheriting the previously
+programmed continuation as its tail (the original's prior tail for the
+first, topmost cut), and then the lower portion is re-measured. Chain
+order therefore matches entry order, as it does in C. Crash safety is
+unchanged in kind: no continuation is referenced until the original's
+lower commit lands, so that single program remains the linearization
+point and a tear leaks orphan pairs the allocator reclaims. The crash
+window is one continuation wider per extra cut, swept by
+`torn_multi_cut_directory_split_is_atomic_across_every_power_loss`.
+
+Two bounds keep the loop finite in a kernel with no allocator:
+`MAX_SPLIT_CUTS = 8` (the entry range halves per cut whenever the upper
+portion fits, so `log2(MAX_LIVE_ENTRIES)` covers the widest pair), and
+the existing guards, now evaluated per cut: the reachable-pair headroom
+under `MAX_QUEUED_PAIRS`, and the root fullness floor, which each cut
+consumes two blocks against. Exhausting any of them stops cutting and
+falls through to the single-block commit, which is exactly the
+pre-existing degraded behaviour.
+
+The second half of L1 (the relocation paths never split) is **refuted**
+for the error it predicts, and the evidence is in
+`tests/review_l1_forced_victim.rs`: the forced-victim branch is reachable
+only when the in-place append fitted the block, and the active block's
+log is never smaller than the rebuild of its own live set, so the rebuilt
+image is at most `BLOCK_SIZE - 8` bytes. The worn-alternate branch cannot
+reach the relocation with an overfull range at all, because
+`build_compact_commit` runs before the alternate write and rejects first.
+What both branches do skip is the half-block redistribution, so a pair
+relocated off a worn block may carry more than half a block until its
+next ordinary compaction; that is a metadata-distribution difference, not
+an error, and it is deliberate.
+
 ## Related
 
 - `tests/pending_dir_split.rs`: the reproduce-first target.
-- `tests/dir_split_torn.rs`: the split crash-window power-loss pin.
+- `tests/review_l1_split_recheck.rs`: the multi-cut reproducer.
+- `tests/review_l1_forced_victim.rs`: the refutation sweep for L1's
+  relocation half.
+- `tests/dir_split_torn.rs`: the split crash-window power-loss pin,
+  single-cut and multi-cut.
 - `tests/dir_split_budget.rs`: clean failure at the reachable-pair budget.
 - `tools/verify_image` `split_dir` scenario + `roundtrip_split_dir`: the C
   reference reads a crate-written split directory.

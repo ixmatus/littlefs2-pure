@@ -146,6 +146,45 @@ impl Gstate {
     /// gstate. Called once per committed `MoveState` tag during
     /// mount-time accumulation; called again during compaction to
     /// roll up a pair's net contribution.
+    ///
+    /// # Divergence: C's orphan and needssuperblock bits (review L5)
+    ///
+    /// The C reference packs more than a move into the same 32 bit tag
+    /// word. Bits 8 to 0 hold an orphan count
+    /// (`lfs_gstate_getorphans`, `lfs.c:411`), bit 9 holds a
+    /// needssuperblock flag (`lfs_gstate_needssuperblock`,
+    /// `lfs.c:420`), and bit 31 holds a summary of the low ten bits
+    /// that `lfs_fs_preporphans` maintains (`lfs.c:4838`). This crate
+    /// models only the move: the whole word lands in
+    /// [`Self::move_tag`], and [`Self::pending_move`] classifies it as
+    /// a tag, so anything that is not a `Delete` decodes as no move.
+    ///
+    /// Of those fields only bit 31 ever reaches a disk a C writer
+    /// produced. C strips the entire ten bit size field from every
+    /// gstate delta before committing it (`delta.tag &= ~LFS_MKTAG(0,
+    /// 0, 0x3ff)` at `lfs.c:2024` and `lfs.c:2275`), and the comment
+    /// at `lfs.c:4482` calls the superblock bit reserved on disk. C
+    /// reconstitutes a count of one from bit 31 on its next mount
+    /// (`lfs.c:4556`).
+    ///
+    /// **Consequence.** A C image carrying orphans presents this
+    /// reader with `move_tag == 0x8000_0000`, so
+    /// [`Self::has_pending_move`] reports true while
+    /// [`Self::pending_move`] returns `None`. Mount therefore fires no
+    /// recovery and does not loop; the residue persists across every
+    /// Rust mount until a C mount runs its deorphan pass and clears
+    /// it. Reads, writes, and move recovery are all unaffected: bit 31
+    /// sits in the tag's valid bit position, which
+    /// [`crate::tag::Tag::tag_type`] ignores, so an image carrying an
+    /// orphan AND an in flight move still decodes and completes the
+    /// move.
+    ///
+    /// The behavior above is pinned by
+    /// `tests/review_l5_gstate_orphan_bits.rs`. Modeling the orphan
+    /// bits properly belongs with the gstate aggregate resident in `Fs`;
+    /// see the explicitly out of scope section of
+    /// `docs/decisions/0016-gstate-totals-and-relocation-cascade.md`
+    /// and the parse don't validate follow up (review D8).
     pub fn xor_body(&mut self, body: &[u8; MOVE_STATE_BODY_SIZE]) {
         self.move_tag ^= u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
         self.move_pair_a ^= u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
