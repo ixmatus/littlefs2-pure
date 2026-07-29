@@ -180,6 +180,36 @@ fn roundtrip_split_dir() {
 }
 
 #[test]
+fn roundtrip_multi_cut_split() {
+    let Some(verifier) = require_verifier() else { return };
+    let mut storage = MemStorage::new();
+    let mut scratch = common::make_buffer();
+    Fs::format(&mut storage, &mut scratch).unwrap();
+    {
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
+        let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
+        fs.mkdir(Path::new("/d").unwrap(), &mut a, &mut b).unwrap();
+        for name in ["/d/0", "/d/1", "/d/2", "/d/3"] {
+            fs.write_to_path(Path::new(name).unwrap(), b"", &mut a, &mut b).unwrap();
+        }
+        // Two attributes land by log append; the third forces a compaction
+        // whose lower portion does not fit one block after a single cut, so
+        // the writer cuts twice (review L1). The C reference must chase both
+        // HardTail links and read every attribute back.
+        fs.set_attr(Path::new("/d/0").unwrap(), 1, &[0xA0; 60], &mut a, &mut b).unwrap();
+        fs.set_attr(Path::new("/d/1").unwrap(), 1, &[0xA1; 60], &mut a, &mut b).unwrap();
+        fs.set_attr(Path::new("/d/0").unwrap(), 2, &[0xB0; 120], &mut a, &mut b).unwrap();
+        storage = fs.into_storage();
+    }
+    let img = dump_image(&storage, "multi_cut");
+    invoke_verifier(&verifier, &img, "multi_cut");
+    let _ = std::fs::remove_file(&img);
+}
+
+#[test]
 fn roundtrip_split_root() {
     let Some(verifier) = require_verifier() else { return };
     let mut storage = MemStorage::new();

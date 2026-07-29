@@ -1272,6 +1272,25 @@ fn op_adds_entry(op: &WriteOp<'_>) -> bool {
 /// (lfs.c, "space is complicated").
 const SPLIT_RESERVE: usize = 40;
 
+/// Continuation pairs one compacting split may cut off, bounding the
+/// C reference's unbounded `lfs_dir_splittingcompact` outer loop for a
+/// kernel with no allocator and a pinned stack budget (ADR-0006).
+///
+/// The loop re-cuts the lower portion until it fits about half a block,
+/// so `end` shrinks toward the halving sequence's floor: with the cut
+/// index landing at `end / 2` whenever the upper portion fits, the entry
+/// range halves per cut and `log2(MAX_LIVE_ENTRIES) = 8` cuts cover the
+/// widest pair this crate can hold. Cuts beyond the bound degrade to the
+/// pre-existing single-block commit, which succeeds when the remainder
+/// fits one block and otherwise returns [`Error::OutOfRange`], exactly
+/// the behavior before multi-cut splitting existed. The reachable-pair
+/// budget and the root fullness guard cap the count further.
+///
+/// Each permitted cut reserves two entries in the split's excluded-block
+/// list, so raising this constant costs `8 * MAX_SPLIT_CUTS` bytes of
+/// stack in [`Fs::split_directory_pair`].
+const MAX_SPLIT_CUTS: usize = 8;
+
 /// Wire size of the live entries in the combined-sequence range
 /// `[lo, hi)` exactly as [`build_compact_commit`] would emit them
 /// (user attributes included), plus the virtual new entry (combined
@@ -3602,9 +3621,25 @@ impl<S: Storage> Fs<S> {
         // active block: eagerly relocate the pair onto a fresh block,
         // rebuilding the (readable) active block's live set there and dropping
         // the worn block, exactly like the alternate-worn pivot but evicting
-        // the active half. A single pair's live set always fits one block (it
-        // splits at half-block during growth), so no split is needed. The
-        // root pair is the fixed superblock anchor and cannot relocate.
+        // the active half. The root pair is the fixed superblock anchor and
+        // cannot relocate.
+        //
+        // No split here, and the reason is arithmetic rather than the
+        // half-block invariant a growing op can break (review L1): this
+        // branch runs only when `can_append` held, so
+        // `committed_end + dsize <= BLOCK_SIZE`. The active block's log
+        // physically holds every tag the rebuild re-emits (this writer emits
+        // a Create, a NAME, a STRUCT, and the attribute tags into its own
+        // compacted blocks) plus the revision header, the tail tag the
+        // rebuild re-emits, and at least one CCRC and FCRC, so
+        // `committed_end` is at least the rebuilt size of the same set; and
+        // the op adds `dsize` bytes to the log against `dsize - 8` to a
+        // rebuild, which shares the one trailing CCRC. The rebuilt image is
+        // therefore at most `BLOCK_SIZE - 8` and cannot overflow. What this
+        // branch does skip is the *half-block* redistribution the ordinary
+        // path performs, so a pair relocated this way may carry more than
+        // half a block until its next ordinary compaction splits it.
+        // Swept by `tests/review_l1_forced_victim.rs`.
         if let Some(victim) = forced_victim {
             if pair_addr == self.root {
                 return Err(Error::Io);
@@ -3650,16 +3685,20 @@ impl<S: Storage> Fs<S> {
             compute_split_index::<S>(source_buf, slots, count, op, 0, total)?
         };
         let mut do_split = split > 0;
+        // How many continuation pairs this split may cut off. Each guard
+        // below lowers the ceiling; `do_split` false means zero.
+        let mut max_cuts = MAX_SPLIT_CUTS;
         if do_split {
-            // Bound the reachable-pair count before splitting. The split
-            // adds exactly one reachable pair (the continuation); the
+            // Bound the reachable-pair count before splitting. Each cut
+            // adds exactly one reachable pair (its continuation); the
             // mount-time walks (allocator scan, gstate accumulation,
             // deorphan) enumerate the forest into fixed `MAX_QUEUED_PAIRS`
             // arrays (ADR-0006), so a forest of more than `MAX_QUEUED_PAIRS`
             // reachable pairs is unmountable. At the budget, do not split:
             // fall through to a single-block compaction (degraded), which
             // still fits when the live set is at most one block and only
-            // a genuine overflow turns into `OutOfRange` below.
+            // a genuine overflow turns into `OutOfRange` below. Below the
+            // budget, the headroom is the cut ceiling.
             //
             // `collect_live_tree_pairs` clobbers both scratch buffers, so
             // re-read the active block afterward to restore the bytes
@@ -3672,6 +3711,8 @@ impl<S: Storage> Fs<S> {
             self.storage.read(active_addr.as_u32(), 0, source_buf).map_err(|_| Error::Io)?;
             if reachable >= crate::alloc::MAX_QUEUED_PAIRS {
                 do_split = false;
+            } else {
+                max_cuts = max_cuts.min(crate::alloc::MAX_QUEUED_PAIRS - reachable);
             }
         }
         if do_split && pair_addr == self.root {
@@ -3682,15 +3723,21 @@ impl<S: Storage> Fs<S> {
             // permanently consume the last free blocks and starve future
             // writes. Do not split the root once free space drops to an
             // eighth of the device — degrade to a single-block compaction
-            // (a root overflow then keeps its prior `OutOfRange`).
+            // (a root overflow then keeps its prior `OutOfRange`). A
+            // multi-cut split consumes two blocks per cut, so the same
+            // question is asked once per cut: cut `k` (zero-based) is
+            // permitted only while `free - 2 * k` still clears the floor.
             // `scan_used_blocks` clobbers both buffers; restore the source.
             let mut used = crate::alloc::Bitmap::EMPTY;
             crate::alloc::scan_used_blocks(&mut self.storage, self.root, &mut used, buf_a, buf_b)?;
             let source_buf: &mut [u8] = if active_is_a { buf_a } else { buf_b };
             self.storage.read(active_addr.as_u32(), 0, source_buf).map_err(|_| Error::Io)?;
             let free = (0..S::BLOCK_COUNT).filter(|&blk| !used.is_set(blk)).count();
-            if free <= (S::BLOCK_COUNT as usize) / 8 {
+            let floor = (S::BLOCK_COUNT as usize) / 8;
+            if free <= floor {
                 do_split = false;
+            } else {
+                max_cuts = max_cuts.min((free - floor).div_ceil(2));
             }
         }
         if do_split {
@@ -3719,6 +3766,7 @@ impl<S: Storage> Fs<S> {
                 op,
                 split,
                 total,
+                max_cuts,
                 tail,
                 ms_arg,
                 rs_arg,
@@ -4018,9 +4066,12 @@ impl<S: Storage> Fs<S> {
     ) -> Result<BlockPair, Error> {
         // Excluded set: the pair's own two blocks, every inflight block from a
         // parent relocation cascade, and every worn fresh candidate tried so
-        // far. Sized for the worst case with bound checks → `OutOfRange`.
-        let mut excluded =
-            [BlockAddress::NONE; 2 + 2 + crate::alloc::MAX_QUEUED_PAIRS + MAX_BAD_BLOCK_RETRIES];
+        // far. The widest caller is the split's worn-alternate path, whose
+        // in-flight list also names both blocks of every continuation the
+        // split already cut. Sized for that worst case with bound checks →
+        // `OutOfRange`.
+        let mut excluded = [BlockAddress::NONE;
+            2 + 2 + crate::alloc::MAX_QUEUED_PAIRS + 2 * MAX_SPLIT_CUTS + 2 * MAX_BAD_BLOCK_RETRIES];
         excluded[0] = pair_addr.a;
         excluded[1] = pair_addr.b;
         let mut base_len = 2;
@@ -4148,54 +4199,64 @@ impl<S: Storage> Fs<S> {
         }
     }
 
-    /// Split an overflowing directory pair across a freshly allocated
-    /// `HardTail` continuation, matching the C reference's `lfs_dir_split`.
-    /// The combined entry sequence is cut at `split` (computed by
+    /// Split an overflowing directory pair across freshly allocated
+    /// `HardTail` continuations, matching the C reference's `lfs_dir_split`
+    /// driven by the `lfs_dir_splittingcompact` outer loop. The combined
+    /// entry sequence is cut at `split` (computed by
     /// [`compute_split_index`]): the upper portion `[split, total)` moves
-    /// to the continuation, the lower portion `[0, split)` stays in the
-    /// original pair, now ending in a `HardTail` to the continuation.
+    /// to a continuation, and the remaining lower portion is re-measured
+    /// and cut again until it fits, up to `max_cuts` continuations. What is
+    /// left stays in the original pair, now ending in a `HardTail` to the
+    /// most recently cut continuation.
     ///
-    /// **Ordering and crash-safety.** The continuation is allocated and
-    /// fully programmed *before* the original's lower-half commit lands.
-    /// Until that commit, the continuation is referenced by nothing (the
-    /// original's active block still holds its pre-split tags with no
-    /// HardTail), so a crash leaves it an unreferenced orphan reclaimed by
-    /// the next allocator scan — exactly the `mkdir` create window. After
-    /// the lower-half commit lands on the original's alternate (higher
-    /// revision, CCRC-valid), the directory reads as the post-split state:
-    /// the original's lower entries followed by the continuation's upper
-    /// entries (which include the new entry for a Create), concatenated by
-    /// `list_pair_chain` across the HardTail.
+    /// **Why more than one cut.** A single cut bounds only the *upper*
+    /// portion (`compute_split_index` shrinks it to about half a block); the
+    /// lower portion is whatever remains, and an op that grows an existing
+    /// entry in place (a `SetAttr`, an inline `Update`, a `RenameInPlace`
+    /// to a longer name) can leave that remainder larger than one block.
+    /// The first cut then lands a continuation the lower half cannot join,
+    /// and the lower commit fails with `Error::OutOfRange` where the C
+    /// reference simply cuts again (review L1, ADR-0013). Each cut narrows
+    /// `end` to the previous cut index, so the loop terminates.
     ///
-    /// **gstate** stays on the original (lower) pair; the continuation is
-    /// brand new and carries a zero contribution. The continuation
-    /// inherits the original's prior tail so the global thread (and any
-    /// further continuation) stays linked.
+    /// **Ordering and crash-safety.** Every continuation is allocated and
+    /// fully programmed *before* the original's lower commit lands, newest
+    /// cut last, each inheriting the previously programmed one as its tail.
+    /// Until that final commit none of them is referenced (the original's
+    /// active block still holds its pre-split tags with no HardTail), so a
+    /// crash leaves them unreferenced orphans reclaimed by the next
+    /// allocator scan — exactly the `mkdir` create window, one pair per cut
+    /// instead of one. The single linearization point is unchanged: the
+    /// lower commit on the original's alternate (higher revision,
+    /// CCRC-valid). After it the directory reads as the post-split state,
+    /// `list_pair_chain` concatenating the original's entries, then each
+    /// continuation's in cut order (the newest cut holds the entries
+    /// closest to the original, so chain order is entry order).
     ///
-    /// **Worn blocks.** A split writes a fresh continuation block and the
+    /// **gstate** stays on the original (lower) pair; every continuation is
+    /// brand new and carries a zero contribution. The first (topmost) cut
+    /// inherits the original's prior tail so the global thread stays
+    /// linked; later cuts inherit the continuation cut before them.
+    ///
+    /// **Worn blocks.** A split writes fresh continuation blocks and the
     /// original's alternate, either of which may be worn. A worn continuation
     /// block is relocated past in place: the continuation is unreferenced
-    /// until the lower-half commit, so a failed write is a clean blank orphan
-    /// — exclude it and reallocate the pair (bounded by
-    /// [`MAX_BAD_BLOCK_RETRIES`]). A worn *alternate* on the lower-half write
-    /// relocates the original onto a fresh block via
-    /// [`Self::relocate_compact_to_fresh`], with the lower half still
-    /// carrying the `HardTail` to the continuation; that returns the new pair
-    /// address (`Ok(Some(new_pair))`) so the caller repoints the parent. The
-    /// root pair cannot relocate, so a worn root alternate stays
+    /// until the lower commit, so a failed write is a clean blank orphan
+    /// — exclude it and reallocate the pair. The retry budget
+    /// ([`MAX_BAD_BLOCK_RETRIES`]) spans the whole split, not each cut, so a
+    /// wholly-failing device cannot loop longer for having more cuts. A worn
+    /// *alternate* on the lower commit relocates the original onto a fresh
+    /// block via [`Self::relocate_compact_to_fresh`], with the lower portion
+    /// still carrying the `HardTail` to the newest continuation; that returns
+    /// the new pair address (`Ok(Some(new_pair))`) so the caller repoints the
+    /// parent. The root pair cannot relocate, so a worn root alternate stays
     /// [`Error::Io`]. A normal split returns `Ok(None)`.
     ///
-    /// One split always suffices in this writer: each metadata pair fits
-    /// one block and each `WriteOp` adds at most one entry, so the combined
-    /// sequence is at most one block plus one entry, which a single cut
-    /// splits into two sub-block pairs (the upper bounded to half a block
-    /// by `compute_split_index`, the lower being the pre-existing entries).
-    /// A multi-pair directory grows by repeatedly splitting the last pair
-    /// as it fills. The within-compaction cascade of the C reference's
-    /// `lfs_dir_splittingcompact` (reachable only when one commit batches
-    /// several creates) is therefore unreachable here; see ADR-0013. A
-    /// lower portion that somehow still exceeded the block would surface as
-    /// the pre-existing `Error::OutOfRange` from `build_compact_commit`.
+    /// `max_cuts` is the caller's ceiling from the reachable-pair budget and
+    /// the root fullness guard, itself capped by [`MAX_SPLIT_CUTS`]; it is at
+    /// least 1. Exhausting it leaves a lower portion that may still exceed
+    /// one block, which surfaces as the pre-existing `Error::OutOfRange` from
+    /// `build_compact_commit`.
     #[allow(clippy::too_many_arguments)]
     fn split_directory_pair(
         &mut self,
@@ -4209,6 +4270,7 @@ impl<S: Storage> Fs<S> {
         op: &WriteOp<'_>,
         split: usize,
         total: usize,
+        max_cuts: usize,
         inherited_tail: Option<(BlockPair, bool)>,
         ms_arg: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
         rs_arg: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
@@ -4216,14 +4278,16 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<Option<BlockPair>, Error> {
-        // Excluded set for the continuation allocation: the pair's own blocks,
-        // any inflight blocks, and every worn continuation candidate tried.
-        // The build buffer is the allocator's single-buffer scan scratch, so
-        // the source buffer (holding the bytes `slots` point into) is never
-        // clobbered. One extra slot holds the first-allocated block tentatively
-        // while the second is allocated.
-        let mut excluded =
-            [BlockAddress::NONE; 2 + crate::alloc::MAX_QUEUED_PAIRS + MAX_BAD_BLOCK_RETRIES + 1];
+        // Excluded set for the continuation allocations: the pair's own
+        // blocks, any inflight blocks, both blocks of every continuation
+        // already cut (they are programmed but unreferenced, so the
+        // allocator's scan cannot see them), and every worn continuation
+        // candidate tried. The build buffer is the allocator's single-buffer
+        // scan scratch, so the source buffer (holding the bytes `slots` point
+        // into) is never clobbered. One extra slot holds the first-allocated
+        // block of the current cut tentatively while the second is allocated.
+        let mut excluded = [BlockAddress::NONE;
+            2 + crate::alloc::MAX_QUEUED_PAIRS + 2 * MAX_SPLIT_CUTS + MAX_BAD_BLOCK_RETRIES + 1];
         excluded[0] = active_addr;
         excluded[1] = alternate_addr;
         let mut base = 2;
@@ -4235,20 +4299,126 @@ impl<S: Storage> Fs<S> {
             base += 1;
         }
 
+        // Cut loop. `end` is the exclusive upper bound of the portion still
+        // to place; `cut` is where the next continuation starts; `pending`
+        // is the tail that continuation inherits (the original's prior tail
+        // for the first, topmost cut; the previous continuation after that).
+        // The worn-block retry budget is shared across cuts.
+        let mut end = total;
+        let mut cut = split;
+        let mut pending = inherited_tail;
+        let mut cuts = 0usize;
+        let mut tries = 0usize;
+        let cont = loop {
+            let cont = self.program_split_continuation(
+                active_is_a,
+                slots,
+                count,
+                op,
+                cut,
+                end,
+                pending,
+                inflight.chain,
+                &mut excluded,
+                &mut base,
+                &mut tries,
+                buf_a,
+                buf_b,
+            )?;
+            // The continuation is programmed but unreferenced, so keep its
+            // blocks off every later allocation in this split (the next cut,
+            // and the worn-alternate relocation below). `base` already
+            // covers any worn candidate this cut burned through.
+            if base + 2 > excluded.len() {
+                return Err(Error::OutOfRange);
+            }
+            excluded[base] = cont.a;
+            excluded[base + 1] = cont.b;
+            base += 2;
+            pending = Some((cont, true));
+            end = cut;
+            cuts += 1;
+            if cuts >= max_cuts {
+                break cont;
+            }
+            // Re-measure what is left. `compute_split_index` returns 0 when
+            // the remainder already fits, which ends the loop; otherwise it
+            // is the next cut index and `end` strictly decreases.
+            let next = {
+                let source_buf: &[u8] = if active_is_a { &*buf_a } else { &*buf_b };
+                compute_split_index::<S>(source_buf, slots, count, op, 0, end)?
+            };
+            if next == 0 {
+                break cont;
+            }
+            cut = next;
+        };
+        let split = end;
+        self.finish_split_lower_half(
+            pair_addr,
+            alternate_addr,
+            active_is_a,
+            new_revision,
+            slots,
+            count,
+            op,
+            split,
+            cont,
+            ms_arg,
+            rs_arg,
+            inflight,
+            &excluded[..base],
+            buf_a,
+            buf_b,
+        )
+    }
+
+    /// Allocate and fully program one `HardTail` continuation pair holding
+    /// the combined-sequence range `[lo, hi)` at revision 1, inheriting
+    /// `inherited_tail`, carrying no gstate. Block B is left erased as the
+    /// continuation's alternate so a stale image there cannot masquerade as
+    /// a newer revision.
+    ///
+    /// The pair is unreferenced on return: nothing points at it until the
+    /// caller's lower-half commit lands, so a crash here leaks two blocks
+    /// the next allocator scan reclaims. A worn candidate block is excluded
+    /// and the pair reallocated, charged against the caller's shared
+    /// `tries` budget so a wholly-failing device terminates.
+    ///
+    /// `excluded[..*base]` is the caller's persistent exclusion prefix. On
+    /// success `*base` has advanced past any worn candidate this call burned
+    /// through, so a later cut does not re-offer the same bad block; the
+    /// caller then records the returned pair's own two blocks.
+    #[allow(clippy::too_many_arguments)]
+    fn program_split_continuation(
+        &mut self,
+        active_is_a: bool,
+        slots: &[SlotOffsets; MAX_LIVE_ENTRIES],
+        count: usize,
+        op: &WriteOp<'_>,
+        lo: usize,
+        hi: usize,
+        inherited_tail: Option<(BlockPair, bool)>,
+        chain: Option<(u32, u32)>,
+        excluded: &mut [BlockAddress],
+        base: &mut usize,
+        tries: &mut usize,
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<BlockPair, Error> {
         // Allocate + program the continuation, relocating past worn
         // continuation blocks. The continuation is unreferenced until the
         // lower-half commit, so an attempt that hits a worn block leaves a
         // blank/unreferenced orphan: exclude the worn block and retry.
-        let mut ex = base;
-        let mut tries = 0usize;
-        let cont = loop {
+        let mut ex = *base;
+        loop {
             let ca = if active_is_a {
                 crate::alloc::alloc_one_block_cached_single_buf(
                     &mut self.storage,
                     self.root,
                     &mut self.used_cache,
                     &excluded[..ex],
-                    inflight.chain,
+                    chain,
                     buf_b,
                 )?
             } else {
@@ -4257,7 +4427,7 @@ impl<S: Storage> Fs<S> {
                     self.root,
                     &mut self.used_cache,
                     &excluded[..ex],
-                    inflight.chain,
+                    chain,
                     buf_a,
                 )?
             };
@@ -4274,7 +4444,7 @@ impl<S: Storage> Fs<S> {
                     self.root,
                     &mut self.used_cache,
                     &excluded[..=ex],
-                    inflight.chain,
+                    chain,
                     buf_b,
                 )?
             } else {
@@ -4283,17 +4453,17 @@ impl<S: Storage> Fs<S> {
                     self.root,
                     &mut self.used_cache,
                     &excluded[..=ex],
-                    inflight.chain,
+                    chain,
                     buf_a,
                 )?
             };
             let cont = BlockPair::new(ca, cb);
 
-            // Build + program the continuation: the upper portion at revision
-            // 1, inheriting the original's prior tail, carrying no gstate.
-            // Rebuilt each attempt (the alloc clobbered the build buffer);
-            // the bytes are identical since the continuation's tail does not
-            // reference its own address.
+            // Build + program the continuation: the range at revision 1,
+            // inheriting the caller's tail, carrying no gstate. Rebuilt each
+            // attempt (the alloc clobbered the build buffer); the bytes are
+            // identical since the continuation's tail does not reference its
+            // own address.
             let cont_len = if active_is_a {
                 build_compact_commit(
                     buf_b,
@@ -4302,8 +4472,8 @@ impl<S: Storage> Fs<S> {
                     slots,
                     count,
                     op,
-                    split,
-                    total,
+                    lo,
+                    hi,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
                     None,
@@ -4318,8 +4488,8 @@ impl<S: Storage> Fs<S> {
                     slots,
                     count,
                     op,
-                    split,
-                    total,
+                    lo,
+                    hi,
                     S::PROG_SIZE,
                     S::BLOCK_SIZE,
                     None,
@@ -4340,22 +4510,57 @@ impl<S: Storage> Fs<S> {
             // image there cannot masquerade as a newer revision.
             let b_ok = a_ok && self.storage.erase(cb.as_u32()).is_ok();
             if a_ok && b_ok {
-                break cont;
+                // Promote the worn candidates this call recorded into the
+                // caller's persistent prefix; the scratch slot at `ex` holds
+                // `ca`, which the caller overwrites with the pair proper.
+                *base = ex;
+                return Ok(cont);
             }
             // A continuation block is worn: exclude it and retry. The other
             // (good, possibly already-written) block is abandoned as a
             // blank/unreferenced orphan and reclaimed by the next scan.
             self.used_cache = None;
-            tries += 1;
-            if tries >= MAX_BAD_BLOCK_RETRIES {
+            *tries += 1;
+            if *tries >= MAX_BAD_BLOCK_RETRIES || ex + 1 >= excluded.len() {
                 return Err(Error::Io);
             }
             let worn = if a_ok { cb } else { ca };
             excluded[ex] = worn;
             ex += 1;
-        };
+        }
+    }
 
-        // Make the continuation durable before the linearizing commit, so
+    /// Program the split's lower portion `[0, split)` onto the original
+    /// pair's alternate, ending in a `HardTail` to `cont` (the newest
+    /// continuation) and carrying the original's gstate. This program is the
+    /// split's linearization point: every continuation is already durable
+    /// and unreferenced, and this commit is what makes the chain reachable.
+    ///
+    /// Returns `Ok(None)` for the normal in-place case, or
+    /// `Ok(Some(new_pair))` when the alternate turned out to be worn and the
+    /// original relocated onto a fresh block, which the caller propagates to
+    /// the parent. `excluded_conts` holds the split's already-allocated
+    /// blocks so the relocation cannot land on one.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_split_lower_half(
+        &mut self,
+        pair_addr: BlockPair,
+        alternate_addr: BlockAddress,
+        active_is_a: bool,
+        new_revision: u32,
+        slots: &[SlotOffsets; MAX_LIVE_ENTRIES],
+        count: usize,
+        op: &WriteOp<'_>,
+        split: usize,
+        cont: BlockPair,
+        ms_arg: Option<[u8; crate::gstate::MOVE_STATE_BODY_SIZE]>,
+        rs_arg: Option<[u8; crate::gstate::RELOCATE_STATE_BODY_SIZE]>,
+        inflight: Inflight<'_>,
+        excluded_conts: &[BlockAddress],
+        buf_a: &mut [u8],
+        buf_b: &mut [u8],
+    ) -> Result<Option<BlockPair>, Error> {
+        // Make every continuation durable before the linearizing commit, so
         // a reordering device cannot expose a HardTail to a not-yet-written
         // continuation (mirrors mkdir's sync between the new dir and the
         // parent commit).
@@ -4365,7 +4570,7 @@ impl<S: Storage> Fs<S> {
         // ending in a HardTail (split bit set) to the continuation, carrying
         // the original's gstate. Programming this block (higher revision,
         // CCRC-valid) is the split's linearization point — the moment the
-        // continuation becomes reachable.
+        // continuation chain becomes reachable.
         let low_len = if active_is_a {
             build_compact_commit(
                 buf_b,
@@ -4428,19 +4633,10 @@ impl<S: Storage> Fs<S> {
         if pair_addr == self.root {
             return Err(Error::Io);
         }
-        // The continuation blocks are allocated but not yet reachable; keep
-        // the relocation's fresh allocation off them.
-        let mut reloc_inflight = [BlockAddress::NONE; 2 + crate::alloc::MAX_QUEUED_PAIRS];
-        reloc_inflight[0] = cont.a;
-        reloc_inflight[1] = cont.b;
-        let mut rl = 2;
-        for &b in inflight.blocks {
-            if rl >= reloc_inflight.len() {
-                return Err(Error::OutOfRange);
-            }
-            reloc_inflight[rl] = b;
-            rl += 1;
-        }
+        // Every continuation this split cut is allocated but not yet
+        // reachable; keep the relocation's fresh allocation off all of them.
+        // `excluded_conts` already carries the caller's own in-flight blocks
+        // (the split copied them in first), so it subsumes `inflight.blocks`.
         let new_pair = self.relocate_compact_to_fresh(
             pair_addr,
             alternate_addr,
@@ -4454,7 +4650,7 @@ impl<S: Storage> Fs<S> {
             ms_arg,
             rs_arg,
             Some((cont, true)),
-            Inflight { blocks: &reloc_inflight[..rl], chain: inflight.chain },
+            Inflight { blocks: excluded_conts, chain: inflight.chain },
             None,
             buf_a,
             buf_b,

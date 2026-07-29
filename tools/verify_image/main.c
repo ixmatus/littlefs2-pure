@@ -12,6 +12,10 @@
 //   split_dir - expect `/d/f00`..`/d/f13`, each body == "x" (a directory
 //               this crate split across a HardTail continuation; the C
 //               reference must chase the chain to find every entry)
+//   multi_cut - expect `/d/0`..`/d/3`, empty, with attributes 1 and 2 on
+//               `/d/0` and attribute 1 on `/d/1` (a directory this crate
+//               split with TWO cuts in one compaction; the C reference
+//               must chase both HardTail links and read every attribute)
 //   split_root- expect `/f00`..`/f11`, each body == "v" (the ROOT pair
 //               {0,1} split across a HardTail continuation; {0,1} stays the
 //               superblock anchor and the C reference chases its tail)
@@ -160,6 +164,36 @@ static int verify_file(lfs_t *lfs, const char *path,
     return 0;
 }
 
+// Read user attribute `id` on `path` and require exactly `len` bytes of
+// `fill`. Used by the multi_cut scenario, whose entries carry the
+// attributes that made the pair too large for a single cut.
+static int verify_attr(lfs_t *lfs, const char *path, uint8_t id,
+                       uint8_t fill, size_t len) {
+    uint8_t buf[256];
+    if (len > sizeof buf) {
+        fprintf(stderr, "verify_image: attr buffer too small\n");
+        return 1;
+    }
+    lfs_ssize_t n = lfs_getattr(lfs, path, id, buf, (lfs_size_t)len);
+    if (n < 0) {
+        fprintf(stderr, "verify_image: getattr %s id %u failed: %d\n", path, id, (int)n);
+        return 1;
+    }
+    if ((size_t)n != len) {
+        fprintf(stderr, "verify_image: attr %s id %u length: got %d expected %zu\n",
+                path, id, (int)n, len);
+        return 1;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (buf[i] != fill) {
+            fprintf(stderr, "verify_image: attr %s id %u byte %zu: got %02x expected %02x\n",
+                    path, id, i, buf[i], fill);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int load_image(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return 1; }
@@ -248,6 +282,21 @@ int main(int argc, char **argv) {
             snprintf(path, sizeof path, "/d/f%02d", i);
             rc = verify_file(&lfs, path, (const uint8_t *)"x", 1);
         }
+    } else if (strcmp(argv[2], "multi_cut") == 0) {
+        // A directory this crate split with TWO cuts in one compaction
+        // (review L1): `/d/0` carries 180 bytes of attributes, so the
+        // first cut left a lower portion no block could hold and a second
+        // cut had to follow. The C reference must chase both HardTail
+        // links, find all four entries, and read every attribute back.
+        rc = 0;
+        for (int i = 0; i < 4 && rc == 0; i++) {
+            char path[16];
+            snprintf(path, sizeof path, "/d/%d", i);
+            rc = verify_file(&lfs, path, (const uint8_t *)"", 0);
+        }
+        if (rc == 0) rc = verify_attr(&lfs, "/d/0", 1, 0xA0, 60);
+        if (rc == 0) rc = verify_attr(&lfs, "/d/0", 2, 0xB0, 120);
+        if (rc == 0) rc = verify_attr(&lfs, "/d/1", 1, 0xA1, 60);
     } else if (strcmp(argv[2], "remove") == 0) {
         // Delete-tag wire compatibility (review C3): the image holds
         // /aa = "keep-me" and a REMOVED /bb. Before the fix the
