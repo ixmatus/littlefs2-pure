@@ -25,14 +25,17 @@
 //!    the old tail address, so the tail cannot relocate this late; the
 //!    committed state is untouched and the next append's dirty check
 //!    routes the retry through copy on write.
-//! 5. `shrink_ctz_head`, the partial tail relocation: report `Io`,
-//!    exactly as a program failure does there. Only a fresh block was
-//!    written, so the committed file is untouched.
+//! 5. `shrink_ctz_head`, the partial tail relocation: exclude the fresh
+//!    candidate and allocate another, and report `Io` only once the
+//!    retry bound is spent (`lfs-i59` gave this site the retry the
+//!    other fresh block paths already had; it originally reported `Io`
+//!    on the first mismatch). Only a fresh block is ever written, so
+//!    the committed file is untouched either way.
 //!
 //! `LyingDev` models the failure: programs to a designated block report
 //! success and flip one bit of the region just written.
 
-use littlefs2_pure::{Error, Fs, OpenOptions, Path, Storage};
+use littlefs2_pure::{CtzStruct, Error, Fs, OpenOptions, Path, Storage};
 
 const BS: usize = 256;
 const BC: u32 = 64;
@@ -282,11 +285,13 @@ fn lying_committed_tail_fill_is_an_error_not_silent_corruption() {
 /// Site 5, `shrink_ctz_head`. Shrinking a 300 byte file to 100 bytes
 /// leaves a partial tail, so the kept prefix relocates onto a freshly
 /// allocated block. The chain occupies blocks 2 and 3 and is excluded,
-/// so the fresh candidate is block 4, and it lies. Only that fresh
-/// block was written, so the read back must surface `Io` and leave the
-/// committed file exactly as it was.
+/// so the fresh candidate is block 4, and it lies. Since `lfs-i59` the
+/// read back's verdict is not `Io` but exclusion: the liar is dropped
+/// and the next candidate takes the relocation, so the shrink lands.
+/// What the read back still forbids is the liar becoming the committed
+/// head.
 #[test]
-fn lying_shrink_relocation_is_an_error_not_silent_corruption() {
+fn lying_shrink_relocation_relocates_instead_of_corrupting() {
     let dev = formatted();
     let mut fs = mount(dev);
     let mut a = buf();
@@ -299,9 +304,47 @@ fn lying_shrink_relocation_is_an_error_not_silent_corruption() {
     {
         let opts = OpenOptions::new().write(true);
         let mut f = fs.open(p("/f"), opts, &mut a, &mut b).unwrap();
+        f.set_len(100, &mut a, &mut b).expect("the lying candidate must be excluded, not fatal");
+        f.close(&mut a, &mut b).unwrap();
+    }
+    {
+        let r = fs.resolve(p("/f"), &mut a, &mut b).unwrap();
+        let head = CtzStruct::from_bytes(r.struct_body).unwrap().head_block.as_u32();
+        assert_ne!(head, 4, "the lying block must not become the committed head");
+    }
+
+    let dev = fs.into_storage();
+    assert!(dev.corruptions > 0, "the lying block was never programmed; the test proved nothing");
+    let mut fs = mount(dev);
+    assert_eq!(fs.size_of(p("/f"), &mut a, &mut b).unwrap(), 100, "the shrink must have landed");
+    let mut out = [0u8; 100];
+    let n = fs.read_at_path(p("/f"), 0, &mut out, &mut a, &mut b).unwrap();
+    assert_eq!(n, 100);
+    assert!(out.iter().all(|&x| x == 0x33), "the kept prefix must be intact");
+}
+
+/// The same shrink on a device where every free block lies. No candidate
+/// ever verifies, so the retry exhausts and the failure is reported
+/// rather than swallowed: the committed 300 bytes stay exactly as they
+/// were. This is the property the pre-`lfs-i59` shape got from a single
+/// attempt, kept here for the case retrying cannot rescue.
+#[test]
+fn wholly_lying_shrink_relocation_is_an_error_not_silent_corruption() {
+    let dev = formatted();
+    let mut fs = mount(dev);
+    let mut a = buf();
+    let mut b = buf();
+    fs.write_to_path(p("/f"), &[0x33u8; 300], &mut a, &mut b).unwrap();
+
+    let mut dev = fs.into_storage();
+    dev.bad = (4..BC).collect();
+    let mut fs = mount(dev);
+    {
+        let opts = OpenOptions::new().write(true);
+        let mut f = fs.open(p("/f"), opts, &mut a, &mut b).unwrap();
         let err = f
             .set_len(100, &mut a, &mut b)
-            .expect_err("a lying shrink relocation must not report success");
+            .expect_err("a shrink with no honest candidate must not report success");
         assert_eq!(err, Error::Io);
     }
 

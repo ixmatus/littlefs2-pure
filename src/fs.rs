@@ -1233,6 +1233,11 @@ fn op_dsize_of(op: &WriteOp<'_>) -> usize {
 /// `off`/`len` are `PROG_SIZE`-aligned, and `BLOCK_SIZE` being a
 /// multiple of `PROG_SIZE` (itself at least `READ_SIZE`) makes the
 /// read legal under the [`Storage`] geometry contract.
+///
+/// The read goes through [`Storage::read_device`], not
+/// [`Storage::read`]: a write buffering adapter answers a plain read
+/// with the bytes it was handed, which would make this compare RAM
+/// against RAM and pass whatever the device did (ADR-0020, `lfs-6ym`).
 fn verify_programmed<S: Storage>(
     storage: &mut S,
     block: BlockAddress,
@@ -1240,7 +1245,7 @@ fn verify_programmed<S: Storage>(
     region: &mut [u8],
 ) -> bool {
     let expected = crate::crc::update(crate::crc::INIT, region);
-    storage.read(block.as_u32(), off as u32, region).is_ok()
+    storage.read_device(block.as_u32(), off as u32, region).is_ok()
         && crate::crc::update(crate::crc::INIT, region) == expected
 }
 
@@ -1261,6 +1266,10 @@ fn verify_programmed<S: Storage>(
 /// a multiple of `READ_SIZE` (both powers of two), so the widened window
 /// stays inside the block; the bounds check is the backstop for a
 /// storage impl that violates that contract.
+///
+/// Like [`verify_programmed`], the read goes through
+/// [`Storage::read_device`] so a write buffering adapter cannot answer
+/// with the caller's own pending bytes (ADR-0020, `lfs-6ym`).
 fn verify_programmed_bytes<S: Storage>(
     storage: &mut S,
     block: BlockAddress,
@@ -1276,7 +1285,7 @@ fn verify_programmed_bytes<S: Storage>(
     if hi > S::BLOCK_SIZE || hi > scratch.len() {
         return false;
     }
-    if storage.read(block.as_u32(), lo as u32, &mut scratch[lo..hi]).is_err() {
+    if storage.read_device(block.as_u32(), lo as u32, &mut scratch[lo..hi]).is_err() {
         return false;
     }
     scratch[off..end] == *expected
@@ -2668,6 +2677,13 @@ impl<S: Storage> Fs<S> {
     /// new head at sync. A power loss here leaves the previous file state
     /// fully readable, and the orphaned fresh block is reclaimed by the
     /// next allocator scan.
+    ///
+    /// **Worn blocks.** That same atomicity makes the relocation free to
+    /// retry: a candidate whose erase or program fails, or whose read
+    /// back disagrees with what was sent, is excluded and another is
+    /// allocated, bounded by [`MAX_BAD_BLOCK_RETRIES`] (ADR-0014,
+    /// `lfs-i59`). Exhaustion reports [`Error::Io`], the verdict a single
+    /// program failure used to get here.
     pub(crate) fn shrink_ctz_head(
         &mut self,
         head_block: BlockAddress,
@@ -2686,7 +2702,12 @@ impl<S: Storage> Fs<S> {
         if n_old as usize > MAX_CTZ_BLOCKS {
             return Err(Error::OutOfRange);
         }
-        let mut chain = [BlockAddress::NONE; MAX_CTZ_BLOCKS];
+        // The chain occupies the front of the array and the worn
+        // candidates the retry excludes accumulate behind it, so one
+        // contiguous slice names everything the allocator must avoid.
+        // `n_old` is bounded by `MAX_CTZ_BLOCKS` just above and the retry
+        // count by `MAX_BAD_BLOCK_RETRIES`, so the tail never overruns.
+        let mut chain = [BlockAddress::NONE; MAX_CTZ_BLOCKS + MAX_BAD_BLOCK_RETRIES];
         // `buf_a` is free until the relocated block image is built
         // below, so it serves as the walk's aligned read window.
         collect_chain_blocks_buffered(
@@ -2713,40 +2734,56 @@ impl<S: Storage> Fs<S> {
         // block. Exclude the whole existing chain so the allocator never
         // hands back a block this (possibly not-yet-committed) file still
         // uses.
-        let mut fresh = [BlockAddress::NONE; 1];
-        crate::alloc::alloc_blocks_cached(
-            &mut self.storage,
-            self.root,
-            &mut self.used_cache,
-            &chain[..n_old as usize],
-            None,
-            &mut fresh,
-            buf_a,
-            buf_b,
-        )?;
-        let fresh_addr = fresh[0];
-
-        // Build the relocated block: header + kept content from the old
-        // tail, the remainder of the block left erased.
-        self.storage
-            .read(old_tail.as_u32(), 0, &mut buf_a[..S::BLOCK_SIZE])
-            .map_err(|_| Error::Io)?;
+        //
+        // A candidate whose erase or program fails, or whose read back
+        // disagrees with what was sent (review `lfs-ttr`), is worn.
+        // Exclude it and allocate another, bounded by
+        // `MAX_BAD_BLOCK_RETRIES`, the discipline every other fresh block
+        // path follows (ADR-0014, `lfs-i59`). Retrying is purely additive
+        // on this path: only the fresh block is ever written, the old
+        // chain and the committed metadata stay untouched, and the new
+        // head reaches disk only in the caller's later commit, so an
+        // abandoned candidate is an unreferenced orphan the next
+        // allocator scan reclaims.
         let keep = (header + bytes_used) as usize;
-        for byte in &mut buf_a[keep..S::BLOCK_SIZE] {
-            *byte = 0xFF;
-        }
-        self.storage.erase(fresh_addr.as_u32()).map_err(|_| Error::Io)?;
-        self.storage
-            .program(fresh_addr.as_u32(), 0, &buf_a[..S::BLOCK_SIZE])
-            .map_err(|_| Error::Io)?;
-        // Read back the relocated tail (review `lfs-ttr`). A mismatch
-        // reports `Io`, the verdict a program failure already gets on
-        // this path; only the fresh block was written, so the committed
-        // chain and the committed metadata are untouched either way and
-        // the caller's shrink simply did not happen.
-        if !verify_programmed(&mut self.storage, fresh_addr, 0, &mut buf_a[..S::BLOCK_SIZE]) {
-            return Err(Error::Io);
-        }
+        let mut ex_len = 0usize;
+        let fresh_addr = loop {
+            let mut fresh = [BlockAddress::NONE; 1];
+            crate::alloc::alloc_blocks_cached(
+                &mut self.storage,
+                self.root,
+                &mut self.used_cache,
+                &chain[..n_old as usize + ex_len],
+                None,
+                &mut fresh,
+                buf_a,
+                buf_b,
+            )?;
+            let candidate = fresh[0];
+
+            // Build the relocated block: header + kept content from the
+            // old tail, the remainder of the block left erased. Rebuilt
+            // inside the loop because both the allocator's rescan and a
+            // rejected read back clobber `buf_a`.
+            self.storage
+                .read(old_tail.as_u32(), 0, &mut buf_a[..S::BLOCK_SIZE])
+                .map_err(|_| Error::Io)?;
+            for byte in &mut buf_a[keep..S::BLOCK_SIZE] {
+                *byte = 0xFF;
+            }
+            if self.storage.erase(candidate.as_u32()).is_ok()
+                && self.storage.program(candidate.as_u32(), 0, &buf_a[..S::BLOCK_SIZE]).is_ok()
+                && verify_programmed(&mut self.storage, candidate, 0, &mut buf_a[..S::BLOCK_SIZE])
+            {
+                break candidate;
+            }
+            if ex_len >= MAX_BAD_BLOCK_RETRIES {
+                return Err(Error::Io);
+            }
+            chain[n_old as usize + ex_len] = candidate;
+            ex_len += 1;
+            self.used_cache = None;
+        };
         self.storage.sync().map_err(|_| Error::Io)?;
         Ok(fresh_addr)
     }

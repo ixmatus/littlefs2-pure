@@ -73,11 +73,16 @@ pub trait Storage {
     fn read(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), Self::Error>;
     fn program(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), Self::Error>;
     fn erase(&mut self, block: u32) -> Result<(), Self::Error>;
+    fn read_device(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), Self::Error> {
+        self.read(block, off, buf)
+    }
     fn sync(&mut self) -> Result<(), Self::Error> { Ok(()) }
 }
 ```
 
 All offsets and sizes are bytes. `block * BLOCK_SIZE + off` is the device-absolute byte position. The kernel does no bounds checking; misaligned or out-of-bounds calls are precondition violations.
+
+`read_device` is the one method most implementations should leave alone. The kernel uses it, and only it, to re-read a region it has just programmed, so that a chip which accepts a program and lands corrupted cells is caught at write time rather than at the next mount. The default forwards to `read`, which is right for any implementation that does not buffer writes. Override it if yours does: flush the pending bytes that overlap the request, then read through. If your type wraps another `Storage`, forward to the inner `read_device` rather than letting the default call your own `read`, otherwise the bypass stops at your layer. See ADR-0020.
 
 ### Where the buffers live
 

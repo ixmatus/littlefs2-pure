@@ -13,6 +13,11 @@
 //! programs are merged with the cached window; a sync or a touch of a
 //! different window flushes.
 //!
+//! Reads splice that window in, so a caller sees its own pending bytes.
+//! The one exception is [`Storage::read_device`], which the kernel uses
+//! to verify what it just programmed and which therefore has to reach
+//! the chip; see the override below and ADR-0020.
+//!
 //! # Constraints
 //!
 //! - `S::PROG_SIZE` must divide `S::BLOCK_SIZE`. (Standard for any
@@ -172,6 +177,44 @@ impl<S: Storage> Storage for NorAlignedStorage<S> {
             }
         }
         Ok(())
+    }
+
+    /// Answer from the device, never from the cached window.
+    ///
+    /// [`Storage::read`] above splices the cached window in, which is
+    /// what a caller reading back its own not yet flushed commit needs.
+    /// A read back verification needs the opposite: it exists to catch a
+    /// device that reports a successful program and lands corrupted
+    /// cells, and the cache holds the bytes the caller sent rather than
+    /// the bytes the chip kept. Splicing there compared RAM against RAM
+    /// and passed whatever the device did (ADR-0020, `lfs-6ym`).
+    ///
+    /// Pending bytes that overlap the request are flushed first, so the
+    /// device is asked a fair question. A pending window that does not
+    /// overlap is left alone: it is nobody's business here, and flushing
+    /// it early would move a program inside a crash window for nothing.
+    /// The flush is not extra work in the overlapping case either, since
+    /// that window was already destined for the device at the next
+    /// window switch or [`Storage::sync`]; it only happens sooner.
+    ///
+    /// Note that a plain `sync` is not a substitute. The window stays
+    /// resident after it is flushed (so a second program into it merges
+    /// rather than re reading the device), and [`Storage::read`] splices
+    /// a resident window whether or not it is dirty, so the device's own
+    /// bytes stay hidden until the window is switched or erased.
+    fn read_device(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), Self::Error> {
+        if self.dirty && self.cached_block == Some(block) {
+            let cache_start = self.cached_off as u64;
+            let cache_end = cache_start + S::PROG_SIZE as u64;
+            let read_start = off as u64;
+            let read_end = read_start + buf.len() as u64;
+            if read_start < cache_end && cache_start < read_end {
+                self.flush()?;
+            }
+        }
+        // Forward rather than calling `inner.read`, so an adapter stack
+        // bypasses every cache in it, not just this one.
+        self.inner.read_device(block, off, buf)
     }
 
     fn program(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), Self::Error> {
