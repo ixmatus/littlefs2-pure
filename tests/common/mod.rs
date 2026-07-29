@@ -469,6 +469,15 @@ where
         self.inner.read(block, off, buf)
     }
 
+    /// Forwarded, not defaulted: a defaulted `read_device` would call
+    /// this adapter's `read` and so hand the question to the inner
+    /// storage's *splicing* read, which is exactly what `lfs-6ym` set
+    /// out to bypass. An adapter that wraps another `Storage` has to
+    /// pass the intent down.
+    fn read_device(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), Self::Error> {
+        self.inner.read_device(block, off, buf)
+    }
+
     fn program(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), Self::Error> {
         self.program_count += 1;
         if !self.powered() {
@@ -906,6 +915,13 @@ where
 
     fn read(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), Self::Error> {
         self.inner.read(block, off, buf)
+    }
+
+    /// Forwarded for the same reason [`TornWriteStorage`] forwards it:
+    /// the tear injector must not turn a device truth read back into a
+    /// cached one on its way down the stack.
+    fn read_device(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), Self::Error> {
+        self.inner.read_device(block, off, buf)
     }
 
     fn program(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), Self::Error> {

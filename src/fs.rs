@@ -952,8 +952,7 @@ fn accumulate_gstate<S: Storage>(
         let pair_addr = queue[head];
         head += 1;
 
-        storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        read_pair_blocks(storage, pair_addr, buf_a, buf_b)?;
         let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
 
         gstate.xor_body(&scan_pair_move_state(&pair));
@@ -1050,8 +1049,7 @@ fn collect_live_tree_pairs<S: Storage>(
     while head < tail {
         let pair_addr = out[head];
         head += 1;
-        storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        read_pair_blocks(storage, pair_addr, buf_a, buf_b)?;
         let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
         let active_is_a = pair.active_block == pair_addr.a;
         // A HardTail continues this directory's own pair chain (part of
@@ -1139,8 +1137,7 @@ fn relocated_twin_in<S: Storage>(
         } else {
             continue;
         };
-        storage.read(t.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        storage.read(t.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        read_pair_blocks(storage, t, buf_a, buf_b)?;
         let p = MetadataPair::parse(t.a, &*buf_a, t.b, &*buf_b)?;
         if p.active_block != shared {
             return Ok(Some(t));
@@ -1236,6 +1233,11 @@ fn op_dsize_of(op: &WriteOp<'_>) -> usize {
 /// `off`/`len` are `PROG_SIZE`-aligned, and `BLOCK_SIZE` being a
 /// multiple of `PROG_SIZE` (itself at least `READ_SIZE`) makes the
 /// read legal under the [`Storage`] geometry contract.
+///
+/// The read goes through [`Storage::read_device`], not
+/// [`Storage::read`]: a write buffering adapter answers a plain read
+/// with the bytes it was handed, which would make this compare RAM
+/// against RAM and pass whatever the device did (ADR-0020, `lfs-6ym`).
 fn verify_programmed<S: Storage>(
     storage: &mut S,
     block: BlockAddress,
@@ -1243,7 +1245,7 @@ fn verify_programmed<S: Storage>(
     region: &mut [u8],
 ) -> bool {
     let expected = crate::crc::update(crate::crc::INIT, region);
-    storage.read(block.as_u32(), off as u32, region).is_ok()
+    storage.read_device(block.as_u32(), off as u32, region).is_ok()
         && crate::crc::update(crate::crc::INIT, region) == expected
 }
 
@@ -1264,6 +1266,10 @@ fn verify_programmed<S: Storage>(
 /// a multiple of `READ_SIZE` (both powers of two), so the widened window
 /// stays inside the block; the bounds check is the backstop for a
 /// storage impl that violates that contract.
+///
+/// Like [`verify_programmed`], the read goes through
+/// [`Storage::read_device`] so a write buffering adapter cannot answer
+/// with the caller's own pending bytes (ADR-0020, `lfs-6ym`).
 fn verify_programmed_bytes<S: Storage>(
     storage: &mut S,
     block: BlockAddress,
@@ -1279,7 +1285,7 @@ fn verify_programmed_bytes<S: Storage>(
     if hi > S::BLOCK_SIZE || hi > scratch.len() {
         return false;
     }
-    if storage.read(block.as_u32(), lo as u32, &mut scratch[lo..hi]).is_err() {
+    if storage.read_device(block.as_u32(), lo as u32, &mut scratch[lo..hi]).is_err() {
         return false;
     }
     scratch[off..end] == *expected
@@ -1432,9 +1438,9 @@ fn should_relocate(
 ///
 /// # The posture, stated once (`lfs-qeh`)
 ///
-/// Every *walker* that decodes a pair address from disk and enqueues it
-/// owes the same two answers, and this is the one place they are written
-/// down. Sites that enforce it point here rather than restating it.
+/// Every site that decodes a pair address from disk owes the same two
+/// answers, and this is the one place they are written down. Sites that
+/// enforce it point here rather than restating it.
 ///
 /// 1. **The all ones sentinel is thread end, never an address.** It is
 ///    resolved upstream, at the tail decode
@@ -1463,30 +1469,69 @@ fn should_relocate(
 /// unthread, or a parent lookup returning `None` for a directory that
 /// does have a parent.
 ///
-/// # What this does not yet cover
+/// # Where the rule is applied (`lfs-w3o`)
 ///
-/// The rule governs the walkers, which decode an address and decide
-/// whether to enqueue it. It does not yet govern the *chase* sites,
-/// which follow a `HardTail` to continue one directory's own chain
-/// (`resolve`, `list_dir`, `find_thread_predecessor`,
-/// `unthread_and_steal` and their kin: sixteen pair reads across this
-/// module). Those hand the address straight to [`Storage::read`] and
-/// surface an out-of-range one as [`Error::Io`], which misreads image
-/// corruption as a hardware fault, exactly the confusion review L9
-/// (`lfs-b2m`) removed from the walkers. The C reference has no such
-/// split because its bounds check lives inside `lfs_dir_fetchmatch` and
-/// therefore covers every fetch, chases included. Closing the gap means
-/// routing all sixteen reads through one bounds-checked pair read; that
-/// is a separate concern from this one and is deliberately not folded in
-/// here. Note the *sentinel* is already correct at those sites: it
-/// resolves to `None` at the decode, so a chase terminates rather than
-/// dereferencing all ones.
+/// The predicate is used in two shapes. A *walker* decodes an address
+/// and decides whether to enqueue it, so it calls this directly at the
+/// enqueue site and never reads through a rejected address. A *chase*
+/// follows a `HardTail` to continue one directory's own chain, or is
+/// simply handed a pair to fetch, so it reads immediately: those sites
+/// call [`read_pair_blocks`], which applies this predicate and then
+/// performs the two block reads.
+///
+/// The chases used to hand the decoded address straight to
+/// [`Storage::read`] and surface an out-of-range one as [`Error::Io`],
+/// which misreads image corruption as a hardware fault, exactly the
+/// confusion review L9 (`lfs-b2m`) removed from the walkers. The C
+/// reference never had that split because its bounds check lives inside
+/// `lfs_dir_fetchmatch` and therefore covers every fetch, chases
+/// included. Routing every pair-block read in this module through one
+/// helper is the structural form of the same thing: a future fetch site
+/// cannot forget the check. The *sentinel* was already correct at those
+/// sites and stays so: it resolves to `None` at the decode, so a chase
+/// terminates rather than dereferencing all ones.
 ///
 /// Shared with [`crate::alloc`], whose forest walkers owe the same
-/// rejection at every enqueue site (review L9, `lfs-b2m`).
+/// rejection at every enqueue site (review L9, `lfs-b2m`) and whose CTZ
+/// chain walk owes the block-address twin of it (`lfs-0ph`, enforced by
+/// [`crate::ctz`]'s `require_in_bounds`).
 #[inline]
 pub(crate) fn pair_in_bounds<S: Storage>(pair: BlockPair) -> bool {
     pair.a.as_u32() < S::BLOCK_COUNT && pair.b.as_u32() < S::BLOCK_COUNT
+}
+
+/// Read both blocks of `pair` into `buf_a` and `buf_b`, rejecting an
+/// out-of-range address before either read.
+///
+/// The single fetch primitive for metadata pairs in this module, and the
+/// structural home of [`pair_in_bounds`]'s rule 2 (`lfs-w3o`). The order
+/// of the two failure modes is the whole point: an address the device
+/// cannot hold is [`Error::Corrupt`], decided from the geometry with no
+/// I/O at all, while a device that refuses a read of an address it does
+/// hold is [`Error::Io`]. Doing the read first collapses both into `Io`
+/// and loses the distinction, because a conforming [`Storage`] rejects
+/// the out-of-range access too.
+///
+/// This is the placement the C reference uses: `lfs_dir_fetchmatch`
+/// (`lfs.c:1103`) opens with the `>= lfs->block_count` test and returns
+/// `LFS_ERR_CORRUPT` before touching the device, so every fetch in the C
+/// reader is covered by construction.
+///
+/// The all ones sentinel never arrives here from a tail: it is resolved
+/// to `None` at the decode ([`crate::meta::MetadataReader::tail`]), so a
+/// chase ends rather than fetching it.
+fn read_pair_blocks<S: Storage>(
+    storage: &mut S,
+    pair: BlockPair,
+    buf_a: &mut [u8],
+    buf_b: &mut [u8],
+) -> Result<(), Error> {
+    if !pair_in_bounds::<S>(pair) {
+        return Err(Error::Corrupt);
+    }
+    storage.read(pair.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
+    storage.read(pair.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+    Ok(())
 }
 
 /// Walk the global metadata-pair thread from `root` (following each
@@ -1514,8 +1559,7 @@ fn find_thread_predecessor<S: Storage>(
         if steps > crate::alloc::MAX_QUEUED_PAIRS {
             return Err(Error::OutOfRange);
         }
-        storage.read(cur.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        storage.read(cur.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        read_pair_blocks(storage, cur, buf_a, buf_b)?;
         let (tail, is_hard) = {
             let p = MetadataPair::parse(cur.a, &*buf_a, cur.b, &*buf_b)?;
             (p.reader.tail(), p.reader.is_hard_tail())
@@ -1587,8 +1631,7 @@ fn find_parent_in_tree<S: Storage>(
         let pair_addr = queue[head];
         head += 1;
 
-        storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        read_pair_blocks(storage, pair_addr, buf_a, buf_b)?;
         let pair = MetadataPair::parse(pair_addr.a, &*buf_a, pair_addr.b, &*buf_b)?;
         let active_is_a = pair.active_block == pair_addr.a;
         let mut slots = [SlotOffsets::EMPTY; MAX_LIVE_ENTRIES];
@@ -1946,8 +1989,7 @@ impl<S: Storage> Fs<S> {
         // Append the metadata commit.
         // buf_a was consumed for chain bytes; re-read the target pair
         // just to learn the live-entry count for the new id.
-        self.storage.read(target.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(target.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        read_pair_blocks(&mut self.storage, target, buf_a, buf_b)?;
         let count: usize = {
             let pair = MetadataPair::parse(target.a, &*buf_a, target.b, &*buf_b)?;
             let active_is_a = pair.active_block == target.a;
@@ -2367,6 +2409,15 @@ impl<S: Storage> Fs<S> {
         if (new_n as usize) > MAX_CTZ_WRITE_BLOCKS {
             return Err(Error::OutOfRange);
         }
+        // The chain head comes from a `CtzStruct` body on disk and is
+        // dereferenced directly below (the tail fill reads it without
+        // walking the chain first), so it owes the same rejection every
+        // other CTZ block address owes: out of range is `Corrupt`, not
+        // the `Io` a raw read would report (`lfs-0ph`). An empty chain
+        // carries no head to check.
+        if n_old > 0 {
+            crate::ctz::require_in_bounds::<S>(ctz.head_block)?;
+        }
 
         // Step 1: plan the tail fill. The tail block *is* the chain
         // head, so its address is known without walking the chain.
@@ -2626,6 +2677,13 @@ impl<S: Storage> Fs<S> {
     /// new head at sync. A power loss here leaves the previous file state
     /// fully readable, and the orphaned fresh block is reclaimed by the
     /// next allocator scan.
+    ///
+    /// **Worn blocks.** That same atomicity makes the relocation free to
+    /// retry: a candidate whose erase or program fails, or whose read
+    /// back disagrees with what was sent, is excluded and another is
+    /// allocated, bounded by [`MAX_BAD_BLOCK_RETRIES`] (ADR-0014,
+    /// `lfs-i59`). Exhaustion reports [`Error::Io`], the verdict a single
+    /// program failure used to get here.
     pub(crate) fn shrink_ctz_head(
         &mut self,
         head_block: BlockAddress,
@@ -2644,7 +2702,12 @@ impl<S: Storage> Fs<S> {
         if n_old as usize > MAX_CTZ_BLOCKS {
             return Err(Error::OutOfRange);
         }
-        let mut chain = [BlockAddress::NONE; MAX_CTZ_BLOCKS];
+        // The chain occupies the front of the array and the worn
+        // candidates the retry excludes accumulate behind it, so one
+        // contiguous slice names everything the allocator must avoid.
+        // `n_old` is bounded by `MAX_CTZ_BLOCKS` just above and the retry
+        // count by `MAX_BAD_BLOCK_RETRIES`, so the tail never overruns.
+        let mut chain = [BlockAddress::NONE; MAX_CTZ_BLOCKS + MAX_BAD_BLOCK_RETRIES];
         // `buf_a` is free until the relocated block image is built
         // below, so it serves as the walk's aligned read window.
         collect_chain_blocks_buffered(
@@ -2671,40 +2734,56 @@ impl<S: Storage> Fs<S> {
         // block. Exclude the whole existing chain so the allocator never
         // hands back a block this (possibly not-yet-committed) file still
         // uses.
-        let mut fresh = [BlockAddress::NONE; 1];
-        crate::alloc::alloc_blocks_cached(
-            &mut self.storage,
-            self.root,
-            &mut self.used_cache,
-            &chain[..n_old as usize],
-            None,
-            &mut fresh,
-            buf_a,
-            buf_b,
-        )?;
-        let fresh_addr = fresh[0];
-
-        // Build the relocated block: header + kept content from the old
-        // tail, the remainder of the block left erased.
-        self.storage
-            .read(old_tail.as_u32(), 0, &mut buf_a[..S::BLOCK_SIZE])
-            .map_err(|_| Error::Io)?;
+        //
+        // A candidate whose erase or program fails, or whose read back
+        // disagrees with what was sent (review `lfs-ttr`), is worn.
+        // Exclude it and allocate another, bounded by
+        // `MAX_BAD_BLOCK_RETRIES`, the discipline every other fresh block
+        // path follows (ADR-0014, `lfs-i59`). Retrying is purely additive
+        // on this path: only the fresh block is ever written, the old
+        // chain and the committed metadata stay untouched, and the new
+        // head reaches disk only in the caller's later commit, so an
+        // abandoned candidate is an unreferenced orphan the next
+        // allocator scan reclaims.
         let keep = (header + bytes_used) as usize;
-        for byte in &mut buf_a[keep..S::BLOCK_SIZE] {
-            *byte = 0xFF;
-        }
-        self.storage.erase(fresh_addr.as_u32()).map_err(|_| Error::Io)?;
-        self.storage
-            .program(fresh_addr.as_u32(), 0, &buf_a[..S::BLOCK_SIZE])
-            .map_err(|_| Error::Io)?;
-        // Read back the relocated tail (review `lfs-ttr`). A mismatch
-        // reports `Io`, the verdict a program failure already gets on
-        // this path; only the fresh block was written, so the committed
-        // chain and the committed metadata are untouched either way and
-        // the caller's shrink simply did not happen.
-        if !verify_programmed(&mut self.storage, fresh_addr, 0, &mut buf_a[..S::BLOCK_SIZE]) {
-            return Err(Error::Io);
-        }
+        let mut ex_len = 0usize;
+        let fresh_addr = loop {
+            let mut fresh = [BlockAddress::NONE; 1];
+            crate::alloc::alloc_blocks_cached(
+                &mut self.storage,
+                self.root,
+                &mut self.used_cache,
+                &chain[..n_old as usize + ex_len],
+                None,
+                &mut fresh,
+                buf_a,
+                buf_b,
+            )?;
+            let candidate = fresh[0];
+
+            // Build the relocated block: header + kept content from the
+            // old tail, the remainder of the block left erased. Rebuilt
+            // inside the loop because both the allocator's rescan and a
+            // rejected read back clobber `buf_a`.
+            self.storage
+                .read(old_tail.as_u32(), 0, &mut buf_a[..S::BLOCK_SIZE])
+                .map_err(|_| Error::Io)?;
+            for byte in &mut buf_a[keep..S::BLOCK_SIZE] {
+                *byte = 0xFF;
+            }
+            if self.storage.erase(candidate.as_u32()).is_ok()
+                && self.storage.program(candidate.as_u32(), 0, &buf_a[..S::BLOCK_SIZE]).is_ok()
+                && verify_programmed(&mut self.storage, candidate, 0, &mut buf_a[..S::BLOCK_SIZE])
+            {
+                break candidate;
+            }
+            if ex_len >= MAX_BAD_BLOCK_RETRIES {
+                return Err(Error::Io);
+            }
+            chain[n_old as usize + ex_len] = candidate;
+            ex_len += 1;
+            self.used_cache = None;
+        };
         self.storage.sync().map_err(|_| Error::Io)?;
         Ok(fresh_addr)
     }
@@ -2932,8 +3011,7 @@ impl<S: Storage> Fs<S> {
         // count, then append the CreateDir commit. Pass the just-allocated
         // new_dir blocks as inflight so wear-level relocation (if it
         // fires) won't reallocate them.
-        self.storage.read(target.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(target.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        read_pair_blocks(&mut self.storage, target, buf_a, buf_b)?;
         let count: usize = {
             let p = MetadataPair::parse(target.a, &*buf_a, target.b, &*buf_b)?;
             let active_is_a = p.active_block == target.a;
@@ -3467,8 +3545,7 @@ impl<S: Storage> Fs<S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
-        self.storage.read(pair_addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(pair_addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        read_pair_blocks(&mut self.storage, pair_addr, buf_a, buf_b)?;
 
         let active_addr;
         let alternate_addr;
@@ -4918,8 +4995,7 @@ impl<S: Storage> Fs<S> {
         let mut current = dropped;
         let mut walk = BrentTailWalk::new(current);
         let successor: Option<BlockPair> = loop {
-            self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-            self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            read_pair_blocks(&mut self.storage, current, buf_a, buf_b)?;
             let (tail, is_hard, ms, rs) = {
                 let p = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
                 (
@@ -5132,8 +5208,7 @@ impl<S: Storage> Fs<S> {
         let mut emitted = 0usize;
         let mut walk = BrentTailWalk::new(current);
         loop {
-            self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-            self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            read_pair_blocks(&mut self.storage, current, buf_a, buf_b)?;
             let next = {
                 let pair = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
                 let next = if pair.reader.is_hard_tail() { pair.reader.tail() } else { None };
@@ -5479,6 +5554,13 @@ impl<S: Storage> Fs<S> {
         if block_a_buf.len() != S::BLOCK_SIZE || block_b_buf.len() != S::BLOCK_SIZE {
             return Err(Error::GeometryMismatch);
         }
+        // The one pair fetch in this module that does not route through
+        // `read_pair_blocks`, deliberately: blocks 0 and 1 are the
+        // `ROOT_BLOCK_PAIR` constant, not an address decoded from disk,
+        // so there is nothing here for the bounds rule to catch. The
+        // geometry gate above already established `BLOCK_COUNT >=
+        // BLOCK_COUNT_MIN`, so both are in range by construction, and a
+        // failure at this point is a genuine device fault (`lfs-w3o`).
         storage.read(0, 0, block_a_buf).map_err(|_| Error::Io)?;
         storage.read(1, 0, block_b_buf).map_err(|_| Error::Io)?;
 
@@ -5581,8 +5663,7 @@ impl<S: Storage> Fs<S> {
             if steps > 4 * crate::alloc::MAX_QUEUED_PAIRS {
                 break;
             }
-            self.storage.read(cur.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-            self.storage.read(cur.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            read_pair_blocks(&mut self.storage, cur, buf_a, buf_b)?;
             let (next, cur_is_hard) = {
                 let p = MetadataPair::parse(cur.a, &*buf_a, cur.b, &*buf_b)?;
                 (p.reader.tail(), p.reader.is_hard_tail())
@@ -5693,8 +5774,7 @@ impl<S: Storage> Fs<S> {
         };
 
         // Validate src_id against the live entry count of the target.
-        self.storage.read(target.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(target.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        read_pair_blocks(&mut self.storage, target, buf_a, buf_b)?;
         {
             let pair = MetadataPair::parse(target.a, &*buf_a, target.b, &*buf_b)?;
             let active_is_a = pair.active_block == target.a;
@@ -5865,8 +5945,7 @@ impl<S: Storage> Fs<S> {
         // with no arbitrary cap (review item R3, ADR-0009).
         let mut walk = BrentTailWalk::new(current);
         loop {
-            self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-            self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            read_pair_blocks(&mut self.storage, current, buf_a, buf_b)?;
             // We need to drop the pair borrow before potentially looping
             // back to re-read. Scope it tightly.
             let tail_to_follow = {
@@ -5927,8 +6006,7 @@ impl<S: Storage> Fs<S> {
         let mut current = first;
         let mut walk = BrentTailWalk::new(current);
         loop {
-            self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-            self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            read_pair_blocks(&mut self.storage, current, buf_a, buf_b)?;
             let next: Option<BlockPair>;
             let hit: Option<(u16, crate::dir::EntryKind)>;
             let count: usize;
@@ -5985,8 +6063,7 @@ impl<S: Storage> Fs<S> {
         // is descended with no arbitrary cap (review item R3, ADR-0009).
         let mut walk = BrentTailWalk::new(current);
         loop {
-            self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-            self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+            read_pair_blocks(&mut self.storage, current, buf_a, buf_b)?;
             let pair = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
             if let Some(resolved) = crate::dir::lookup_checked(&pair, name)? {
                 if resolved.entry.kind != crate::dir::EntryKind::Directory {
@@ -6048,8 +6125,7 @@ impl<S: Storage> Fs<S> {
         if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
             return Err(Error::GeometryMismatch);
         }
-        self.storage.read(addr.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
-        self.storage.read(addr.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
+        read_pair_blocks(&mut self.storage, addr, buf_a, buf_b)?;
         MetadataPair::parse(addr.a, buf_a, addr.b, buf_b)
     }
 }

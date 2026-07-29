@@ -34,6 +34,7 @@ Post mortems are written at fix time, in the same slice as the fix; crash consis
 - [failure-setlen-nor](failure-setlen-nor.md) — shrink then extend ANDed bytes into stale NOR cells (fixed v1.1.0)
 - [failure-splice-id-family](failure-splice-id-family.md) — one raw-id versus live-id confusion, five copies, four Criticals (2026-06 review C1/C2/C5/H1; fixed in the ADR-0015 arc)
 - [failure-gstate-cascade-family](failure-gstate-cascade-family.md) — re-derived mechanisms, missing countermeasures: the cross-product defects (2026-06 review C4/C6/C7/C8/H3/H4; fixed in the ADR-0016/0017 arc)
+- [failure-nor-verify-splice](failure-nor-verify-splice.md) — the read back verification validated the alignment adapter's cache, not the device (`lfs-6ym`; fixed in the ADR-0020 slice)
 
 ## Named gaps
 

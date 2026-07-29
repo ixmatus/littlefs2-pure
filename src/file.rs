@@ -76,21 +76,35 @@ use crate::{BlockAddress, Fs};
 ///
 /// - [`OpenOptions::read`] — open for reading. Required to call
 ///   [`File::read`].
-/// - [`OpenOptions::write`] — open for writing. Required to call
-///   [`File::write`] or [`File::set_len`].
-/// - [`OpenOptions::append`] — implies `write`; positions the cursor
-///   at end of file at open time and forces every [`File::write`] to
-///   land at end of file regardless of subsequent [`File::seek`]
-///   calls.
+/// - [`OpenOptions::write`] — open for writing. Grants write access,
+///   which [`File::write`] and [`File::set_len`] require.
+/// - [`OpenOptions::append`] — also grants write access; positions the
+///   cursor at end of file at open time and forces every
+///   [`File::write`] to land at end of file regardless of subsequent
+///   [`File::seek`] calls.
 /// - [`OpenOptions::truncate`] — drop existing content on open.
-///   Requires `write`. Has no effect on missing files.
+///   Requires write access. Has no effect on missing files.
 /// - [`OpenOptions::create`] — create the file if missing. The parent
-///   directory must already exist. Requires `write`. Has no effect
-///   when the file is already present.
+///   directory must already exist. Requires write access. Has no
+///   effect when the file is already present.
+///
+/// # Write access is `write || append`, read at open time
+///
+/// The five fields are independent; none of them sets another. Write
+/// access is the derived predicate `write || append`, computed by a
+/// crate internal `writable()` accessor wherever it is needed rather
+/// than latched into a field at setter time. That is
+/// `std::fs::OpenOptions`'s own shape,
+/// and it is what makes the setters commute: `append(true)` used to set
+/// the `write` field as a side effect while `write(on)` overwrote that
+/// field unconditionally, so `.append(true).write(false)` and
+/// `.write(false).append(true)` built different values from the same
+/// two calls (`lfs-f4m`). A caller reading the setters left to right
+/// could not predict which one won.
 ///
 /// Both `create` and `truncate` mutate the device, so
 /// [`Fs::open`](crate::Fs::open) rejects either one unless the access
-/// mode also grants write. This matches `std::fs::OpenOptions`, which
+/// mode grants write. This matches `std::fs::OpenOptions`, which
 /// fails with `InvalidInput` when `create`, `create_new`, or
 /// `truncate` is set and the access mode names neither `write` nor
 /// `append`. Without that rule a nominally read only open would
@@ -122,29 +136,35 @@ impl OpenOptions {
         self
     }
 
-    /// Set the write flag. Required for [`File::write`].
+    /// Set the write flag. One of the two ways to grant write access
+    /// (see [`Self::append`] for the other).
+    ///
+    /// Sets only this flag. `write(false)` clears write access only if
+    /// `append` is also unset; an append mode open stays writable, as
+    /// it does in `std`.
     #[must_use]
     pub const fn write(mut self, on: bool) -> Self {
         self.write = on;
         self
     }
 
-    /// Set the append flag. Implies [`Self::write`]; writes are forced
-    /// to end of file regardless of cursor position.
+    /// Set the append flag. Grants write access on its own, and forces
+    /// every write to end of file regardless of cursor position.
+    ///
+    /// Sets only this flag. It does not touch [`Self::write`], so the
+    /// two setters commute (`lfs-f4m`); write access is the derived
+    /// `write || append`, read at open time.
     #[must_use]
     pub const fn append(mut self, on: bool) -> Self {
         self.append = on;
-        if on {
-            self.write = true;
-        }
         self
     }
 
     /// Set the truncate flag. Drops existing content to zero bytes on
     /// open.
     ///
-    /// Requires [`Self::write`] (which [`Self::append`] also sets).
-    /// A truncating open without write access is rejected by
+    /// Requires write access, from either [`Self::write`] or
+    /// [`Self::append`]. A truncating open without it is rejected by
     /// [`Fs::open`](crate::Fs::open) with [`Error::InvalidPath`].
     #[must_use]
     pub const fn truncate(mut self, on: bool) -> Self {
@@ -154,8 +174,8 @@ impl OpenOptions {
 
     /// Set the create flag. Creates the file if it does not exist.
     ///
-    /// Requires [`Self::write`] (which [`Self::append`] also sets).
-    /// A creating open without write access is rejected by
+    /// Requires write access, from either [`Self::write`] or
+    /// [`Self::append`]. A creating open without it is rejected by
     /// [`Fs::open`](crate::Fs::open) with [`Error::InvalidPath`],
     /// because materializing the entry programs the parent metadata
     /// pair and a read only open must never touch the device.
@@ -163,6 +183,23 @@ impl OpenOptions {
     pub const fn create(mut self, on: bool) -> Self {
         self.create = on;
         self
+    }
+
+    /// `true` when these options grant write access: `write || append`.
+    ///
+    /// The single normalization point for the two access granting
+    /// flags (`lfs-f4m`). Every consumer reads write access through
+    /// here rather than testing a field, so the answer cannot depend on
+    /// the order the setters were called in: the access mode gate in
+    /// [`Fs::open`](crate::Fs::open), its `create` and `truncate`
+    /// predicate (review L6), [`File::write`], and [`File::set_len`].
+    ///
+    /// Crate internal by design. The flags are already public through
+    /// their setters, and exposing the derived predicate would freeze
+    /// it as public API before there is a caller that needs it.
+    #[inline]
+    pub(crate) const fn writable(self) -> bool {
+        self.write || self.append
     }
 }
 
@@ -266,21 +303,19 @@ impl<S: Storage> Fs<S> {
         if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
             return Err(Error::GeometryMismatch);
         }
-        if !options.read && !options.write {
+        if !options.read && !options.writable() {
             return Err(Error::InvalidPath);
         }
         // `create` and `truncate` both mutate the device, so both need
         // write access. This is `std::fs::OpenOptions`'s creation-mode
         // rule: it rejects `create`, `create_new`, and `truncate` when
-        // the access mode grants neither `write` nor `append`. Testing
-        // `write` alone covers append here because `OpenOptions::append`
-        // sets `write`; an options value carrying `append` without
-        // `write` is one this crate refuses writes on everywhere else
-        // (see `File::write`), so it does not license a creation either.
-        // Before this check existed, `read(true).create(true)` was a
-        // read-only open that programmed the parent metadata pair
-        // (review L6).
-        if (options.create || options.truncate) && !options.write {
+        // the access mode grants neither `write` nor `append`.
+        // `writable()` is exactly that disjunction, read here rather
+        // than latched at setter time (`lfs-f4m`), so the answer does
+        // not depend on the order the caller set the flags in. Before
+        // this check existed, `read(true).create(true)` was a read-only
+        // open that programmed the parent metadata pair (review L6).
+        if (options.create || options.truncate) && !options.writable() {
             return Err(Error::InvalidPath);
         }
 
@@ -469,7 +504,9 @@ impl<S: Storage> File<'_, S> {
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<usize, Error> {
-        if !self.options.write {
+        // `write || append`, normalized (`lfs-f4m`): an append-only
+        // handle is writable, matching `std`.
+        if !self.options.writable() {
             return Err(Error::InvalidPath);
         }
         if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {
@@ -499,15 +536,16 @@ impl<S: Storage> File<'_, S> {
     /// by the next allocator scan after sync). Extending past the
     /// current size zero-fills the new bytes.
     ///
-    /// Requires [`OpenOptions::write`]. The change is staged in
-    /// memory until [`Self::sync`].
+    /// Requires write access, from either [`OpenOptions::write`] or
+    /// [`OpenOptions::append`]. The change is staged in memory until
+    /// [`Self::sync`].
     pub fn set_len(
         &mut self,
         new_size: u32,
         buf_a: &mut [u8],
         buf_b: &mut [u8],
     ) -> Result<(), Error> {
-        if !self.options.write {
+        if !self.options.writable() {
             return Err(Error::InvalidPath);
         }
         if buf_a.len() != S::BLOCK_SIZE || buf_b.len() != S::BLOCK_SIZE {

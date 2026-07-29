@@ -123,6 +123,36 @@ pub trait Storage {
     /// Erase one block. After erase the block reads as all `0xFF` bytes.
     fn erase(&mut self, block: u32) -> Result<(), Self::Error>;
 
+    /// Read `buf.len()` bytes starting at `(block, off)` into `buf`,
+    /// answering from the device rather than from any RAM the
+    /// implementation would otherwise splice into [`read`](Self::read).
+    ///
+    /// The kernel calls this, and only this, for a read back
+    /// verification: it programs a region, then asks what the device
+    /// actually holds, so a chip that accepts a program and lands
+    /// corrupted cells is named worn instead of trusted. A cache that
+    /// answered with the bytes the caller just handed it would make that
+    /// question compare RAM against RAM (ADR-0020).
+    ///
+    /// The default is [`read`](Self::read), which is correct for any
+    /// implementation that does not buffer writes: a plain device, a
+    /// memory backing, a file. An implementation that does buffer must
+    /// override this to flush whatever pending bytes overlap the request
+    /// and then read through, and an adapter that wraps another
+    /// [`Storage`] must forward to the inner `read_device` so a stack of
+    /// adapters bypasses all of them. [`crate::NorAlignedStorage`] does
+    /// both.
+    ///
+    /// Alignment and out of range rules are exactly [`read`](Self::read)'s.
+    ///
+    /// The C reference does the same thing from the other side:
+    /// `lfs_bd_flush`'s validating compare drops the read cache and
+    /// passes a null program cache, so its comparison reads the device
+    /// (lfs.c, `lfs_bd_flush` and `lfs_bd_cmp`).
+    fn read_device(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), Self::Error> {
+        self.read(block, off, buf)
+    }
+
     /// Flush any internal caches in the backing store. The kernel calls this
     /// after a commit, before claiming the commit is durable.
     fn sync(&mut self) -> Result<(), Self::Error> {
