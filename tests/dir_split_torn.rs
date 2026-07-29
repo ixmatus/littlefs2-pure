@@ -26,8 +26,21 @@
 //! commit. The crash window is wider by one continuation, and the
 //! invariant is the same: nothing is reachable until the lower commit
 //! lands, so every tear reads as the pre-state or the post-state.
+//!
+//! The single-cut sweep runs under two tear models. The first tears at
+//! the kernel's program calls over a permissive RAM device. The second
+//! (review coverage item V4, bead `lfs-hki`) tears at the device's own
+//! program boundaries, with the injector inside `NorAlignedStorage`
+//! over a strict NOR device, and can leave the interrupted page half
+//! programmed. The second model is the finer one, because the
+//! alignment adapter splits each commit span the kernel programs in one
+//! call into `PROG_SIZE` windows; on this geometry that is roughly four
+//! device programs per kernel program call. Both counts are measured at
+//! run time by the respective `*_call_counts` helper, so neither sweep
+//! carries a frozen tally.
 
 use littlefs2_pure::meta::MetadataReader;
+use littlefs2_pure::storage::Storage;
 use littlefs2_pure::{BlockPair, Fs, Path};
 
 mod common;
@@ -45,7 +58,7 @@ fn buf() -> [u8; BS] {
 /// for that continuation.
 const ENTRIES: u32 = 16;
 
-fn scenario(fs: &mut Fs<TornWriteStorage>) {
+fn scenario<S: Storage>(fs: &mut Fs<S>) {
     let mut a = buf();
     let mut b = buf();
     let _ = fs.mkdir(Path::new("/d").unwrap(), &mut a, &mut b);
@@ -153,7 +166,7 @@ fn assert_no_thread_orphan(data: &[u8]) {
 /// names, asserting each reads back its one-byte content and that no name
 /// repeats. Returns `None` if the directory does not resolve (a valid
 /// pre-operation state where `/d` was not yet created).
-fn enumerate_dir(fs: &mut Fs<MemStorage>) -> Option<Vec<Vec<u8>>> {
+fn enumerate_dir<S: Storage>(fs: &mut Fs<S>) -> Option<Vec<Vec<u8>>> {
     let mut a = buf();
     let mut b = buf();
     if !fs.exists(Path::new("/d").unwrap(), &mut a, &mut b).ok()? {
@@ -181,6 +194,7 @@ fn enumerate_dir(fs: &mut Fs<MemStorage>) -> Option<Vec<Vec<u8>>> {
 
 #[test]
 fn torn_directory_split_is_atomic_across_every_power_loss() {
+    let scenario = scenario::<TornWriteStorage>;
     let (fmt_calls, scenario_calls) = common::torn_call_counts(scenario);
     assert!(scenario_calls > 0);
     // The scenario must actually split: a single 256-byte pair cannot hold
@@ -434,4 +448,67 @@ fn torn_multi_cut_directory_split_is_atomic_across_every_power_loss() {
         let names_b = enumerate_multi_cut_dir(&mut fs, &ctx);
         assert_eq!(names_a, names_b, "{ctx}: directory state must be stable across remounts");
     }
+}
+
+/// The split sweep at DEVICE program granularity, with partial window
+/// landings (review coverage item V4, bead `lfs-hki`).
+///
+/// Same invariants as the kernel boundary sweep above: the image must
+/// mount, `/d` must hold an exact prefix of the write sequence with no
+/// duplicate and no unreadable entry, the tail thread must reach no
+/// pair outside the tree, and a second consecutive mount must answer
+/// the same. What changes is where the power cut lands: inside a real
+/// page program of the continuation write or of the parent repoint, and
+/// possibly with that page left half programmed.
+///
+/// Landing lengths come from `common::NOR_PARTIAL_LANDINGS`; that
+/// constant documents the sampling bound.
+#[test]
+fn torn_directory_split_is_atomic_across_every_nor_program_landing() {
+    let scenario = scenario::<common::NorTornStorage>;
+    let (fmt_calls, scenario_calls) = common::nor_torn_call_counts(scenario);
+    assert!(scenario_calls > 0);
+
+    let mut witness = common::PartialLandingWitness::new();
+    for partial in common::NOR_PARTIAL_LANDINGS {
+        for trigger in 1..=fmt_calls + scenario_calls + 2 {
+            let ctx = format!("nor split sweep trigger {trigger}, partial landing {partial}");
+            let image = match common::run_nor_torn_scenario(trigger, partial, scenario) {
+                common::TornRun::TornFormat => {
+                    assert!(
+                        trigger <= fmt_calls,
+                        "{ctx}: format reported torn past its own {fmt_calls} device programs"
+                    );
+                    continue;
+                }
+                common::TornRun::Image(image) => image,
+            };
+            witness.observe(partial, trigger, &image);
+
+            let names_a = {
+                let mut fs = common::mount_nor_image_strict(image.clone(), &ctx);
+                let names = enumerate_dir(&mut fs);
+                if let Some(names) = &names {
+                    for (i, name) in names.iter().enumerate() {
+                        assert_eq!(
+                            name,
+                            format!("f{i:02}").as_bytes(),
+                            "{ctx}: surviving entries must be an exact prefix of the \
+                             write sequence, got {names:?}"
+                        );
+                    }
+                }
+                assert_no_thread_orphan(&common::nor_image_of(fs));
+                names
+            };
+
+            let mut fs = common::mount_nor_image_strict(image, &format!("{ctx}, second remount"));
+            assert_eq!(
+                names_a,
+                enumerate_dir(&mut fs),
+                "{ctx}: directory state must be stable across remounts"
+            );
+        }
+    }
+    witness.assert_partials_landed("nor split sweep");
 }

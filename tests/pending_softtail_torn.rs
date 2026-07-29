@@ -11,8 +11,21 @@
 //! and remounting, the deorphan sweep must leave a consistent filesystem:
 //! every pair reachable by following tails from the root must also be a
 //! live directory in the tree (no orphan).
+//!
+//! The scenario is swept under two tear models: at the kernel's program
+//! calls over a permissive RAM device, and at the device's own program
+//! boundaries with the injector inside `NorAlignedStorage` over a
+//! strict NOR device, where the interrupted page may also land half
+//! programmed (review coverage item V4, bead `lfs-hki`). The second
+//! model is the finer one, since the alignment adapter splits each
+//! commit span the kernel programs in one call into `PROG_SIZE`
+//! windows; on this geometry that is roughly three device programs per
+//! kernel program call for this scenario. Both counts are measured at
+//! run time by the respective `*_call_counts` helper, so neither sweep
+//! carries a frozen tally.
 
 use littlefs2_pure::meta::MetadataReader;
+use littlefs2_pure::storage::Storage;
 use littlefs2_pure::{BlockPair, Fs, Path};
 
 mod common;
@@ -108,15 +121,19 @@ fn assert_no_thread_orphan(data: &[u8]) {
     }
 }
 
+/// `mkdir /a; mkdir /b; rmdir /a`. Generic over the storage so the same
+/// sequence runs under both tear models.
+fn scenario<S: Storage>(fs: &mut Fs<S>) {
+    let mut a = buf();
+    let mut b = buf();
+    let _ = fs.mkdir(Path::new("/a").unwrap(), &mut a, &mut b);
+    let _ = fs.mkdir(Path::new("/b").unwrap(), &mut a, &mut b);
+    let _ = fs.rmdir(Path::new("/a").unwrap(), &mut a, &mut b);
+}
+
 #[test]
 fn torn_rmdir_unthread_is_deorphaned_on_remount() {
-    let scenario = |fs: &mut Fs<TornWriteStorage>| {
-        let mut a = buf();
-        let mut b = buf();
-        let _ = fs.mkdir(Path::new("/a").unwrap(), &mut a, &mut b);
-        let _ = fs.mkdir(Path::new("/b").unwrap(), &mut a, &mut b);
-        let _ = fs.rmdir(Path::new("/a").unwrap(), &mut a, &mut b);
-    };
+    let scenario = scenario::<TornWriteStorage>;
     let (fmt_calls, scenario_calls) = common::torn_call_counts(scenario);
     assert!(scenario_calls > 0);
 
@@ -165,4 +182,61 @@ fn torn_rmdir_unthread_is_deorphaned_on_remount() {
             "trigger {trigger}: directory state must be stable across remounts"
         );
     }
+}
+
+/// The rmdir unthread sweep at DEVICE program granularity, with
+/// partial window landings (review coverage item V4, bead `lfs-hki`).
+///
+/// Same invariants as the kernel boundary sweep above: the image must
+/// mount, both existence queries must answer cleanly and identically on
+/// a second consecutive mount, and the tail thread must reach no pair
+/// that is not a live tree directory. What changes is where the power
+/// cut lands: inside one of the two real page programs that carry the
+/// entry delete and the predecessor's tail clear, and possibly with
+/// that page left half programmed.
+///
+/// Landing lengths come from `common::NOR_PARTIAL_LANDINGS`; that
+/// constant documents the sampling bound.
+#[test]
+fn torn_rmdir_unthread_is_deorphaned_across_every_nor_program_landing() {
+    let scenario = scenario::<common::NorTornStorage>;
+    let (fmt_calls, scenario_calls) = common::nor_torn_call_counts(scenario);
+    assert!(scenario_calls > 0);
+
+    let mut witness = common::PartialLandingWitness::new();
+    for partial in common::NOR_PARTIAL_LANDINGS {
+        for trigger in 1..=fmt_calls + scenario_calls + 2 {
+            let ctx = format!("nor rmdir unthread sweep trigger {trigger}, partial {partial}");
+            let image = match common::run_nor_torn_scenario(trigger, partial, scenario) {
+                common::TornRun::TornFormat => {
+                    assert!(
+                        trigger <= fmt_calls,
+                        "{ctx}: format reported torn past its own {fmt_calls} device programs"
+                    );
+                    continue;
+                }
+                common::TornRun::Image(image) => image,
+            };
+            witness.observe(partial, trigger, &image);
+
+            let mut fs = common::mount_nor_image_strict(image, &ctx);
+            let mut a = buf();
+            let mut b = buf();
+            let a_exists = fs.exists(Path::new("/a").unwrap(), &mut a, &mut b).unwrap();
+            let b_exists = fs.exists(Path::new("/b").unwrap(), &mut a, &mut b).unwrap();
+            let recovered = common::nor_image_of(fs);
+            assert_no_thread_orphan(&recovered);
+
+            let mut fs =
+                common::mount_nor_image_strict(recovered, &format!("{ctx}, second remount"));
+            let a2 = fs.exists(Path::new("/a").unwrap(), &mut a, &mut b).unwrap();
+            let b2 = fs.exists(Path::new("/b").unwrap(), &mut a, &mut b).unwrap();
+            assert_eq!(
+                (a_exists, b_exists),
+                (a2, b2),
+                "{ctx}: directory state must be stable across remounts"
+            );
+        }
+    }
+    witness.assert_partials_landed("nor rmdir unthread sweep");
 }
