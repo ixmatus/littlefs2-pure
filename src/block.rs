@@ -88,4 +88,40 @@ impl BlockPair {
             (self.b, self.a)
         }
     }
+
+    /// `true` when `self` and `other` name the same two physical blocks,
+    /// whichever order each lists them in.
+    ///
+    /// Order carries no meaning on disk. A pair's active half is the block
+    /// with the higher revision counter, not the block listed first, so
+    /// `{2, 3}` and `{3, 2}` address one metadata pair and read back one
+    /// committed state. The C reference says the same thing twice over: its
+    /// only pair equality primitive is `lfs_pair_issync`, which accepts
+    /// either order, and `lfs_dir_fetchmatch` re-sorts every fetched pair by
+    /// revision before anything else consumes it.
+    ///
+    /// Derived `PartialEq` on [`BlockPair`] compares the ordered `(a, b)`
+    /// tuple and is therefore the wrong test for identity of an address
+    /// decoded from disk. Any visited set, dedup key, or reachability
+    /// membership test over such addresses must use this instead: an image
+    /// that names one pair under both orders otherwise walks it twice, and a
+    /// walk that XOR-folds per-pair state cancels that pair's contribution
+    /// to zero (review L7, `lfs-a8j`).
+    #[inline]
+    pub fn is_same_pair(self, other: Self) -> bool {
+        self.sorted() == other.sorted()
+    }
+}
+
+/// `true` when `pairs` already holds `pair` as a physical block set.
+///
+/// The order-insensitive counterpart of `slice::contains` for pair
+/// addresses decoded from disk. See [`BlockPair::is_same_pair`] for why
+/// the derived equality is the wrong test at these sites.
+///
+/// Internal to the kernel's walkers: it exists to keep every visited-set
+/// membership test in one shape, not as a downstream utility.
+#[inline]
+pub(crate) fn contains_pair(pairs: &[BlockPair], pair: BlockPair) -> bool {
+    pairs.iter().any(|p| p.is_same_pair(pair))
 }

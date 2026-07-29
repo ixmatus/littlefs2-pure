@@ -921,6 +921,20 @@ fn build_compact_commit(
 /// Bounded at [`crate::alloc::MAX_QUEUED_PAIRS`] visited pairs to
 /// match the allocator's BFS budget; deeper directory trees return
 /// `Error::OutOfRange`.
+///
+/// # Pair identity is the physical block set
+///
+/// The visited set keys on [`BlockPair::is_same_pair`], not on the
+/// derived ordered equality. XOR is self-inverse, so folding one pair's
+/// `MoveState` body twice cancels it to zero. An image naming one
+/// physical pair as `{a, b}` in one place and `{b, a}` in another would
+/// otherwise be walked twice and would silently erase that pair's
+/// pending move from the accumulated gstate, so mount recovery would
+/// never fire on a move that a correct reader completes (review L7,
+/// `lfs-a8j`). Canonicalizing the key does not change what is read: the
+/// queue still stores each pair in the order it was found, and
+/// [`MetadataPair::parse`] picks the active half by revision counter
+/// rather than by position.
 fn accumulate_gstate<S: Storage>(
     storage: &mut S,
     root: BlockPair,
@@ -965,7 +979,7 @@ fn accumulate_gstate<S: Storage>(
             if !pair_in_bounds::<S>(tail_pair) {
                 return Err(Error::Corrupt);
             }
-            if !queue[..tail].contains(&tail_pair) {
+            if !crate::block::contains_pair(&queue[..tail], tail_pair) {
                 if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                     return Err(Error::OutOfRange);
                 }
@@ -988,7 +1002,7 @@ fn accumulate_gstate<S: Storage>(
                 if !pair_in_bounds::<S>(child) {
                     return Err(Error::Corrupt);
                 }
-                if !queue[..tail].contains(&child) {
+                if !crate::block::contains_pair(&queue[..tail], child) {
                     if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                         return Err(Error::OutOfRange);
                     }
@@ -1015,6 +1029,14 @@ fn accumulate_gstate<S: Storage>(
 /// directory's entries continue there), so they are followed; the live
 /// `DirStruct` view (not raw `iter_tags`) ensures a directory whose entry
 /// has already been deleted is not counted as live.
+///
+/// Collected pairs are compared with [`BlockPair::is_same_pair`] rather
+/// than the derived ordered equality, both when deduping during the walk
+/// and, at every caller, when testing a thread successor for membership
+/// in the result. Order carries no meaning on disk, so a successor named
+/// `{b, a}` against a tree entry collected as `{a, b}` is the same live
+/// directory; treating it as absent would let the deorphan sweep drop a
+/// live pair out of the global thread (review L7, `lfs-a8j`).
 fn collect_live_tree_pairs<S: Storage>(
     storage: &mut S,
     root: BlockPair,
@@ -1036,7 +1058,7 @@ fn collect_live_tree_pairs<S: Storage>(
         // the tree); a SoftTail is the global list (not the tree).
         if pair.reader.is_hard_tail() {
             if let Some(cont) = pair.reader.tail() {
-                if pair_in_bounds::<S>(cont) && !out[..tail].contains(&cont) {
+                if pair_in_bounds::<S>(cont) && !crate::block::contains_pair(&out[..tail], cont) {
                     if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                         return Err(Error::OutOfRange);
                     }
@@ -1058,7 +1080,7 @@ fn collect_live_tree_pairs<S: Storage>(
                 if !pair_in_bounds::<S>(child) {
                     return Err(Error::Corrupt);
                 }
-                if !out[..tail].contains(&child) {
+                if !crate::block::contains_pair(&out[..tail], child) {
                     if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                         return Err(Error::OutOfRange);
                     }
@@ -1402,8 +1424,11 @@ fn should_relocate(
 /// out-of-range, but which the kernel does not depend on for its own
 /// correctness). Out-of-range pair addresses are never legitimately
 /// reachable, so callers skip or reject them.
+///
+/// Shared with [`crate::alloc`], whose forest walkers owe the same
+/// rejection at every enqueue site (review L9, `lfs-b2m`).
 #[inline]
-fn pair_in_bounds<S: Storage>(pair: BlockPair) -> bool {
+pub(crate) fn pair_in_bounds<S: Storage>(pair: BlockPair) -> bool {
     pair.a.as_u32() < S::BLOCK_COUNT && pair.b.as_u32() < S::BLOCK_COUNT
 }
 
@@ -1516,7 +1541,7 @@ fn find_parent_in_tree<S: Storage>(
         // Latest tail only; every raw tail tag would re-enqueue
         // superseded thread links.
         if let Some(t) = pair.reader.tail() {
-            if pair_in_bounds::<S>(t) && !queue[..tail].contains(&t) {
+            if pair_in_bounds::<S>(t) && !crate::block::contains_pair(&queue[..tail], t) {
                 if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                     return Err(Error::OutOfRange);
                 }
@@ -1542,7 +1567,7 @@ fn find_parent_in_tree<S: Storage>(
             // An out-of-range DirStruct body cannot be the target (a
             // real allocated pair) and must never be dereferenced;
             // skip it rather than enqueue.
-            if pair_in_bounds::<S>(child) && !queue[..tail].contains(&child) {
+            if pair_in_bounds::<S>(child) && !crate::block::contains_pair(&queue[..tail], child) {
                 if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                     return Err(Error::OutOfRange);
                 }
@@ -5455,11 +5480,14 @@ impl<S: Storage> Fs<S> {
             let Some(next) = next else {
                 break;
             };
-            if tree[..tree_count].contains(&next) {
+            if crate::block::contains_pair(&tree[..tree_count], next) {
                 // A live threaded directory; advance, but stop on a cycle
                 // (leave the corrupt thread as-is for the resolution path
-                // to reject).
-                if visited[..visited_count].contains(&next) {
+                // to reject). Both membership tests compare physical block
+                // sets: a thread successor named in the opposite order to
+                // the tree's copy is the same live directory, and reading
+                // it as absent would drop it from the thread (review L7).
+                if crate::block::contains_pair(&visited[..visited_count], next) {
                     break;
                 }
                 if visited_count < crate::alloc::MAX_QUEUED_PAIRS {
@@ -5547,7 +5575,7 @@ impl<S: Storage> Fs<S> {
             crate::alloc::MAX_QUEUED_PAIRS];
         let tree_count =
             collect_live_tree_pairs(&mut self.storage, self.root, &mut tree, buf_a, buf_b)?;
-        let target = if tree[..tree_count].contains(&src_pair) {
+        let target = if crate::block::contains_pair(&tree[..tree_count], src_pair) {
             src_pair
         } else {
             relocated_twin_in(&mut self.storage, &tree[..tree_count], src_pair, buf_a, buf_b)?
