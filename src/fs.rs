@@ -2926,8 +2926,8 @@ impl<S: Storage> Fs<S> {
     /// destination `Create` commit atomically (review H6; the C
     /// reference's `LFS_FROM_MOVE` replays all unique tags of the
     /// moved id). One documented divergence: the attributes stage
-    /// through a fixed 1 KiB stack pool, so an entry whose live
-    /// attribute payload exceeds [`RENAME_ATTR_STAGE`] fails the
+    /// through a fixed 1 KiB stack pool (`RENAME_ATTR_STAGE`), so an
+    /// entry whose live attribute payload exceeds that stage fails the
     /// rename with [`Error::OutOfRange`] (attributes intact, nothing
     /// moved) where the C reference, which streams the source pair
     /// through its block caches, would succeed.
