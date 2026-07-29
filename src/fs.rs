@@ -2239,7 +2239,7 @@ impl<S: Storage> Fs<S> {
         buf_b: &mut [u8],
     ) -> Result<(u32, u32), Error> {
         use crate::ctz::{
-            block_count, block_index_at_offset, content_bytes_in_block, seek_block,
+            block_count, block_index_at_offset, content_bytes_in_block, seek_block_buffered,
             skip_pointers_in_block,
         };
 
@@ -2410,9 +2410,18 @@ impl<S: Storage> Fs<S> {
                             // copy-on-written, index n_old - 1 must
                             // resolve to the NEW tail; its copied
                             // header reaches the unchanged earlier
-                            // blocks.
-                            seek_block(&mut self.storage, tail_addr, n_old - 1, target_idx as u32)?
-                                .as_u32()
+                            // blocks. `buf_a` holds the block image
+                            // under construction, so the descent stages
+                            // its aligned reads through `buf_b`, which
+                            // the allocation above has finished with.
+                            seek_block_buffered(
+                                &mut self.storage,
+                                tail_addr,
+                                n_old - 1,
+                                target_idx as u32,
+                                buf_b,
+                            )?
+                            .as_u32()
                         };
                         let off = 4 * k;
                         buf_a[off..off + 4].copy_from_slice(&target_phys.to_le_bytes());
@@ -2515,8 +2524,8 @@ impl<S: Storage> Fs<S> {
         buf_b: &mut [u8],
     ) -> Result<BlockAddress, Error> {
         use crate::ctz::{
-            block_count, block_index_at_offset, collect_chain_blocks, content_bytes_in_block,
-            skip_pointers_in_block, MAX_CTZ_BLOCKS,
+            block_count, block_index_at_offset, collect_chain_blocks_buffered,
+            content_bytes_in_block, skip_pointers_in_block, MAX_CTZ_BLOCKS,
         };
         debug_assert!(new_size > 0 && new_size <= old_size);
         let bs = S::BLOCK_SIZE as u32;
@@ -2525,7 +2534,15 @@ impl<S: Storage> Fs<S> {
             return Err(Error::OutOfRange);
         }
         let mut chain = [BlockAddress::NONE; MAX_CTZ_BLOCKS];
-        collect_chain_blocks(&mut self.storage, head_block, n_old, &mut chain[..n_old as usize])?;
+        // `buf_a` is free until the relocated block image is built
+        // below, so it serves as the walk's aligned read window.
+        collect_chain_blocks_buffered(
+            &mut self.storage,
+            head_block,
+            n_old,
+            &mut chain[..n_old as usize],
+            buf_a,
+        )?;
 
         let (new_tail_idx, abs_off) = block_index_at_offset(new_size - 1, bs);
         let header = 4 * skip_pointers_in_block(new_tail_idx);

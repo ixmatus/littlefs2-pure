@@ -148,7 +148,9 @@ pub fn block_count(size: u32, block_size: u32) -> u32 {
 /// as it sits on disk: the skip pointer header lives at the start of
 /// the block (bytes `0..4*skip_pointers_in_block(index)`) and the
 /// content follows. The offset already accounts for the header, so
-/// `storage.read(block, returned_offset, ..)` lands on the right byte.
+/// a read at `returned_offset` (through
+/// [`crate::storage::read_range`], which puts it on the `READ_SIZE`
+/// grid) lands on the right byte.
 #[must_use]
 pub fn block_index_at_offset(offset: u32, block_size: u32) -> (u32, u32) {
     // `b` is the maximum content per block, ignoring the per block skip
@@ -190,11 +192,12 @@ pub const MAX_CTZ_BLOCKS: usize = 256;
 ///
 /// `ctz` describes the file's layout (head block and total size).
 /// `scratch` must be at least [`S::BLOCK_SIZE`](Storage::BLOCK_SIZE)
-/// bytes. The current implementation does not read from `scratch`: block
-/// content is read straight into `out` and the backward walk uses its
-/// own internal 8 byte buffer (see [`collect_chain_blocks`]). The
-/// parameter and its length precondition are retained for API stability
-/// on the 1.x line; dropping them is a candidate for 2.0.
+/// bytes; it is the `READ_SIZE` aligned staging window for the skip
+/// pointer headers and for any content span whose ends do not fall on
+/// the read grid (see [`crate::storage::read_range`]). A span already
+/// on the grid, which is what a full block of content is whenever the
+/// block carries no pointer header, is read straight into `out`. Its
+/// contents after the call are unspecified.
 ///
 /// The function reads `min(out.len(), ctz.size)` bytes and returns the
 /// count actually read.
@@ -215,24 +218,81 @@ pub fn read_ctz<S: Storage>(
     read_ctz_at(storage, ctz, 0, out, scratch)
 }
 
+/// Largest `READ_SIZE` the window free convenience wrappers
+/// ([`collect_chain_blocks`] and [`seek_block`]) support.
+///
+/// A skip pointer header is 4 or 8 bytes, but the [`Storage`] contract
+/// admits no read smaller than `READ_SIZE`, so fetching one needs a
+/// staging window of at least `READ_SIZE` bytes. The wrappers take no
+/// buffer from the caller, so they stack one of this fixed size and
+/// report [`Error::GeometryMismatch`] on a device whose `READ_SIZE`
+/// exceeds it. The value matches [`crate::nor::MAX_PROG_SIZE`], and
+/// `PROG_SIZE` is at least `READ_SIZE` on any conforming device, so the
+/// two ceilings agree.
+///
+/// The buffered forms ([`collect_chain_blocks_buffered`] and
+/// [`seek_block_buffered`]) take the window from the caller and carry
+/// no such ceiling; so does the whole file read path
+/// ([`read_ctz`] and [`read_ctz_at`]), which stages through the block
+/// sized `scratch` it already requires. The kernel uses the buffered
+/// forms everywhere.
+pub const MAX_UNBUFFERED_READ_SIZE: usize = 512;
+
 /// Walk a CTZ chain backward from `head` (the physical address of the
 /// chain's last block) and fill `out[0..total_blocks]` with the chain's
 /// block addresses indexed by chain position.
 ///
-/// Reads only skip-pointer headers (4 or 8 bytes per block), so the
-/// caller does not need a per-block scratch buffer. The traversal
-/// uses the same `count = 2 - (index & 1)` rule as
+/// Reads only skip pointer headers, one aligned read per visited
+/// block, so the caller does not need a per block scratch buffer. The
+/// traversal uses the same `count = 2 - (index & 1)` rule as
 /// `lfs_ctz_traverse` (`lfs.c:2990`).
+///
+/// This form stages the header through a stacked
+/// [`MAX_UNBUFFERED_READ_SIZE`] byte window; use
+/// [`collect_chain_blocks_buffered`] to supply the window (and to lift
+/// the `READ_SIZE` ceiling) when the caller already holds a block
+/// buffer.
 ///
 /// # Errors
 ///
 /// - [`Error::OutOfRange`] if `out.len() < total_blocks as usize`.
+/// - [`Error::GeometryMismatch`] if `S::READ_SIZE` exceeds
+///   [`MAX_UNBUFFERED_READ_SIZE`].
 /// - I/O errors propagate from `storage.read`.
 pub fn collect_chain_blocks<S: Storage>(
     storage: &mut S,
     head: BlockAddress,
     total_blocks: u32,
     out: &mut [BlockAddress],
+) -> Result<(), Error> {
+    if S::READ_SIZE > MAX_UNBUFFERED_READ_SIZE {
+        return Err(Error::GeometryMismatch);
+    }
+    let mut window = [0u8; MAX_UNBUFFERED_READ_SIZE];
+    collect_chain_blocks_buffered(storage, head, total_blocks, out, &mut window)
+}
+
+/// [`collect_chain_blocks`] with a caller supplied read window.
+///
+/// `window` stages the `READ_SIZE` aligned fetch of each skip pointer
+/// header (see [`crate::storage::read_range`]); it must hold at least
+/// `S::READ_SIZE` bytes, which any block sized buffer does. Its
+/// contents after the call are unspecified.
+///
+/// # Errors
+///
+/// - [`Error::OutOfRange`] if `out.len() < total_blocks as usize`.
+/// - [`Error::GeometryMismatch`] if `window` is shorter than
+///   `S::READ_SIZE`.
+/// - [`Error::Corrupt`] if a skip pointer addresses a block outside the
+///   device.
+/// - I/O errors propagate from `storage.read`.
+pub fn collect_chain_blocks_buffered<S: Storage>(
+    storage: &mut S,
+    head: BlockAddress,
+    total_blocks: u32,
+    out: &mut [BlockAddress],
+    window: &mut [u8],
 ) -> Result<(), Error> {
     if total_blocks == 0 {
         return Ok(());
@@ -245,16 +305,26 @@ pub fn collect_chain_blocks<S: Storage>(
     let mut sp_buf = [0u8; 8];
     loop {
         // Every address written to `out` is bounds-checked here, so
-        // both this walk's `storage.read(head, ..)` and the caller's
-        // later forward read of `out[i]` only ever dereference an
-        // in-device block; an out-of-range skip pointer is rejected as
+        // both this walk's read of `head` and the caller's later
+        // forward read of `out[i]` only ever dereference an in-device
+        // block; an out-of-range skip pointer is rejected as
         // `Error::Corrupt`.
         out[index as usize] = require_in_bounds::<S>(head)?;
         if index == 0 {
             break;
         }
         let count = 2 - (index & 1);
-        storage.read(head.as_u32(), 0, &mut sp_buf[..4 * count as usize]).map_err(|_| Error::Io)?;
+        // The header is `4 * count` bytes at offset 0, a length that is
+        // not in general a `READ_SIZE` multiple, so the fetch goes
+        // through the aligned window (review `lfs-8e6`, the read path
+        // twin of M7).
+        crate::storage::read_range(
+            storage,
+            head.as_u32(),
+            0,
+            &mut sp_buf[..4 * count as usize],
+            window,
+        )?;
         let ptr0 = u32::from_le_bytes([sp_buf[0], sp_buf[1], sp_buf[2], sp_buf[3]]);
         if count == 2 {
             let ptr1 = u32::from_le_bytes([sp_buf[4], sp_buf[5], sp_buf[6], sp_buf[7]]);
@@ -287,16 +357,51 @@ pub fn collect_chain_blocks<S: Storage>(
 /// bounds-checked, so a corrupt or out-of-range pointer is rejected as
 /// [`Error::Corrupt`].
 ///
+/// This form stages each pointer fetch through a stacked
+/// [`MAX_UNBUFFERED_READ_SIZE`] byte window; use
+/// [`seek_block_buffered`] to supply the window (and to lift the
+/// `READ_SIZE` ceiling) when the caller already holds a block buffer.
+///
 /// # Errors
 ///
 /// - [`Error::OutOfRange`] if `target_index > from_index`.
 /// - [`Error::Corrupt`] if a skip pointer is out of range.
+/// - [`Error::GeometryMismatch`] if `S::READ_SIZE` exceeds
+///   [`MAX_UNBUFFERED_READ_SIZE`].
 /// - I/O errors propagate from `storage.read`.
 pub fn seek_block<S: Storage>(
     storage: &mut S,
     head: BlockAddress,
     from_index: u32,
     target_index: u32,
+) -> Result<BlockAddress, Error> {
+    if S::READ_SIZE > MAX_UNBUFFERED_READ_SIZE {
+        return Err(Error::GeometryMismatch);
+    }
+    let mut window = [0u8; MAX_UNBUFFERED_READ_SIZE];
+    seek_block_buffered(storage, head, from_index, target_index, &mut window)
+}
+
+/// [`seek_block`] with a caller supplied read window.
+///
+/// `window` stages the `READ_SIZE` aligned fetch of each skip pointer
+/// (see [`crate::storage::read_range`]); it must hold at least
+/// `S::READ_SIZE` bytes, which any block sized buffer does. Its
+/// contents after the call are unspecified.
+///
+/// # Errors
+///
+/// - [`Error::OutOfRange`] if `target_index > from_index`.
+/// - [`Error::Corrupt`] if a skip pointer is out of range.
+/// - [`Error::GeometryMismatch`] if `window` is shorter than
+///   `S::READ_SIZE`.
+/// - I/O errors propagate from `storage.read`.
+pub fn seek_block_buffered<S: Storage>(
+    storage: &mut S,
+    head: BlockAddress,
+    from_index: u32,
+    target_index: u32,
+    window: &mut [u8],
 ) -> Result<BlockAddress, Error> {
     if target_index > from_index {
         return Err(Error::OutOfRange);
@@ -312,7 +417,10 @@ pub fn seek_block<S: Storage>(
         let max_k = idx.trailing_zeros();
         let gap_k = gap.ilog2(); // floor(log2(gap)); gap >= 1
         let k = gap_k.min(max_k);
-        storage.read(cur.as_u32(), 4 * k, &mut sp).map_err(|_| Error::Io)?;
+        // The pointer is 4 bytes at offset `4*k`: neither the offset nor
+        // the length sits on the `READ_SIZE` grid in general, so the
+        // fetch goes through the aligned window (review `lfs-8e6`).
+        crate::storage::read_range(storage, cur.as_u32(), 4 * k, &mut sp, window)?;
         let ptr = u32::from_le_bytes([sp[0], sp[1], sp[2], sp[3]]);
         cur = require_in_bounds::<S>(BlockAddress::new(ptr))?;
         idx -= 1 << k;
@@ -329,6 +437,10 @@ pub fn seek_block<S: Storage>(
 /// `MAX_CTZ_BLOCKS` cap); only the read step is offset-aware. A
 /// log-time seek (using skip pointers from the head, à la
 /// `lfs_ctz_find`) is a future optimization.
+///
+/// Every device read this issues sits on the `READ_SIZE` grid, staged
+/// through `scratch` where the on disk extent does not (review
+/// `lfs-8e6`).
 pub fn read_ctz_at<S: Storage>(
     storage: &mut S,
     ctz: &CtzStruct,
@@ -350,7 +462,7 @@ pub fn read_ctz_at<S: Storage>(
     }
 
     let mut blocks = [BlockAddress::NONE; MAX_CTZ_BLOCKS];
-    collect_chain_blocks(storage, ctz.head_block, total_blocks, &mut blocks)?;
+    collect_chain_blocks_buffered(storage, ctz.head_block, total_blocks, &mut blocks, scratch)?;
 
     // Forward read: pull each block's content portion into `out`,
     // skipping logical bytes before `start_off`.
@@ -378,13 +490,17 @@ pub fn read_ctz_at<S: Storage>(
             logical_off = block_logical_end;
             continue;
         }
-        storage
-            .read(
-                blocks[i as usize].as_u32(),
-                (header + skip_in_block) as u32,
-                &mut out[out_off..out_off + take],
-            )
-            .map_err(|_| Error::Io)?;
+        // The content span starts just past the skip pointer header and
+        // runs for exactly the bytes the caller wants, so neither end
+        // need sit on the `READ_SIZE` grid; `read_range` stages the
+        // ragged case through `scratch` (review `lfs-8e6`).
+        crate::storage::read_range(
+            storage,
+            blocks[i as usize].as_u32(),
+            (header + skip_in_block) as u32,
+            &mut out[out_off..out_off + take],
+            scratch,
+        )?;
         out_off += take;
         logical_off = block_logical_end;
     }
