@@ -2189,7 +2189,7 @@ impl<S: Storage> Fs<S> {
         }
         let layout = {
             let p = MetadataPair::parse(owner.a, &*buf_a, owner.b, &*buf_b)?;
-            match crate::dir::lookup(&p, name) {
+            match crate::dir::lookup_checked(&p, name)? {
                 None => Layout::Missing,
                 Some(r) => {
                     if r.entry.kind != crate::dir::EntryKind::RegularFile {
@@ -3203,7 +3203,7 @@ impl<S: Storage> Fs<S> {
         let staged_attr_len;
         {
             let p = MetadataPair::parse(src_owner.a, &*buf_a, src_owner.b, &*buf_b)?;
-            let r = crate::dir::lookup(&p, old_leaf_bytes).ok_or(Error::NotFound)?;
+            let r = crate::dir::lookup_checked(&p, old_leaf_bytes)?.ok_or(Error::NotFound)?;
             let n = r.struct_body.len();
             if n > src_body.len() {
                 return Err(Error::OutOfRange);
@@ -4926,7 +4926,8 @@ impl<S: Storage> Fs<S> {
         };
         let dir_pair = {
             let p = MetadataPair::parse(owner.a, &*buf_a, owner.b, &*buf_b)?;
-            let resolved = crate::dir::lookup(&p, leaf.as_bytes()).ok_or(Error::NotFound)?;
+            let resolved =
+                crate::dir::lookup_checked(&p, leaf.as_bytes())?.ok_or(Error::NotFound)?;
             if resolved.struct_type != crate::tag::TagType::DirStruct
                 || resolved.struct_body.len() != 8
             {
@@ -5761,7 +5762,7 @@ impl<S: Storage> Fs<S> {
             // back to re-read. Scope it tightly.
             let tail_to_follow = {
                 let pair = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
-                if crate::dir::lookup(&pair, leaf_name.as_bytes()).is_some() {
+                if crate::dir::lookup_checked(&pair, leaf_name.as_bytes())?.is_some() {
                     None
                 } else if pair.reader.is_hard_tail() {
                     pair.reader.tail()
@@ -5776,7 +5777,7 @@ impl<S: Storage> Fs<S> {
             }
             // Found here; re-parse to produce the returned 'b-lifetime view.
             let pair = MetadataPair::parse(current.a, buf_a, current.b, buf_b)?;
-            let resolved = crate::dir::lookup(&pair, leaf_name.as_bytes()).expect(
+            let resolved = crate::dir::lookup_checked(&pair, leaf_name.as_bytes())?.expect(
                 "lookup succeeded once already in this iteration; the data has not changed",
             );
             return Ok(ResolvedPath {
@@ -5824,7 +5825,7 @@ impl<S: Storage> Fs<S> {
             let count: usize;
             {
                 let pair = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
-                hit = crate::dir::lookup(&pair, name).map(|r| (r.entry.id, r.entry.kind));
+                hit = crate::dir::lookup_checked(&pair, name)?.map(|r| (r.entry.id, r.entry.kind));
                 // Only a HardTail continues this directory; a SoftTail is
                 // the next directory in the global thread, not part of
                 // this chain.
@@ -5878,7 +5879,7 @@ impl<S: Storage> Fs<S> {
             self.storage.read(current.a.as_u32(), 0, buf_a).map_err(|_| Error::Io)?;
             self.storage.read(current.b.as_u32(), 0, buf_b).map_err(|_| Error::Io)?;
             let pair = MetadataPair::parse(current.a, &*buf_a, current.b, &*buf_b)?;
-            if let Some(resolved) = crate::dir::lookup(&pair, name) {
+            if let Some(resolved) = crate::dir::lookup_checked(&pair, name)? {
                 if resolved.entry.kind != crate::dir::EntryKind::Directory {
                     return Err(Error::NotFound);
                 }
@@ -6114,5 +6115,228 @@ mod split_point_tests {
                 .unwrap(),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod corrupt_splice_resolve_tests {
+    //! Review L4 (bead `lfs-ceq`): [`Fs::resolve`] must report a metadata
+    //! pair whose splice stream cannot be replayed as [`Error::Corrupt`],
+    //! never as [`Error::NotFound`]. A caller told a name is absent goes
+    //! on to create it, and that create lands in a pair whose entry
+    //! roster is already unreadable.
+    //!
+    //! # Why the handle is built directly rather than mounted
+    //!
+    //! [`Fs::mount`] runs `accumulate_gstate` over every reachable pair,
+    //! and that sweep already walks each pair through
+    //! `gather_live_slots`, which propagates the same rejection. So today
+    //! an image corrupted this way fails at mount and never reaches
+    //! `resolve`. That shadow is a property of the current mount
+    //! sequence, not of `resolve`, and nothing in `resolve`'s contract
+    //! promises the tree was pre screened. These tests therefore build
+    //! the handle over the corrupt device directly, isolating the unit
+    //! under test from an unrelated gate.
+
+    use super::{Fs, ROOT_BLOCK_PAIR};
+    use crate::block::BlockAddress;
+    use crate::error::Error;
+    use crate::meta::{Commit, MetadataPair};
+    use crate::path::Path;
+    use crate::storage::Storage;
+    use crate::superblock::Superblock;
+    use crate::tag::{Tag, TagType};
+
+    const BS: usize = 256;
+    const BC: u32 = 8;
+
+    /// Fixed capacity NOR backing: eight 256 byte blocks, program only
+    /// clears bits, erase restores them. Enough device for a formatted
+    /// root pair holding one inline file.
+    struct Dev {
+        data: [u8; BS * BC as usize],
+    }
+
+    impl Dev {
+        fn new() -> Self {
+            Self { data: [0xFFu8; BS * BC as usize] }
+        }
+    }
+
+    impl Storage for Dev {
+        type Error = ();
+        const READ_SIZE: usize = 16;
+        const PROG_SIZE: usize = 16;
+        const BLOCK_SIZE: usize = BS;
+        const BLOCK_COUNT: u32 = BC;
+        const CACHE_SIZE: usize = 64;
+        const LOOKAHEAD_SIZE: usize = 8;
+
+        fn read(&mut self, block: u32, off: u32, buf: &mut [u8]) -> Result<(), ()> {
+            let start = block as usize * BS + off as usize;
+            if start + buf.len() > self.data.len() {
+                return Err(());
+            }
+            buf.copy_from_slice(&self.data[start..start + buf.len()]);
+            Ok(())
+        }
+
+        fn program(&mut self, block: u32, off: u32, data: &[u8]) -> Result<(), ()> {
+            let start = block as usize * BS + off as usize;
+            if start + data.len() > self.data.len() {
+                return Err(());
+            }
+            for (existing, &new) in self.data[start..start + data.len()].iter_mut().zip(data) {
+                assert_eq!(*existing & new, new, "NOR program flipped a 0 bit to 1");
+                *existing &= new;
+            }
+            Ok(())
+        }
+
+        fn erase(&mut self, block: u32) -> Result<(), ()> {
+            let start = block as usize * BS;
+            if start + BS > self.data.len() {
+                return Err(());
+            }
+            for b in &mut self.data[start..start + BS] {
+                *b = 0xFF;
+            }
+            Ok(())
+        }
+    }
+
+    /// An id no two entry root pair ever created, so the `Delete` naming
+    /// it is unambiguously a corrupt splice rather than a stale but
+    /// replayable log.
+    const PHANTOM_ID: u16 = 200;
+
+    /// Format a device, write `/keep`, and return the device plus its
+    /// superblock. The superblock is captured from the healthy mount so
+    /// the corrupt handle can be built without mounting again.
+    fn formatted_device() -> (Dev, Superblock) {
+        let mut dev = Dev::new();
+        let mut scratch = [0u8; BS];
+        Fs::format(&mut dev, &mut scratch).unwrap();
+        let mut buf_a = [0u8; BS];
+        let mut buf_b = [0u8; BS];
+        let mut fs = Fs::mount(dev, &mut buf_a, &mut buf_b).unwrap();
+        let mut a = [0u8; BS];
+        let mut b = [0u8; BS];
+        fs.write_to_path(Path::new("/keep").unwrap(), b"v", &mut a, &mut b).unwrap();
+        let sb = *fs.superblock();
+        (fs.into_storage(), sb)
+    }
+
+    /// Append one more commit to the root pair's active block carrying a
+    /// `Delete` of [`PHANTOM_ID`]. The bytes past the committed end are
+    /// still erased, so this is the same shape an appending writer
+    /// produces, with one tag the splice replay cannot accept.
+    fn corrupt_root_splice(dev: &mut Dev) {
+        let mut block_a = [0u8; BS];
+        let mut block_b = [0u8; BS];
+        block_a.copy_from_slice(&dev.data[0..BS]);
+        block_b.copy_from_slice(&dev.data[BS..2 * BS]);
+        let (active, end, ptag) = {
+            let pair =
+                MetadataPair::parse(BlockAddress::new(0), &block_a, BlockAddress::new(1), &block_b)
+                    .unwrap();
+            (pair.active_block.as_u32(), pair.reader.committed_end(), pair.reader.next_ptag())
+        };
+        let mut block = if active == 0 { block_a } else { block_b };
+        {
+            let mut commit = Commit::new_appending(&mut block, end, ptag).unwrap();
+            commit.tag(Tag::new(true, TagType::Delete, PHANTOM_ID, 0), &[]).unwrap();
+            commit.finish(0).unwrap();
+        }
+        let base = active as usize * BS;
+        dev.data[base..base + BS].copy_from_slice(&block);
+    }
+
+    /// Build a handle over `dev` without the mount time sweep.
+    fn handle(dev: Dev, sb: Superblock) -> Fs<Dev> {
+        Fs {
+            storage: dev,
+            superblock: sb,
+            root: ROOT_BLOCK_PAIR,
+            used_cache: None,
+            pending_move: None,
+        }
+    }
+
+    /// The appended commit really does verify, so the `Delete` reaches
+    /// the entry walk. Without this the rest of the module tests nothing.
+    #[test]
+    fn the_appended_commit_verifies() {
+        let (mut dev, _sb) = formatted_device();
+        corrupt_root_splice(&mut dev);
+        let mut block_a = [0u8; BS];
+        let mut block_b = [0u8; BS];
+        block_a.copy_from_slice(&dev.data[0..BS]);
+        block_b.copy_from_slice(&dev.data[BS..2 * BS]);
+        let pair =
+            MetadataPair::parse(BlockAddress::new(0), &block_a, BlockAddress::new(1), &block_b)
+                .unwrap();
+        let hits = pair
+            .reader
+            .iter_tags()
+            .filter(|e| e.tag.tag_type() == TagType::Delete && e.tag.id() == PHANTOM_ID)
+            .count();
+        assert_eq!(hits, 1, "the appended Delete must sit inside a verified commit");
+    }
+
+    /// The finding. Before the fix this returned `NotFound`.
+    #[test]
+    fn resolve_reports_corrupt_not_notfound() {
+        let (mut dev, sb) = formatted_device();
+        corrupt_root_splice(&mut dev);
+        let mut fs = handle(dev, sb);
+        let mut a = [0u8; BS];
+        let mut b = [0u8; BS];
+        let err = fs.resolve(Path::new("/keep").unwrap(), &mut a, &mut b).unwrap_err();
+        assert_eq!(err, Error::Corrupt, "a corrupt splice stream must not read as a missing entry");
+    }
+
+    /// `exists` derives from `resolve`, so the corruption must not be
+    /// laundered into a calm `Ok(false)` that invites a create.
+    #[test]
+    fn exists_propagates_corrupt() {
+        let (mut dev, sb) = formatted_device();
+        corrupt_root_splice(&mut dev);
+        let mut fs = handle(dev, sb);
+        let mut a = [0u8; BS];
+        let mut b = [0u8; BS];
+        let err = fs.exists(Path::new("/anything").unwrap(), &mut a, &mut b).unwrap_err();
+        assert_eq!(err, Error::Corrupt);
+    }
+
+    /// `read_at_path` resolves first, so it inherits the same verdict.
+    #[test]
+    fn read_at_path_propagates_corrupt() {
+        let (mut dev, sb) = formatted_device();
+        corrupt_root_splice(&mut dev);
+        let mut fs = handle(dev, sb);
+        let mut a = [0u8; BS];
+        let mut b = [0u8; BS];
+        let mut out = [0u8; 8];
+        let err =
+            fs.read_at_path(Path::new("/keep").unwrap(), 0, &mut out, &mut a, &mut b).unwrap_err();
+        assert_eq!(err, Error::Corrupt);
+    }
+
+    /// The healthy device is unaffected by the routing change: a present
+    /// name resolves and an absent one is still `NotFound`.
+    #[test]
+    fn healthy_device_is_unaffected() {
+        let (dev, sb) = formatted_device();
+        let mut fs = handle(dev, sb);
+        let mut a = [0u8; BS];
+        let mut b = [0u8; BS];
+        let hit = fs.resolve(Path::new("/keep").unwrap(), &mut a, &mut b).unwrap();
+        assert_eq!(hit.entry.name, b"keep");
+        assert_eq!(hit.struct_body, b"v");
+        let err = fs.resolve(Path::new("/gone").unwrap(), &mut a, &mut b).unwrap_err();
+        assert_eq!(err, Error::NotFound, "an absent name on a healthy pair is still NotFound");
+        assert!(fs.exists(Path::new("/keep").unwrap(), &mut a, &mut b).unwrap());
+        assert!(!fs.exists(Path::new("/gone").unwrap(), &mut a, &mut b).unwrap());
     }
 }

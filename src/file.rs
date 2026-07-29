@@ -273,7 +273,7 @@ impl<S: Storage> Fs<S> {
         }
         let existing: Existing = {
             let p = MetadataPair::parse(owner.a, &*buf_a, owner.b, &*buf_b)?;
-            match dir::lookup(&p, name) {
+            match dir::lookup_checked(&p, name)? {
                 None => Existing::Missing,
                 Some(r) => {
                     if r.entry.kind != dir::EntryKind::RegularFile {
