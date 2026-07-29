@@ -42,12 +42,31 @@
 //!   accept or reject decision is therefore NOT proven here; that is
 //!   pinned by the conformance and roundtrip vectors against the C
 //!   reference.
+//! - `ctz_proofs`: the CTZ skip list geometry math is total over every
+//!   `u32` index, offset, and size. `skip_pointers_in_block` and
+//!   `content_bytes_in_block` hold at every `block_size` meeting the C
+//!   reference's 128 byte floor (`lfs.c:4189`), and one harness shows
+//!   that floor is tight rather than conservative.
+//!   `block_index_at_offset` and `block_count` are pinned to the
+//!   128 byte and 256 byte geometries, because a symbolic divisor
+//!   defeats CBMC's refinement; the offset they return always lands in
+//!   the block's content region.
+//! - `commit_writer_proofs`: `meta::Commit` never writes outside the
+//!   caller's buffer, every commit it emits ends in a well formed CCRC
+//!   tag, its two bounds checks are exact and leave the cursor
+//!   untouched on rejection, and it refuses a caller supplied CCRC.
+//!   Bounded to a 24 byte buffer and a 4 byte body, with `crc::update`
+//!   stubbed nondeterministically. The writer to reader round trip is
+//!   out of Kani's reach at this revision; the module docs record the
+//!   measurements and name the stacks that cover it instead.
 //!
 //! Adding a new harness: pin the specification (which C-reference
 //! line or this crate's invariant), state the bound (input range,
 //! input length), and let `cargo kani` chew.
 
 pub mod commit_proofs;
+pub mod commit_writer_proofs;
 pub mod crc_proofs;
+pub mod ctz_proofs;
 pub mod meta_proofs;
 pub mod tag_proofs;
