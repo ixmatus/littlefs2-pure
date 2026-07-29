@@ -38,6 +38,14 @@ pub enum Error {
 
     /// A path component exceeded [`crate::NAME_MAX`] bytes, or contained a
     /// disallowed byte (currently only the path separator `/`).
+    ///
+    /// This is also the crate's invalid argument answer for an
+    /// operation whose flags contradict each other, which is what the
+    /// standard library reports as `InvalidInput`. The instances are
+    /// [`crate::Fs::open`] rejecting an [`crate::OpenOptions`] value
+    /// that names neither `read` nor `write`, or that pairs a device
+    /// mutating flag (`create`, `truncate`) with an access mode
+    /// granting no write.
     InvalidPath,
 
     /// A read returned fewer bytes than requested. Used when an operation must
