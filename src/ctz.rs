@@ -441,6 +441,22 @@ pub fn seek_block_buffered<S: Storage>(
 /// Every device read this issues sits on the `READ_SIZE` grid, staged
 /// through `scratch` where the on disk extent does not (review
 /// `lfs-8e6`).
+///
+/// # Errors
+///
+/// - [`Error::GeometryMismatch`] if `scratch` is shorter than one
+///   block, or if `S::BLOCK_SIZE` is below
+///   [`crate::geometry::BLOCK_SIZE_MIN`]. The floor is load bearing
+///   here rather than merely advisory: the per block content capacity
+///   this function computes is `BLOCK_SIZE` minus a skip pointer
+///   header of up to 128 bytes, which underflows below the floor. The
+///   [`crate::Fs`] surface gates the same floor at compile time; this
+///   entry point is reachable with a raw [`Storage`] and no mount, so
+///   it carries its own guard ahead of the arithmetic.
+/// - [`Error::OutOfRange`] if the chain is longer than
+///   [`MAX_CTZ_BLOCKS`].
+/// - [`Error::Corrupt`] if a skip pointer addresses a block outside the
+///   device.
 pub fn read_ctz_at<S: Storage>(
     storage: &mut S,
     ctz: &CtzStruct,
@@ -448,7 +464,7 @@ pub fn read_ctz_at<S: Storage>(
     out: &mut [u8],
     scratch: &mut [u8],
 ) -> Result<usize, Error> {
-    if scratch.len() < S::BLOCK_SIZE {
+    if scratch.len() < S::BLOCK_SIZE || S::BLOCK_SIZE < crate::geometry::BLOCK_SIZE_MIN {
         return Err(Error::GeometryMismatch);
     }
     if ctz.size == 0 || out.is_empty() || start_off >= ctz.size {

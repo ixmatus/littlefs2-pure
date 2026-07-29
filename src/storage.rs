@@ -52,9 +52,18 @@ use crate::error::Error;
 /// - `READ_SIZE`, `PROG_SIZE`, and `CACHE_SIZE` are powers of two.
 /// - `BLOCK_SIZE` is a positive multiple of `PROG_SIZE` (and therefore of
 ///   `READ_SIZE`).
+/// - `BLOCK_SIZE` is at least
+///   [`geometry::BLOCK_SIZE_MIN`](crate::geometry::BLOCK_SIZE_MIN), the
+///   128 bytes a CTZ skip pointer header can occupy.
 /// - Every call to [`read`](Self::read), [`program`](Self::program), and
 ///   [`erase`](Self::erase) operates on regions aligned to and sized as a
 ///   multiple of the respective unit.
+///
+/// [`crate::geometry`] states which of these the crate enforces and
+/// which it only documents. The enforced subset is checked at compile
+/// time on the way into [`crate::Fs::mount`] and [`crate::Fs::format`];
+/// the power of two claim is a description of real NOR flash rather
+/// than a precondition, and no code path depends on it.
 pub trait Storage {
     /// The error type for the underlying device.
     type Error: Debug;

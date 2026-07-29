@@ -87,6 +87,7 @@ pub mod dir;
 pub mod error;
 pub mod file;
 pub mod fs;
+pub mod geometry;
 pub mod gstate;
 pub mod meta;
 pub mod nor;

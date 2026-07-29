@@ -50,7 +50,17 @@
 //!   `block_index_at_offset` and `block_count` are pinned to the
 //!   128 byte and 256 byte geometries, because a symbolic divisor
 //!   defeats CBMC's refinement; the offset they return always lands in
-//!   the block's content region.
+//!   the block's content region. The floor is enforced rather than
+//!   merely assumed since `lfs-cw1`; see `geometry_proofs` and
+//!   `crate::geometry`.
+//! - `geometry_proofs`: the geometry gate `Fs::mount` and `Fs::format`
+//!   apply admits no block size below the 128 byte CTZ floor, and every
+//!   geometry it does admit makes the CTZ content capacity subtraction
+//!   total over all 2^32 block indices. Together with `ctz_proofs` this
+//!   closes the loop: the precondition those harnesses assume is the
+//!   one the entry points discharge. `block_size` is symbolic;
+//!   `read_size` and `prog_size` are pinned to two grids, for the same
+//!   symbolic divisor reason.
 //! - `commit_writer_proofs`: `meta::Commit` never writes outside the
 //!   caller's buffer, every commit it emits ends in a well formed CCRC
 //!   tag, its two bounds checks are exact and leave the cursor
@@ -68,5 +78,6 @@ pub mod commit_proofs;
 pub mod commit_writer_proofs;
 pub mod crc_proofs;
 pub mod ctz_proofs;
+pub mod geometry_proofs;
 pub mod meta_proofs;
 pub mod tag_proofs;

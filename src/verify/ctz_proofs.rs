@@ -113,11 +113,25 @@ fn ctz_content_bytes_in_block_no_underflow() {
 /// content size near `u32::MAX` and computes read extents from it. The
 /// precondition is therefore load-bearing for more than panic
 /// freedom, and `block_size` has to be validated before it reaches
-/// this module. Today nothing in the crate enforces the floor: no
-/// mount path checks `S::BLOCK_SIZE >= 128`, so the guarantee rests
-/// on the storage adapter being sane.
+/// this module.
 ///
-/// If a future change makes the function total (saturating, or
+/// # Where the precondition is discharged
+///
+/// The function itself is still partial, so this harness still holds
+/// and is deliberately kept. What changed with `lfs-cw1` is where the
+/// boundary sits: the floor is now enforced rather than assumed.
+/// [`crate::Fs::mount`] and [`crate::Fs::format`] name
+/// [`crate::geometry::Geometry::CHECK`], so a sub floor `Storage` is a
+/// compile error at either entry point and no `Fs` handle over such a
+/// device can exist; [`crate::ctz::read_ctz_at`], the one public reader
+/// that computes a per block capacity from a raw `Storage`, reports
+/// [`crate::Error::GeometryMismatch`] before the subtraction. The
+/// companion harnesses in `crate::verify::geometry_proofs` prove that
+/// gate admits nothing below 128.
+///
+/// The partiality this harness pins therefore describes the raw
+/// function, not a reachable state of the kernel. Keep it that way: if
+/// a future change makes the function itself total (saturating, or
 /// returning a `Result`, or taking a validated geometry newtype), this
 /// harness fails and must be deliberately retired. That is the
 /// intended signal, not a regression.

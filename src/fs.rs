@@ -5345,7 +5345,25 @@ impl<S: Storage> Fs<S> {
     /// After this call returns, `storage` can be passed to [`Fs::mount`]
     /// to obtain a usable handle. Block `1` is left in pristine erased
     /// state to serve as the metadata pair's alternate.
+    ///
+    /// # Geometry
+    ///
+    /// `S` must satisfy the [`crate::geometry`] preconditions, chiefly
+    /// the 128 byte block size floor the CTZ skip pointer header
+    /// forces and the C reference asserts. The check is a compile time
+    /// one: this function names
+    /// [`crate::geometry::Geometry::CHECK`], so formatting a device the
+    /// kernel cannot compute with is a build error, not a corrupt
+    /// image. [`Error::GeometryMismatch`] is the runtime backstop for
+    /// the same predicate, and is also what a `scratch` shorter than
+    /// one block reports.
     pub fn format(storage: &mut S, scratch: &mut [u8]) -> Result<(), Error> {
+        // Geometry gate, before any arithmetic that trusts the
+        // constants. Naming the const is what makes a device the kernel
+        // cannot compute with a compile error; the `validate` call is
+        // the folded-away backstop. See `crate::geometry`.
+        let () = crate::geometry::Geometry::<S>::CHECK;
+        crate::geometry::validate::<S>()?;
         if scratch.len() < S::BLOCK_SIZE {
             return Err(Error::GeometryMismatch);
         }
@@ -5425,11 +5443,19 @@ impl<S: Storage> Fs<S> {
     /// | Variant | Meaning | Suggested action |
     /// |---|---|---|
     /// | [`Error::Io`] | The `storage.read` call failed. | Retry on a transient device fault, or escalate. |
-    /// | [`Error::GeometryMismatch`] | Buffers are the wrong size, **or** the on-disk superblock's `block_size` / `block_count` differs from the [`Storage`] trait's advertised values. | Caller bug (wrong buffer length) or wrong-chip-for-image. Do not auto-format. |
+    /// | [`Error::GeometryMismatch`] | Buffers are the wrong size, **or** the on-disk superblock's `block_size` / `block_count` differs from the [`Storage`] trait's advertised values, **or** the device's geometry violates a [`crate::geometry`] precondition. | Caller bug (wrong buffer length) or wrong-chip-for-image. Do not auto-format. |
     /// | [`Error::Unformatted`] | Both blocks of the root pair are pristine `0xFF`. The device has never been programmed (fresh chip, post-full-erase). | Call [`Fs::format`] and retry, *if* the caller owns the formatting decision. |
     /// | [`Error::Corrupt`] | At least one block has been programmed, but neither block has a successfully verified CCRC commit. Bit rot, torn erase, or third-party-tool damage. | Escalate to a recovery path; do not auto-format. |
     /// | [`Error::NotLittleFs`] | Both blocks parse cleanly (valid CCRC commits) but the [`crate::MAGIC`] NAME tag is absent. The blocks hold someone else's metadata format. | Escalate; this is the "wrong filesystem on this chip" case. |
     /// | [`Error::UnsupportedVersion`] | Magic + superblock present, but the version word is newer than this crate. The contained value is the encoded version. | Escalate; cannot read forward-version data safely. |
+    ///
+    /// The geometry row is the one a caller rarely sees, because the
+    /// same preconditions are gated at compile time: `Fs::mount` names
+    /// [`crate::geometry::Geometry::CHECK`], so a `Storage` whose
+    /// constants the kernel cannot compute with (a block size below the
+    /// 128 byte CTZ floor, a block size off the program grid, a zero
+    /// read or program size) fails to build rather than failing to
+    /// mount. The runtime row remains as the backstop.
     ///
     /// `Error::Unformatted` versus `Error::Corrupt` is the key
     /// distinction for production boot logic: an `Unformatted` device
@@ -5442,6 +5468,14 @@ impl<S: Storage> Fs<S> {
         block_a_buf: &mut [u8],
         block_b_buf: &mut [u8],
     ) -> Result<Self, Error> {
+        // Geometry gate, before any arithmetic that trusts the
+        // constants. Naming the const is what makes a device the kernel
+        // cannot compute with a compile error; the `validate` call is
+        // the folded-away backstop. Every other method on `Fs` is
+        // reachable only through a handle this function returns, so the
+        // whole surface inherits the check. See `crate::geometry`.
+        let () = crate::geometry::Geometry::<S>::CHECK;
+        crate::geometry::validate::<S>()?;
         if block_a_buf.len() != S::BLOCK_SIZE || block_b_buf.len() != S::BLOCK_SIZE {
             return Err(Error::GeometryMismatch);
         }

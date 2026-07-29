@@ -16,6 +16,8 @@ consumers:
   - tools/verify_image
   - docs/decisions/0002-spec-as-oracle.md
   - docs/decisions/0004-c-reference-as-golden.md
+  - docs/decisions/0019-storage-geometry-gate.md
+  - src/geometry.rs
   - src/meta.rs
   - src/ctz.rs
   - src/dir.rs
