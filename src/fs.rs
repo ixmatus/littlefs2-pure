@@ -1219,6 +1219,44 @@ fn verify_programmed<S: Storage>(
         && crate::crc::update(crate::crc::INIT, region) == expected
 }
 
+/// Re-read a just-programmed sub-block region and compare it byte for
+/// byte against `expected`, the file-data counterpart of
+/// [`verify_programmed`] (review `lfs-ttr`).
+///
+/// The metadata sites verify a region that is itself a scratch buffer,
+/// so they can read back over it and CRC-compare. The file-data tail
+/// fill programs from the caller's immutable slice instead, so this
+/// variant reads into `scratch` (a spare `BLOCK_SIZE` buffer) and
+/// compares directly, which is exact rather than CRC-equal and leaves
+/// `expected` untouched.
+///
+/// Alignment: `off` and `len` are content coordinates and need not sit
+/// on the read grid, so the read is widened to the enclosing
+/// `READ_SIZE` window. `BLOCK_SIZE` is a multiple of `PROG_SIZE`, itself
+/// a multiple of `READ_SIZE` (both powers of two), so the widened window
+/// stays inside the block; the bounds check is the backstop for a
+/// storage impl that violates that contract.
+fn verify_programmed_bytes<S: Storage>(
+    storage: &mut S,
+    block: BlockAddress,
+    off: usize,
+    expected: &[u8],
+    scratch: &mut [u8],
+) -> bool {
+    let Some(end) = off.checked_add(expected.len()) else {
+        return false;
+    };
+    let lo = off - (off % S::READ_SIZE);
+    let hi = end.next_multiple_of(S::READ_SIZE);
+    if hi > S::BLOCK_SIZE || hi > scratch.len() {
+        return false;
+    }
+    if storage.read(block.as_u32(), lo as u32, &mut scratch[lo..hi]).is_err() {
+        return false;
+    }
+    scratch[off..end] == *expected
+}
+
 /// True when `op` adds a new entry, so the combined entry sequence has
 /// one more element (at index `count`) than the live entry count.
 /// Create-family ops append an entry; every other op transforms or
@@ -1662,6 +1700,14 @@ impl<S: Storage> Fs<S> {
     /// program fails (a worn/bad block), returns `Err(phys)` with that
     /// block's physical address so the caller can exclude it and rebuild
     /// past it. `chain.len()` is the block count.
+    ///
+    /// A block whose read back disagrees with what was sent counts as
+    /// worn too (review `lfs-ttr`): the C reference validates every
+    /// program it issues, file data included, and routes a mismatch into
+    /// the same relocation a reported failure takes. `buf_a` is rebuilt
+    /// from scratch for each block, so the clobbering
+    /// [`verify_programmed`] does on a mismatch costs the caller
+    /// nothing.
     fn try_build_ctz_chain(
         &mut self,
         chain: &[BlockAddress],
@@ -1691,6 +1737,9 @@ impl<S: Storage> Fs<S> {
             let phys = block.as_u32();
             self.storage.erase(phys).map_err(|_| phys)?;
             self.storage.program(phys, 0, &buf_a[..S::BLOCK_SIZE]).map_err(|_| phys)?;
+            if !verify_programmed(&mut self.storage, *block, 0, &mut buf_a[..S::BLOCK_SIZE]) {
+                return Err(phys);
+            }
         }
         Ok(())
     }
@@ -2269,11 +2318,23 @@ impl<S: Storage> Fs<S> {
                             *x = 0xFF;
                         }
                         buf_a[off..off + fill].copy_from_slice(&data[..fill]);
+                        // A candidate that reports success but lands
+                        // corrupted cells is excluded exactly like one
+                        // that reports the failure (review `lfs-ttr`).
+                        // The next attempt re-reads the committed tail
+                        // into `buf_a`, so the read back's clobbering is
+                        // harmless here.
                         if self.storage.erase(fresh.as_u32()).is_ok()
                             && self
                                 .storage
                                 .program(fresh.as_u32(), 0, &buf_a[..S::BLOCK_SIZE])
                                 .is_ok()
+                            && verify_programmed(
+                                &mut self.storage,
+                                fresh,
+                                0,
+                                &mut buf_a[..S::BLOCK_SIZE],
+                            )
                         {
                             tail_addr = fresh;
                             break;
@@ -2363,8 +2424,18 @@ impl<S: Storage> Fs<S> {
                     content_off += take;
 
                     let phys = new_blocks[(new_i - n_old) as usize].as_u32();
+                    // A read back mismatch is a worn block too, and
+                    // takes the same exclusion (review `lfs-ttr`).
+                    // `buf_a` is rebuilt for every block of every
+                    // attempt, so its clobbering costs nothing.
                     if self.storage.erase(phys).is_err()
                         || self.storage.program(phys, 0, &buf_a[..S::BLOCK_SIZE]).is_err()
+                        || !verify_programmed(
+                            &mut self.storage,
+                            BlockAddress::new(phys),
+                            0,
+                            &mut buf_a[..S::BLOCK_SIZE],
+                        )
                     {
                         // Worn block: exclude it and rebuild the new set.
                         if ex_len >= MAX_BAD_BLOCK_RETRIES {
@@ -2388,6 +2459,25 @@ impl<S: Storage> Fs<S> {
         // dirty check turns into a copy-on-write.
         if let Some((tail_phys, off, fill)) = deferred_fill {
             self.storage.program(tail_phys, off, &data[..fill]).map_err(|_| Error::Io)?;
+            // Read back what was just sent (review `lfs-ttr`). Unlike
+            // every other file-data site this one cannot relocate: the
+            // overflow blocks written in step 2 already carry skip
+            // pointers naming this block's address, so moving it now
+            // would strand them. `Io` is therefore the same verdict a
+            // program failure gets here, and it is a safe one: the
+            // metadata still records `old_size`, so nothing acknowledged
+            // is lost, and the cells this attempt did land leave the
+            // region dirty, which routes the caller's retry through the
+            // copy-on-write branch of step 1.
+            if !verify_programmed_bytes(
+                &mut self.storage,
+                BlockAddress::new(tail_phys),
+                off as usize,
+                &data[..fill],
+                buf_a,
+            ) {
+                return Err(Error::Io);
+            }
         }
 
         self.storage.sync().map_err(|_| Error::Io)?;
@@ -2479,6 +2569,14 @@ impl<S: Storage> Fs<S> {
         self.storage
             .program(fresh_addr.as_u32(), 0, &buf_a[..S::BLOCK_SIZE])
             .map_err(|_| Error::Io)?;
+        // Read back the relocated tail (review `lfs-ttr`). A mismatch
+        // reports `Io`, the verdict a program failure already gets on
+        // this path; only the fresh block was written, so the committed
+        // chain and the committed metadata are untouched either way and
+        // the caller's shrink simply did not happen.
+        if !verify_programmed(&mut self.storage, fresh_addr, 0, &mut buf_a[..S::BLOCK_SIZE]) {
+            return Err(Error::Io);
+        }
         self.storage.sync().map_err(|_| Error::Io)?;
         Ok(fresh_addr)
     }
@@ -2612,58 +2710,94 @@ impl<S: Storage> Fs<S> {
             }
         }
 
-        // Allocate two blocks for the new directory's metadata pair.
-        let mut new_blocks = [BlockAddress::NONE; 2];
-        crate::alloc::alloc_blocks_cached(
-            &mut self.storage,
-            self.root,
-            &mut self.used_cache,
-            &[],
-            None,
-            &mut new_blocks,
-            buf_a,
-            buf_b,
-        )?;
-        let new_dir = BlockPair::new(new_blocks[0], new_blocks[1]);
-
-        // Initialize: erase both blocks, then write an empty commit
+        // Allocate two blocks for the new directory's metadata pair and
+        // initialize them: erase both, then write an empty commit
         // (revision 1 + CCRC, no entries) on block A. Block B remains
         // pristine erased as the alternate.
-        self.storage.erase(new_dir.a.as_u32()).map_err(|_| Error::Io)?;
-        self.storage.erase(new_dir.b.as_u32()).map_err(|_| Error::Io)?;
-        for byte in buf_a.iter_mut() {
-            *byte = 0xFF;
-        }
-        let new_end = {
-            let mut commit = crate::meta::Commit::new(&mut buf_a[..S::BLOCK_SIZE], 1)?;
-            // The new directory takes the parent's old place in the global
-            // list: its tail points where the parent's tail did (null if
-            // the parent was the list end). Crash-safe: until the parent's
-            // commit below lands, the new dir is referenced by nothing and
-            // is reclaimed as an orphan, so this link is never reachable.
-            if let Some((tail_pair, is_hard)) = parent_tail {
-                let mut body = [0u8; 8];
-                body[0..4].copy_from_slice(&tail_pair.a.as_u32().to_le_bytes());
-                body[4..8].copy_from_slice(&tail_pair.b.as_u32().to_le_bytes());
-                let tag_type = if is_hard {
-                    crate::tag::TagType::HardTail
-                } else {
-                    crate::tag::TagType::SoftTail
+        //
+        // A candidate whose erase or program fails, or whose init commit
+        // does not read back (review H2), is a worn block. Exclude it and
+        // allocate again, bounded by `MAX_BAD_BLOCK_RETRIES`, the same
+        // discipline `relocate_compact_to_fresh` and the split
+        // continuation follow (ADR-0014, `lfs-n23`). Retrying is purely
+        // additive here: the pair is referenced by nothing until the
+        // parent's `CreateDir` commit lands far below, so an abandoned
+        // candidate is a blank orphan the next allocator scan reclaims.
+        // Exclusion is per block, not per pair: the healthy half of a
+        // rejected pair is free to come back paired with someone else.
+        let mut excluded = [BlockAddress::NONE; MAX_BAD_BLOCK_RETRIES];
+        let mut ex_len = 0usize;
+        let mut new_blocks = [BlockAddress::NONE; 2];
+        let new_dir = loop {
+            crate::alloc::alloc_blocks_cached(
+                &mut self.storage,
+                self.root,
+                &mut self.used_cache,
+                &excluded[..ex_len],
+                None,
+                &mut new_blocks,
+                buf_a,
+                buf_b,
+            )?;
+            let candidate = BlockPair::new(new_blocks[0], new_blocks[1]);
+            let worn = if self.storage.erase(candidate.a.as_u32()).is_err() {
+                Some(candidate.a)
+            } else if self.storage.erase(candidate.b.as_u32()).is_err() {
+                Some(candidate.b)
+            } else {
+                for byte in buf_a.iter_mut() {
+                    *byte = 0xFF;
+                }
+                let new_end = {
+                    let mut commit = crate::meta::Commit::new(&mut buf_a[..S::BLOCK_SIZE], 1)?;
+                    // The new directory takes the parent's old place in the
+                    // global list: its tail points where the parent's tail
+                    // did (null if the parent was the list end).
+                    // Crash-safe: until the parent's commit below lands,
+                    // the new dir is referenced by nothing and is
+                    // reclaimed as an orphan, so this link is never
+                    // reachable.
+                    if let Some((tail_pair, is_hard)) = parent_tail {
+                        let mut body = [0u8; 8];
+                        body[0..4].copy_from_slice(&tail_pair.a.as_u32().to_le_bytes());
+                        body[4..8].copy_from_slice(&tail_pair.b.as_u32().to_le_bytes());
+                        let tag_type = if is_hard {
+                            crate::tag::TagType::HardTail
+                        } else {
+                            crate::tag::TagType::SoftTail
+                        };
+                        commit.tag(
+                            crate::tag::Tag::new(true, tag_type, crate::tag::ID_NONE, 8),
+                            &body,
+                        )?;
+                    }
+                    commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
+                    commit.bytes_written()
                 };
-                commit.tag(crate::tag::Tag::new(true, tag_type, crate::tag::ID_NONE, 8), &body)?;
+                // `verify_programmed` clobbers `buf_a` on a mismatch, and
+                // both exits from here rebuild it: a retry re-emits the
+                // commit above, and the success path re-reads the target
+                // pair below.
+                if self.storage.program(candidate.a.as_u32(), 0, &buf_a[..new_end]).is_err()
+                    || !verify_programmed(&mut self.storage, candidate.a, 0, &mut buf_a[..new_end])
+                {
+                    Some(candidate.a)
+                } else {
+                    None
+                }
+            };
+            match worn {
+                None => break candidate,
+                Some(bad) => {
+                    if ex_len >= MAX_BAD_BLOCK_RETRIES {
+                        return Err(Error::Io);
+                    }
+                    excluded[ex_len] = bad;
+                    ex_len += 1;
+                    self.used_cache = None;
+                }
             }
-            commit.finish_padded(0, S::PROG_SIZE, S::BLOCK_SIZE)?;
-            commit.bytes_written()
         };
-        self.storage.program(new_dir.a.as_u32(), 0, &buf_a[..new_end]).map_err(|_| Error::Io)?;
-        // Review H2: the new directory's init commit gets the same
-        // read-back every other commit gets. A verify failure reports
-        // `Io` exactly like a program failure on this path; the
-        // allocated pair stays an unreferenced orphan. `buf_a` is
-        // re-read below before its next use.
-        if !verify_programmed(&mut self.storage, new_dir.a, 0, &mut buf_a[..new_end]) {
-            return Err(Error::Io);
-        }
         self.storage.sync().map_err(|_| Error::Io)?;
 
         // Re-read the target pair to compute the new id from the live
