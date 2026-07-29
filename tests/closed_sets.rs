@@ -402,7 +402,7 @@ fn every_oracle_type_constant_decodes_as_classified() {
                 );
                 assert_eq!(
                     expected as u8, bits,
-                    "{expected:?} must carry the discriminant `{name}` >> 8 = {bits:#03x}"
+                    "{expected:?} must carry the discriminant `{name}` >> 8 = {bits:#x}"
                 );
             }
             OracleRole::InMemoryOnly(reason) => {
@@ -553,10 +553,10 @@ fn abstract_type_domain_is_exactly_three_bits() {
     for b in 0u8..=0xff {
         let decoded = AbstractType::from_bits(b);
         if b < 8 {
-            let decoded = decoded.unwrap_or_else(|| panic!("{b:#03x} must decode"));
-            assert_eq!(decoded as u8, b, "{decoded:?} must carry discriminant {b:#03x}");
+            let decoded = decoded.unwrap_or_else(|| panic!("{b:#x} must decode"));
+            assert_eq!(decoded as u8, b, "{decoded:?} must carry discriminant {b:#x}");
         } else {
-            assert!(decoded.is_none(), "{b:#03x} is outside the 3 bit field and must not decode");
+            assert!(decoded.is_none(), "{b:#x} is outside the 3 bit field and must not decode");
         }
     }
 }
