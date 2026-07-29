@@ -2,7 +2,7 @@
 
 All notable changes to `littlefs2-pure` land here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The 0.x line is explicit about API churn; `KNOWN_ISSUES.md` lists every gap against the v1.0 surface.
 
-## [Unreleased]
+## [1.3.0] - 2026-07-28
 
 ### Added
 
