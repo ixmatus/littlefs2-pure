@@ -19,6 +19,12 @@
 //   split_root- expect `/f00`..`/f11`, each body == "v" (the ROOT pair
 //               {0,1} split across a HardTail continuation; {0,1} stays the
 //               superblock anchor and the C reference chases its tail)
+//   null_tail - expect `/b/keep` == "KEEP" and `/a` absent, in an image
+//               this crate produced by removing the LAST directory in the
+//               global thread. Proves the oracle accepts our tag-absent
+//               spelling of thread end, where its own `lfs_dir_drop`
+//               writes an explicit all-ones tail body (review L9,
+//               `lfs-yl6`)
 //   mutate    - MOUNT a Rust image, WRITE into it (a small inline file and
 //               a CTZ-backed file), then dump the mutated image to a third
 //               argument path for Rust to remount and verify. Proves the
@@ -240,6 +246,14 @@ static int mutate_image(lfs_t *lfs) {
     return 0;
 }
 
+// lfs_fs_traverse callback: the traverse itself is the assertion (it
+// walks the whole global metadata thread and every CTZ chain, erroring
+// on any link it cannot fetch), so the callback only has to succeed.
+static int count_block(void *p, lfs_block_t block) {
+    (void)p; (void)block;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 3 && argc != 4) {
         fprintf(stderr, "usage: %s <image_path> <scenario> [<out_path>]\n", argv[0]);
@@ -328,6 +342,41 @@ int main(int argc, char **argv) {
             char path[16];
             snprintf(path, sizeof path, "/f%02d", i);
             rc = verify_file(&lfs, path, (const uint8_t *)"v", 1);
+        }
+    } else if (strcmp(argv[2], "null_tail") == 0) {
+        // Write-side half of the null tail interop question (lfs-yl6).
+        // The crate produced this image by `mkdir /a; mkdir /b;
+        // /b/keep; rmdir /a`, removing the last directory in the global
+        // thread. The C reference reaches the same state via
+        // `lfs_dir_drop` (lfs.c:1831), which writes an all-ones tail body;
+        // this crate instead compacts the predecessor and omits the tail
+        // tag. Both spell "thread ends here" and the C reader treats them
+        // identically, because every walk over dir->tail is gated on
+        // lfs_pair_isnull. This scenario is the proof of that claim in the
+        // direction the conformance vector cannot cover: the oracle must
+        // mount our spelling, see /b with its file, and NOT see /a.
+        rc = verify_file(&lfs, "/b/keep", (const uint8_t *)"KEEP", 4);
+        if (rc == 0) {
+            struct lfs_info info;
+            int st = lfs_stat(&lfs, "/a", &info);
+            if (st != LFS_ERR_NOENT) {
+                fprintf(stderr,
+                        "verify_image: /a should be removed but lfs_stat "
+                        "returned %d\n", st);
+                rc = 1;
+            }
+        }
+        // The un-threading must also leave the global list walkable: a
+        // traverse visits every threaded pair, so a predecessor left
+        // pointing at the dropped directory would surface here.
+        if (rc == 0) {
+            int st = lfs_fs_traverse(&lfs, count_block, NULL);
+            if (st != 0) {
+                fprintf(stderr,
+                        "verify_image: lfs_fs_traverse over the un-threaded "
+                        "global list failed: %d\n", st);
+                rc = 1;
+            }
         }
     } else {
         fprintf(stderr, "verify_image: unknown scenario %s\n", argv[2]);

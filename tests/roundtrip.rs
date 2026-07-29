@@ -335,3 +335,38 @@ fn roundtrip_c_writes_into_rust_image() {
     let _ = std::fs::remove_file(&in_img);
     let _ = std::fs::remove_file(&out_img);
 }
+
+#[test]
+fn roundtrip_null_tail_after_unthreading_the_last_directory() {
+    // Write-side half of `lfs-yl6`. Removing the LAST directory in the
+    // global thread is the one operation whose result has two legal
+    // spellings on disk: the oracle's `lfs_dir_drop` (lfs.c:1831) commits
+    // the dropped directory's all-ones tail body verbatim, while this
+    // crate clears the predecessor's tail tag by compacting it away (the
+    // spelling `lfs_dir_compact`, lfs.c:2003, uses for the same state).
+    //
+    // `tests/conformance.rs::vector_13_null_tail_*` proves we read the
+    // oracle's spelling. This proves the oracle reads ours, which is the
+    // direction a committed vector cannot cover. The scenario also runs
+    // `lfs_fs_traverse`, so a predecessor left pointing at the dropped
+    // directory would fail rather than pass quietly.
+    let Some(verifier) = require_verifier() else { return };
+    let mut storage = MemStorage::new();
+    let mut scratch = common::make_buffer();
+    Fs::format(&mut storage, &mut scratch).unwrap();
+    {
+        let mut buf_a = common::make_buffer();
+        let mut buf_b = common::make_buffer();
+        let mut fs = Fs::mount(storage, &mut buf_a, &mut buf_b).unwrap();
+        let mut a = common::make_buffer();
+        let mut b = common::make_buffer();
+        fs.mkdir(Path::new("/a").unwrap(), &mut a, &mut b).unwrap();
+        fs.mkdir(Path::new("/b").unwrap(), &mut a, &mut b).unwrap();
+        fs.write_to_path(Path::new("/b/keep").unwrap(), b"KEEP", &mut a, &mut b).unwrap();
+        fs.rmdir(Path::new("/a").unwrap(), &mut a, &mut b).unwrap();
+        storage = fs.into_storage();
+    }
+    let img = dump_image(&storage, "null-tail");
+    invoke_verifier(&verifier, &img, "null_tail");
+    let _ = std::fs::remove_file(&img);
+}

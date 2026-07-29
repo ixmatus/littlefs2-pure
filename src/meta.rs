@@ -306,8 +306,8 @@ impl<'a> MetadataReader<'a> {
         self.next_ptag
     }
 
-    /// The most recent Tail tag's pair address, if any committed Tail
-    /// tag was seen.
+    /// The most recent Tail tag's pair address, or `None` when this pair
+    /// ends its thread.
     ///
     /// LittleFS uses Tail tags for two purposes:
     /// - **HardTail** ([`TagType::HardTail`]): the directory's entries
@@ -316,6 +316,20 @@ impl<'a> MetadataReader<'a> {
     ///   filesystem-wide directory list. Lookups do *not* descend.
     ///
     /// Use [`Self::is_hard_tail`] to discriminate.
+    ///
+    /// `None` covers *both* on disk spellings of thread end: no committed
+    /// tail tag at all, and a committed tail tag whose body is the all
+    /// ones sentinel ([`BlockPair::is_null`]). The C reference writes the
+    /// second spelling whenever `lfs_dir_drop` (`lfs.c:1831`) removes the
+    /// last directory in the thread, and reads the two identically
+    /// because every walk over `dir->tail` is gated on
+    /// `lfs_pair_isnull`. Collapsing them here is what lets one
+    /// `while let Some(t) = ...tail()` loop per walker be correct; see
+    /// `scan_for_tail` for the full derivation.
+    ///
+    /// Consequently every returned pair is a genuine address claim, so a
+    /// walker may hand it straight to the bounds check and treat failure
+    /// as corruption rather than having to special case the sentinel.
     #[must_use]
     pub fn tail(&self) -> Option<BlockPair> {
         self.tail
@@ -365,6 +379,42 @@ impl<'a> MetadataReader<'a> {
 /// and decode its 8 byte body as a `BlockPair`. Returns
 /// `(Some(pair), is_hard)` if a Tail was found, `(None, false)`
 /// otherwise.
+///
+/// # The null sentinel is thread end
+///
+/// A tail body of all ones ([`BlockPair::is_null`]) reports `(None,
+/// false)`, identically to a pair carrying no tail tag at all. Both
+/// encodings occur in conforming C written images and mean the same
+/// thing, so collapsing them here is what keeps the two readers in
+/// agreement:
+///
+/// - `lfs_dir_drop` (`lfs.c:1831`) commits `LFS_TYPE_TAIL + tail->split`
+///   with body `tail->tail` and no `lfs_pair_isnull` guard, so dropping
+///   the last directory in the global thread hands its predecessor a
+///   literal all ones tail body.
+/// - `lfs_dir_compact` (`lfs.c:2003`) does guard on `!lfs_pair_isnull`,
+///   so the same logical state reached by compaction instead omits the
+///   tag.
+///
+/// The C reader never distinguishes them because it never consults a
+/// null tail: every thread walk is gated on `lfs_pair_isnull(dir->tail)`
+/// before the pair is fetched (`lfs.c:4410`, `:4639`, `:4733`, `:4798`,
+/// `:4951`, `:5146`), and `lfs_dir_fetchmatch`'s bounds check
+/// (`lfs.c:1103`) would otherwise reject the all ones address as
+/// `LFS_ERR_CORRUPT`. Reporting the sentinel verbatim to this crate's
+/// walkers reproduced exactly that rejection and made such an image
+/// unmountable (`lfs-yl6`; `tests/vectors/13_null_tail.bin`).
+///
+/// The collapse happens *after* latest-tag-wins resolution, never during
+/// the scan: a pair whose log holds a real tail followed by a null tail
+/// has ended its thread, and skipping null tags mid-scan would resurrect
+/// the superseded link. This mirrors the C reader, whose `temptail`
+/// likewise holds the last tail tag's body whatever it is.
+///
+/// A null HardTail collapses the same way. The C writer never produces a
+/// chain whose HardTail is null mid-directory, so there is no valid image
+/// the uniform reading loses; terminating is strictly safer than chasing
+/// an all ones address.
 fn scan_for_tail(block: &[u8], committed_end: usize) -> (Option<BlockPair>, bool) {
     let mut ptag: u32 = 0xFFFF_FFFF;
     let mut off: usize = 0;
@@ -410,7 +460,12 @@ fn scan_for_tail(block: &[u8], committed_end: usize) -> (Option<BlockPair>, bool
             ptag ^= (u32::from(chunk) & 1) << 31;
         }
     }
-    (latest, is_hard)
+    // Latest-tag-wins is settled; now collapse the null sentinel to
+    // "no tail", so every consumer sees thread end in one shape.
+    match latest {
+        Some(p) if p.is_null() => (None, false),
+        other => (other, is_hard && other.is_some()),
+    }
 }
 
 /// Builder for one or more commits on a fresh (erased) metadata block.

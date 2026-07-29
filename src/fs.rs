@@ -1058,7 +1058,13 @@ fn collect_live_tree_pairs<S: Storage>(
         // the tree); a SoftTail is the global list (not the tree).
         if pair.reader.is_hard_tail() {
             if let Some(cont) = pair.reader.tail() {
-                if pair_in_bounds::<S>(cont) && !crate::block::contains_pair(&out[..tail], cont) {
+                // Out-of-range is `Corrupt`, not a skip; the sentinel
+                // already read as thread end upstream. See
+                // [`pair_in_bounds`] for the posture (`lfs-qeh`).
+                if !pair_in_bounds::<S>(cont) {
+                    return Err(Error::Corrupt);
+                }
+                if !crate::block::contains_pair(&out[..tail], cont) {
                     if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                         return Err(Error::OutOfRange);
                     }
@@ -1422,8 +1428,59 @@ fn should_relocate(
 /// kernel must validate before handing the address to
 /// [`Storage::read`] (whose contract requires it to error on
 /// out-of-range, but which the kernel does not depend on for its own
-/// correctness). Out-of-range pair addresses are never legitimately
-/// reachable, so callers skip or reject them.
+/// correctness).
+///
+/// # The posture, stated once (`lfs-qeh`)
+///
+/// Every *walker* that decodes a pair address from disk and enqueues it
+/// owes the same two answers, and this is the one place they are written
+/// down. Sites that enforce it point here rather than restating it.
+///
+/// 1. **The all ones sentinel is thread end, never an address.** It is
+///    resolved upstream, at the tail decode
+///    ([`crate::meta::MetadataReader::tail`]), which reports it as
+///    `None`. It therefore never reaches this predicate from a tail, and
+///    a walker needs no sentinel special case of its own. The one
+///    exception is [`crate::alloc`]'s single buffer walker, which reads
+///    raw tags rather than the decoded tail and so applies the rule
+///    itself. From a `DirStruct` body the sentinel is not thread end and
+///    carries no meaning (the C writer never emits one), so it falls
+///    through to rule 2 and is rejected like any other bad address.
+/// 2. **A genuine out-of-range pair is `Error::Corrupt`, not a skip.**
+///    The oracle is `lfs_dir_fetchmatch` (`lfs.c:1103`), whose first act
+///    is to return `LFS_ERR_CORRUPT` when either half is `>=
+///    lfs->block_count`; the C reader reaches that check for exactly the
+///    addresses these walkers reach, because it too filters null tails
+///    before fetching.
+///
+/// Rule 2 was previously split: most sites rejected while
+/// [`collect_live_tree_pairs`]'s `HardTail` and the parent-lookup BFS
+/// silently skipped. A skip is strictly worse than a reject here. No
+/// legitimate image contains a live out-of-range pair, so nothing is
+/// lost by rejecting, whereas skipping *hides* the corruption and lets a
+/// walk return a confidently incomplete answer: a reachability set
+/// missing a pair, which the deorphan sweep then reads as a pair to
+/// unthread, or a parent lookup returning `None` for a directory that
+/// does have a parent.
+///
+/// # What this does not yet cover
+///
+/// The rule governs the walkers, which decode an address and decide
+/// whether to enqueue it. It does not yet govern the *chase* sites,
+/// which follow a `HardTail` to continue one directory's own chain
+/// (`resolve`, `list_dir`, `find_thread_predecessor`,
+/// `unthread_and_steal` and their kin: sixteen pair reads across this
+/// module). Those hand the address straight to [`Storage::read`] and
+/// surface an out-of-range one as [`Error::Io`], which misreads image
+/// corruption as a hardware fault, exactly the confusion review L9
+/// (`lfs-b2m`) removed from the walkers. The C reference has no such
+/// split because its bounds check lives inside `lfs_dir_fetchmatch` and
+/// therefore covers every fetch, chases included. Closing the gap means
+/// routing all sixteen reads through one bounds-checked pair read; that
+/// is a separate concern from this one and is deliberately not folded in
+/// here. Note the *sentinel* is already correct at those sites: it
+/// resolves to `None` at the decode, so a chase terminates rather than
+/// dereferencing all ones.
 ///
 /// Shared with [`crate::alloc`], whose forest walkers owe the same
 /// rejection at every enqueue site (review L9, `lfs-b2m`).
@@ -1541,7 +1598,13 @@ fn find_parent_in_tree<S: Storage>(
         // Latest tail only; every raw tail tag would re-enqueue
         // superseded thread links.
         if let Some(t) = pair.reader.tail() {
-            if pair_in_bounds::<S>(t) && !crate::block::contains_pair(&queue[..tail], t) {
+            // Out-of-range is `Corrupt`, not a skip; the sentinel already
+            // read as thread end upstream. See [`pair_in_bounds`] for the
+            // posture (`lfs-qeh`).
+            if !pair_in_bounds::<S>(t) {
+                return Err(Error::Corrupt);
+            }
+            if !crate::block::contains_pair(&queue[..tail], t) {
                 if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                     return Err(Error::OutOfRange);
                 }
@@ -1564,10 +1627,14 @@ fn find_parent_in_tree<S: Storage>(
                 // `i` is the entry's live id by construction.
                 return Ok(Some((pair_addr, i as u16)));
             }
-            // An out-of-range DirStruct body cannot be the target (a
-            // real allocated pair) and must never be dereferenced;
-            // skip it rather than enqueue.
-            if pair_in_bounds::<S>(child) && !crate::block::contains_pair(&queue[..tail], child) {
+            // An out-of-range DirStruct body must never be dereferenced,
+            // and is `Corrupt` rather than a skip: swallowing it would
+            // let this lookup answer "no parent" for a directory that has
+            // one. See [`pair_in_bounds`] for the posture (`lfs-qeh`).
+            if !pair_in_bounds::<S>(child) {
+                return Err(Error::Corrupt);
+            }
+            if !crate::block::contains_pair(&queue[..tail], child) {
                 if tail >= crate::alloc::MAX_QUEUED_PAIRS {
                     return Err(Error::OutOfRange);
                 }
@@ -3435,12 +3502,20 @@ impl<S: Storage> Fs<S> {
         // re-emit it; an in-place append keeps the existing tail tag and
         // only emits when the tail actually changes.
         let effective_tail = new_tail.or(current_tail);
-        // A `new_tail` whose pair is the NONE sentinel means "clear the
-        // tail" (un-threading the global-list end so the predecessor
+        // A `new_tail` whose pair is the all-ones sentinel means "clear
+        // the tail" (un-threading the global-list end so the predecessor
         // becomes the new end). The tail tag is sticky, so an in-place
         // append cannot drop it; force a compaction, which rebuilds the
         // block without re-emitting any tail tag.
-        let clear_tail = matches!(new_tail, Some((p, _)) if p.a.is_none());
+        //
+        // That yields the tag-absent spelling of thread end, which is what
+        // `lfs_dir_compact` (`lfs.c:2003`) writes for the same state. The C
+        // reference's `lfs_dir_drop` (`lfs.c:1831`) instead writes the
+        // sentinel literally. Both are conforming and both read as thread
+        // end under either reader (`lfs-yl6`); this crate pins the
+        // tag-absent one on the write side and accepts both on the read
+        // side.
+        let clear_tail = matches!(new_tail, Some((p, _)) if p.is_null());
 
         let extra_ms_dsize =
             extra_move_state.map_or(0, |_| 4 + crate::gstate::MOVE_STATE_BODY_SIZE);

@@ -1,13 +1,13 @@
 ---
 slug: conformance-vector-corpus
 category: conformance
-citation: "littlefs2-pure parity vector corpus, generated 2026-05 by the pinned C oracle (littlefs v2.9.3, see c-littlefs-oracle), extended 2026-07 with the review-coverage classes 08-12; 12 disk images committed at tests/vectors/"
+citation: "littlefs2-pure parity vector corpus, generated 2026-05 by the pinned C oracle (littlefs v2.9.3, see c-littlefs-oracle), extended 2026-07 with the review-coverage classes 08-12 and the null tail class 13; 13 disk images committed at tests/vectors/"
 canonical: tests/vectors/ (this repository)
 doi: none
 archived: none (internal artifact, committed in tree)
 archive_date: none
 retrieved: 2026-07-08
-sha256: "01_empty_format.bin 774ac2275e681c7c815b9554769ce4c3d26087dc59ffa4dfdc6812284e8495c6, 02_single_inline.bin dca2c46c15d1fbc72c4fbb1211c9a074e61def2375d4acaa2e809eaf791d0b3e, 03_single_ctz.bin 97f098394a1c5b5c026a9d7666e7bc3647cad272a097f04d860d6769ceb7c00f, 04_nested_dir.bin b70b5a914e10add668bfa02ccefe321553031b3c0e6f9d42f8a696e61f54aeb0, 05_hardtail_dir.bin 8d44ed0637ff1c52c6bcdb739e6457e749226a99d50efabb8e8cf642ff7505e4, 06_inline_ctz_boundary.bin 78343fdf0a0cd6bbbcdc41e7ebeb5b39722358b835668587ae78999529402e0d, 07_deleted_recreated.bin 57640b4f0c1c2c0dc82fcaca908ac51ccd4ef4fbe9f63e87aaa5dc40a02497b9, 08_user_attrs.bin 6fc50f8966bde31dbe9cfd1c3aef5d34ee85297b8973476219d2d5d39396da37, 09_deep_ctz.bin 441f26a13d56c3cd795e99db481974e2cce9f1a9a4ce96f93ed1f264cdfcec04, 10_delete_tombstone.bin 7273c497047f1b737fc2b6fea490c0879dbfc1f67ef15c1509f1a8edbef2d012, 11_compacted_rename.bin 77c8fb2fcda038c1b30d779a11dab555e90c48ee4436c0fba9dac5c3d5676832, 12_multimove_gstate.bin 58b5c1a223b112accba2631bc5e1e157fd0729cb3693a23248751a2b9bf91d1c"
+sha256: "01_empty_format.bin 774ac2275e681c7c815b9554769ce4c3d26087dc59ffa4dfdc6812284e8495c6, 02_single_inline.bin dca2c46c15d1fbc72c4fbb1211c9a074e61def2375d4acaa2e809eaf791d0b3e, 03_single_ctz.bin 97f098394a1c5b5c026a9d7666e7bc3647cad272a097f04d860d6769ceb7c00f, 04_nested_dir.bin b70b5a914e10add668bfa02ccefe321553031b3c0e6f9d42f8a696e61f54aeb0, 05_hardtail_dir.bin 8d44ed0637ff1c52c6bcdb739e6457e749226a99d50efabb8e8cf642ff7505e4, 06_inline_ctz_boundary.bin 78343fdf0a0cd6bbbcdc41e7ebeb5b39722358b835668587ae78999529402e0d, 07_deleted_recreated.bin 57640b4f0c1c2c0dc82fcaca908ac51ccd4ef4fbe9f63e87aaa5dc40a02497b9, 08_user_attrs.bin 6fc50f8966bde31dbe9cfd1c3aef5d34ee85297b8973476219d2d5d39396da37, 09_deep_ctz.bin 441f26a13d56c3cd795e99db481974e2cce9f1a9a4ce96f93ed1f264cdfcec04, 10_delete_tombstone.bin 7273c497047f1b737fc2b6fea490c0879dbfc1f67ef15c1509f1a8edbef2d012, 11_compacted_rename.bin 77c8fb2fcda038c1b30d779a11dab555e90c48ee4436c0fba9dac5c3d5676832, 12_multimove_gstate.bin 58b5c1a223b112accba2631bc5e1e157fd0729cb3693a23248751a2b9bf91d1c, 13_null_tail.bin 6f94189a0de949e2e6151cc5bd3b5d5ce1afcc2c9638eb9c808090df5c15dc34"
 license: generated artifact of BSD-3-Clause littlefs; same terms
 vendor_status: vendored-at-path tests/vectors
 rot_risk: stable-publisher
@@ -23,7 +23,7 @@ verification: "tests/conformance.rs mounts and reads every image; tests/roundtri
 
 # Parity vector corpus
 
-The evidence behind the bidirectional bit accuracy claim: images the pinned C oracle wrote must mount and read correctly under this crate (conformance direction), and images this crate writes must mount and read correctly under the oracle (roundtrip direction). Twelve golden images are committed at `tests/vectors/`, 2048 bytes each, all generated at one geometry: `read_size = 16`, `prog_size = 16`, `block_size = 256`, `block_count = 8`, `cache_size = 64`, `lookahead_size = 8` (matching the test suite's `MemStorage`).
+The evidence behind the bidirectional bit accuracy claim: images the pinned C oracle wrote must mount and read correctly under this crate (conformance direction), and images this crate writes must mount and read correctly under the oracle (roundtrip direction). Thirteen golden images are committed at `tests/vectors/`, 2048 bytes each, all generated at one geometry: `read_size = 16`, `prog_size = 16`, `block_size = 256`, `block_count = 8`, `cache_size = 64`, `lookahead_size = 8` (matching the test suite's `MemStorage`).
 
 | Image | Scenario |
 |---|---|
@@ -39,6 +39,7 @@ The evidence behind the bidirectional bit accuracy claim: images the pinned C or
 | `10_delete_tombstone.bin` | A bare delete tombstone beside a live neighbor (review C3) |
 | `11_compacted_rename.bin` | An oracle compacted directory with non id dense NAME order (review H1) |
 | `12_multimove_gstate.bin` | Two moves into one directory: two MOVESTATE tags in one log (review C4) |
+| `13_null_tail.bin` | A surviving directory carrying an explicit all ones SoftTail body, written by the oracle's `lfs_dir_drop` when the last directory in the global thread is removed (review L9, `lfs-yl6`) |
 
 Generation method: `tools/gen_vectors/main.c` compiled against the vendored oracle (`make vectors` regenerates the set). The oracle pin and its two way verification are recorded in `c-littlefs-oracle`. `tests/conformance.rs` additionally pins each image's CRC32 so an accidental regeneration cannot silently change what the assertions exercise.
 

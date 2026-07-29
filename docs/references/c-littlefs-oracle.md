@@ -22,6 +22,7 @@ consumers:
   - src/superblock.rs
   - src/alloc.rs
   - src/fs.rs
+  - src/block.rs
 provenance: primary
 verification: "tests/conformance.rs (vectors the oracle wrote), tests/roundtrip.rs (the oracle reads our images via tools/verify_image)"
 ---
@@ -42,3 +43,5 @@ The vendored copy at `tools/gen_vectors/littlefs/` arrived via the `littlefs2-sy
 ## What the oracle grounds
 
 Every parity vector in `tests/vectors/` was written by this oracle revision (see `conformance-vector-corpus`), and the roundtrip gate compiles this same source into `tools/verify_image` so the oracle can mount and read images this crate writes. A clean oracle result speaks only to what the oracle exercises; the corpus entry records the coverage gaps.
+
+The oracle is also what settles questions the specification leaves open about which encodings a conforming reader must accept. The null tail sentinel is the worked example (`lfs-yl6`, 2026-07-28): `SPEC.md` describes the tail tag without saying whether thread end is spelled as an absent tag or as an all ones body, and the oracle writes *both*, choosing by which commit path it takes. `lfs_dir_drop` (`lfs.c:1831`) commits the tail body unguarded, so dropping the last directory in the thread writes the sentinel literally, while `lfs_dir_compact` (`lfs.c:2003`) guards on `!lfs_pair_isnull` and omits the tag. The oracle reads the two identically because every walk over `dir->tail` is gated on `lfs_pair_isnull` (`lfs.c:292`) before the pair is fetched. Reading the oracle's *writer* alone would have missed half the accepted input language; the rule lives in its reader.

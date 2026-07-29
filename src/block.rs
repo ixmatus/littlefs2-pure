@@ -111,6 +111,26 @@ impl BlockPair {
     pub fn is_same_pair(self, other: Self) -> bool {
         self.sorted() == other.sorted()
     }
+
+    /// `true` when this pair is the all ones "no pair here" sentinel.
+    ///
+    /// The C reference spells this `lfs_pair_isnull` (`lfs.c:292`) and
+    /// deliberately tests the two halves with OR, not AND: a pair with
+    /// either half equal to `LFS_BLOCK_NULL` is null. Half of a pair
+    /// address is never independently meaningful, so a partially all ones
+    /// body is malformed rather than half valid, and the C reader folds
+    /// both cases into the same answer. This predicate matches that
+    /// definition exactly so the two readers agree on every input.
+    ///
+    /// In a *tail* body the sentinel means "the thread ends here"; see
+    /// [`crate::meta::MetadataReader::tail`]. In a `DirStruct` body it
+    /// means nothing at all: the C writer never emits one, so the kernel
+    /// treats an all ones `DirStruct` as an out of range address and
+    /// rejects it like any other.
+    #[inline]
+    pub const fn is_null(self) -> bool {
+        self.a.is_none() || self.b.is_none()
+    }
 }
 
 /// `true` when `pairs` already holds `pair` as a physical block set.

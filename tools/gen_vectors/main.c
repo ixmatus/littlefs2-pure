@@ -371,6 +371,43 @@ static void scenario_multimove_gstate(const char *out_path) {
     dump(out_path);
 }
 
+// 13_null_tail: an image whose surviving directory carries an EXPLICIT
+// all-ones ({LFS_BLOCK_NULL, LFS_BLOCK_NULL}) SoftTail body, rather than
+// simply omitting the tail tag.
+//
+// `lfs_mkdir` inserts each new directory at the HEAD of the global thread
+// (lfs.c:2624 walks to the end of the parent's split chain, then commits
+// the new pair's SoftTail to `pred.tail` and re-points `pred` at the new
+// pair), so after `mkdir /a; mkdir /b` the thread runs root -> /b -> /a
+// and /a's tail is null (it is last).
+//
+// Removing the LAST directory in that thread routes through
+// `lfs_dir_drop` (lfs.c:1831), which commits
+// `LFS_MKTAG(LFS_TYPE_TAIL + tail->split, 0x3ff, 8)` with body
+// `tail->tail` UNCONDITIONALLY: no `lfs_pair_isnull` guard. The dropped
+// directory's tail is null, so the predecessor (/b) inherits a literal
+// 8 byte all-ones tail body on disk. (`lfs_dir_compact`, lfs.c:2003, does
+// gate on `!lfs_pair_isnull`, so the same logical state reached by
+// compaction instead omits the tag; both encodings are legal and the C
+// reader treats them identically, because every thread walk terminates on
+// `lfs_pair_isnull(dir->tail)` before the pair is ever fetched.)
+//
+// The surviving /b holds a file so the Rust side asserts real content
+// reads back after the null-tail pair is walked.
+static void scenario_null_tail(const char *out_path) {
+    reset();
+    lfs_t lfs;
+    must(lfs_format(&lfs, &cfg), "format");
+    must(lfs_mount(&lfs, &cfg), "mount");
+    must(lfs_mkdir(&lfs, "/a"), "mkdir a");
+    must(lfs_mkdir(&lfs, "/b"), "mkdir b");
+    mkfile(&lfs, "/b/keep", "KEEP", 4);
+    // /a is last in the thread, so dropping it hands /b the null sentinel.
+    must(lfs_remove(&lfs, "/a"), "rmdir a");
+    must(lfs_unmount(&lfs), "unmount");
+    dump(out_path);
+}
+
 int main(int argc, char **argv) {
     const char *outdir = argc > 1 ? argv[1] : ".";
     char path[512];
@@ -410,6 +447,9 @@ int main(int argc, char **argv) {
 
     snprintf(path, sizeof path, "%s/12_multimove_gstate.bin", outdir);
     scenario_multimove_gstate(path);
+
+    snprintf(path, sizeof path, "%s/13_null_tail.bin", outdir);
+    scenario_null_tail(path);
 
     return 0;
 }

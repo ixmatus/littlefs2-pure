@@ -297,11 +297,12 @@ pub fn scan_used_blocks<S: Storage>(
         // tail is not an entry; `reader.tail()` is latest-wins.
         if let Some(t) = next_tail {
             // A tail is a decoded on-disk pointer like any other and owes
-            // the same rejection (review L9, `lfs-b2m`). This also covers
-            // the all-ones sentinel, which `MetadataReader::tail` reports
-            // verbatim; mount already classifies a committed sentinel tail
-            // as `Corrupt` in `fs::accumulate_gstate`, so the walker
-            // agreeing with mount is the consistent posture.
+            // the same rejection (review L9, `lfs-b2m`). The all-ones
+            // sentinel never arrives here: `MetadataReader::tail` resolves
+            // it to `None` (thread end) at the decode, matching the C
+            // reader's `lfs_pair_isnull` gate, so `Some(t)` is always a
+            // genuine address claim. See `fs::pair_in_bounds` for the
+            // posture (`lfs-yl6`, `lfs-qeh`).
             if !crate::fs::pair_in_bounds::<S>(t) {
                 return Err(Error::Corrupt);
             }
@@ -540,6 +541,20 @@ pub fn scan_used_with_single_buf<S: Storage>(
                             entry.body[7],
                         ]);
                         let child = BlockPair::new(BlockAddress::new(a), BlockAddress::new(b));
+                        // This walker reads RAW tags, so it decodes tail
+                        // bodies itself instead of going through
+                        // `MetadataReader::tail`, and owes the sentinel
+                        // reading directly: an all-ones body on a TAIL tag
+                        // is thread end, so there is nothing to enqueue.
+                        // The same body on a `DirStruct` is not thread end
+                        // and carries no meaning at all, so it falls
+                        // through to the bounds check and is rejected
+                        // (`lfs-yl6`; see `fs::pair_in_bounds`).
+                        let is_tail =
+                            matches!(entry.tag.tag_type(), TagType::HardTail | TagType::SoftTail);
+                        if is_tail && child.is_null() {
+                            continue;
+                        }
                         // Reject an out-of-range pair before the "already
                         // marked" guard can swallow it: `Bitmap::is_set`
                         // answers `true` past its 4096-entry cap, so a far
