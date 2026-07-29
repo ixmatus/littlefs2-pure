@@ -350,6 +350,21 @@ pub fn scan_used_blocks<S: Storage>(
 /// call site once the pair scan that found the chain has finished with
 /// it). The earlier 4/8-byte reads violated the alignment precondition
 /// and would fault on hardware that enforces it (review M7, `lfs-mqz`).
+///
+/// # Address posture (`lfs-0ph`)
+///
+/// Every block address this walk touches, the chain head from the
+/// `CtzStruct` body and each skip pointer decoded from a header, is
+/// checked against the device before it is marked or dereferenced, and
+/// an out-of-range one is [`Error::Corrupt`]. This is the same rule and
+/// the same predicate ([`ctz::require_in_bounds`]) the read path applies
+/// (review R3b), so the two directions of travel over one chain cannot
+/// disagree about whether an image is corrupt.
+///
+/// The H8 total-block guard below is a different claim and does not
+/// subsume this one: it bounds how many blocks the chain says it has,
+/// while a skip pointer names *which* block, and an 8-block device
+/// happily passes a 4-block chain whose pointer names block 200.
 fn walk_ctz_chain<S: Storage>(
     storage: &mut S,
     head_block: u32,
@@ -377,7 +392,16 @@ fn walk_ctz_chain<S: Storage>(
     let mut head = head_block;
 
     loop {
-        used.set(head)?;
+        // The bounds check precedes the marking as well as the read.
+        // `Bitmap` tracks MAX_TRACKED_BLOCKS entries, far more than any
+        // supported device holds, so marking first answered for a block
+        // the device does not have: inside the bitmap it silently
+        // recorded a phantom block and left the wrong verdict to the
+        // read (`Io`, a hardware fault), past the bitmap it failed as
+        // `OutOfRange`, a capacity verdict. Neither names a malformed
+        // on-disk structure.
+        let head_addr = ctz::require_in_bounds::<S>(BlockAddress::new(head))?;
+        used.set(head_addr.as_u32())?;
         if index == 0 {
             break;
         }
@@ -391,7 +415,10 @@ fn walk_ctz_chain<S: Storage>(
         let ptr0 = u32::from_le_bytes([scratch[0], scratch[1], scratch[2], scratch[3]]);
         if count == 2 {
             let ptr1 = u32::from_le_bytes([scratch[4], scratch[5], scratch[6], scratch[7]]);
-            used.set(ptr0)?;
+            // `ptr0` is marked and never revisited, so it is checked
+            // here; `ptr1` becomes `head` and is checked at the top of
+            // the next iteration.
+            used.set(ctz::require_in_bounds::<S>(BlockAddress::new(ptr0))?.as_u32())?;
             head = ptr1;
             index -= 2;
         } else {

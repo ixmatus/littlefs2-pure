@@ -58,8 +58,13 @@ use crate::storage::Storage;
 /// or, with a non-conforming adapter, as memory unsafety. Defense in
 /// depth: a conforming `Storage` impl also rejects the access, but the
 /// kernel does not depend on that for a correct error classification.
+///
+/// Shared with [`crate::alloc`]'s CTZ chain walk and [`crate::fs`]'s
+/// streaming append, so one predicate governs every CTZ block address
+/// the kernel dereferences, whichever direction it is walking
+/// (`lfs-0ph`).
 #[inline]
-fn require_in_bounds<S: Storage>(b: BlockAddress) -> Result<BlockAddress, Error> {
+pub(crate) fn require_in_bounds<S: Storage>(b: BlockAddress) -> Result<BlockAddress, Error> {
     if b.as_u32() < S::BLOCK_COUNT {
         Ok(b)
     } else {

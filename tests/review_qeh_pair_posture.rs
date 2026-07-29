@@ -22,12 +22,14 @@
 //!
 //! # Scope
 //!
-//! These tests cover the walkers. The `HardTail` *chase* sites still
-//! surface an out of range address as [`Error::Io`]; that gap is recorded
-//! on `pair_in_bounds` and is a separate concern. The test named
-//! `out_of_range_hard_tail_chase_is_still_io` pins the current answer so
-//! the gap is visible in the suite rather than only in prose, and is the
-//! test to flip when the chase sites are unified.
+//! These tests cover the walkers. The `HardTail` *chase* sites once
+//! surfaced an out of range address as [`Error::Io`]; review `lfs-w3o`
+//! closed that gap by routing every pair-block read in `src/fs.rs`
+//! through `fs::read_pair_blocks`, so the posture is now one rule at
+//! every fetch, exactly as the C reference has it. The test named
+//! `out_of_range_hard_tail_chase_is_corrupt` (formerly
+//! `..._is_still_io`) pins the unified answer here; the chase sites get
+//! their own coverage in `tests/review_w3o_chase_pair_bounds.rs`.
 
 use littlefs2_pure::alloc::{scan_used_blocks, scan_used_with_single_buf, Bitmap};
 use littlefs2_pure::storage::Storage;
@@ -258,21 +260,18 @@ fn the_sentinel_in_a_dir_struct_is_still_corruption() {
     );
 }
 
-// ---- The known gap, pinned so it stays visible ----
+// ---- The former gap, now closed ----
 
 #[test]
-fn out_of_range_hard_tail_chase_is_still_io() {
-    // NOT the posture: the documented residual. `resolve` and `list_dir`
-    // chase a HardTail by handing the address straight to `Storage::read`,
-    // with no bounds check, so out of range surfaces as `Io` rather than
-    // `Corrupt`. The C reference does not have this split, because its
-    // bounds check lives inside `lfs_dir_fetchmatch` and so covers chases
-    // too.
-    //
-    // Pinned rather than left unwritten so the gap is visible in the
-    // suite. When the chase sites are routed through a bounds checked
-    // pair read, this assertion flips to `Corrupt` and the note on
-    // `fs::pair_in_bounds` comes out.
+fn out_of_range_hard_tail_chase_is_corrupt() {
+    // Once the documented residual, now the posture. `resolve` and
+    // `list_dir` chase a HardTail; both used to hand the address straight
+    // to `Storage::read` with no bounds check, so out of range surfaced
+    // as `Io` rather than `Corrupt`. The C reference never had that
+    // split, because its bounds check lives inside `lfs_dir_fetchmatch`
+    // and so covers chases too. Review `lfs-w3o` routed every pair-block
+    // read through `fs::read_pair_blocks`, which applies the same rule
+    // in the same place the C reference does.
     let storage = image(NEAR_OOR, Via::HardTail);
     let mut a = common::make_buffer();
     let mut b = common::make_buffer();
@@ -300,8 +299,8 @@ fn out_of_range_hard_tail_chase_is_still_io() {
         }
     }
     assert_eq!(
-        fs.list_root(|_| {}, &mut a, &mut b).expect_err("the chase dereferences it"),
-        Error::Io,
-        "documented residual: chase sites report Io where the posture says Corrupt"
+        fs.list_root(|_| {}, &mut a, &mut b).expect_err("the chase must reject it"),
+        Error::Corrupt,
+        "the chase sites now answer with the same posture as the walkers"
     );
 }
